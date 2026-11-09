@@ -96,6 +96,22 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             fresh.push(*m);
         }
     }
+    // Only a pool that can resume ever brings a stopped kept machine back.
+    if !has(Placement::Resume) {
+        for m in machines
+            .iter()
+            .filter(kept)
+            .filter(in_state(MachineState::Stopped))
+        {
+            if runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy) {
+                continue;
+            }
+            deleted.insert(m.id.as_str());
+            actions.push(Action::Delete {
+                machine: m.id.clone(),
+            });
+        }
+    }
 
     let supply = runners
         .iter()
@@ -200,7 +216,11 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             .count();
         short = short.saturating_sub(stopping);
     }
-    while short > 0 && starts.take() {
+    // A pool that resumes but never forks for a job would otherwise stay at its stopped
+    // and `min_up` machines. Demand left after every resume forks a kept machine, which
+    // later stops and resumes with its caches. A failed `take` above fails here too.
+    let grows = has(Placement::Resume) && !has(Placement::Fork);
+    while (short > 0 || (grows && want > 0)) && starts.take() {
         actions.push(Action::Fork {
             pool: pool.name.clone(),
             job: None,
@@ -393,6 +413,12 @@ mod tests {
         }
     }
 
+    fn delete(machine: &str) -> Action {
+        Action::Delete {
+            machine: machine.into(),
+        }
+    }
+
     fn fork_kept() -> Action {
         Action::Fork {
             pool: "ci".into(),
@@ -445,7 +471,55 @@ mod tests {
             vec![],
             &[],
         );
+        assert_eq!(decide(&s, &p), [delete("m2"), fork_kept()]);
+    }
+
+    #[test]
+    fn pool_deletes_a_stopped_kept_machine_nothing_would_resume() {
+        let s = snap(vec![machine("m1", Ms::Stopped)], vec![], &[]);
+        assert_eq!(decide(&s, &pool("pool", "min_up = 0")), [delete("m1")]);
+        assert_eq!(decide(&s, &pool("fork", "")), [delete("m1")]);
+        assert_eq!(decide(&s, &pool("warm", "")), NOTHING);
+
+        let busy = snap(
+            vec![machine("m1", Ms::Stopped)],
+            vec![runner("m1", 0, Rs::Busy)],
+            &[],
+        );
+        let unregister = Action::Unregister {
+            runner: busy.runners[0].name.clone(),
+        };
+        assert_eq!(
+            decide(&busy, &pool("pool", "min_up = 0")),
+            std::slice::from_ref(&unregister)
+        );
+    }
+
+    #[test]
+    fn warm_forks_a_kept_machine_for_demand_no_stopped_machine_can_take() {
+        let mut p = pool("warm", "min_up = 2\nslots_per_box = 2");
+        p.max_boxes = 4;
+        let machines = vec![machine("m1", Ms::Up), machine("m2", Ms::Up)];
+        let runners = vec![
+            runner("m1", 0, Rs::Busy),
+            runner("m1", 1, Rs::Busy),
+            runner("m2", 0, Rs::Busy),
+            runner("m2", 1, Rs::Busy),
+        ];
+        let s = snap(machines, runners, &[1, 2, 3, 4]);
+        // Two machines of two slots each cover the four jobs.
+        assert_eq!(decide(&s, &p), [fork_kept(), fork_kept()]);
+        p.max_boxes = 3;
         assert_eq!(decide(&s, &p), [fork_kept()]);
+        p.max_boxes = 4;
+
+        let mut busy = s.clone();
+        busy.queued.truncate(2);
+        assert_eq!(decide(&busy, &p), [fork_kept()]);
+
+        // A stopped kept machine is resumed first.
+        busy.machines.push(machine("m3", Ms::Stopped));
+        assert_eq!(decide(&busy, &p), [resume("m3")]);
     }
 
     #[test]

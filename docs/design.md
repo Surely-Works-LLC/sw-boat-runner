@@ -32,7 +32,7 @@ next tick tries again. Presets:
 | Preset | `placement` | Idle machines | Fits |
 | - | - | - | - |
 | `pool` | `slot` | `min_up` always up | steady load, trusted code, lowest overhead |
-| `warm` | `slot, resume` | stopped after `idle_stop_s` | load with quiet hours |
+| `warm` | `slot, resume` | stopped after `idle_stop_s`; demand no stopped machine covers forks a kept one | load with quiet hours |
 | `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
 | `hybrid` | `slot, resume, fork` | stopped after `idle_stop_s` | bursts above the pool size |
 
@@ -64,8 +64,9 @@ account-wide spend, including the starts that pools earlier in the file planned 
 same tick.
 
 The cents spent today are counted in memory. A restart cannot recover them, so after a
-restart the tool sets them to the smallest pool cap and makes only included starts in
-that pool until 00:00 UTC. A crash can delay paid starts but never exceed the cap.
+restart the tool sets them to the largest pool cap: every pool's budget counts as spent,
+and every pool makes only included starts until 00:00 UTC. A crash can delay paid starts
+but never exceed a cap.
 
 boat never queues a start. A refused start (429 or 503) is not counted, and the tool
 retries it on a later tick.
@@ -89,12 +90,14 @@ Runner names carry what the tool needs to know about them:
 label `sw-boat-runner-job=<job id>-<attempt>`, and its fork request uses the same value as
 its `Idempotency-Key`, so a crash and restart cannot fork twice for one job.
 
-A kept machine is forked with no job label to bring the pool up to `min_up`. Its
+A kept machine is forked with no job label to bring the pool up to `min_up`, or, in a
+pool with `resume` and no `fork`, for demand that no stopped machine covers. Its
 `Idempotency-Key` is `sbr-<pool>-keep-<n>`, where n is the number of the pool's kept
-machines that are not `Gone`, so a retry after a crash returns the same machine. boat
-holds a key for 24 h, so a kept machine deleted by hand blocks its key, and with it the
-pool's next kept fork, for up to 24 h. A kept machine gets boat's longest TTL, 30 days,
-after which boat archives it.
+machines that are not `Gone` plus the kept forks sent earlier in the tick, so a retry
+after a crash returns the same machine. boat holds a key for 24 h, so a kept machine
+deleted by hand, or by `Delete` once stopped, blocks its key, and with it the pool's next
+kept fork, for up to 24 h. A kept machine gets boat's longest TTL, 30 days, after which
+boat archives it.
 
 Two facts are kept only in memory. When each machine last had a busy runner: a machine
 first seen counts as never busy, and after a restart it counts from the restart, which
@@ -134,11 +137,11 @@ process saw it online is `Registered` until that timeout.
 | Action | Guard |
 | - | - |
 | `Register(machine, slot)` | machine `Up`, slot free (a slot whose runner gets `Unregister` this tick counts as free), unmet demand for the pool's labels |
-| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or kept `Up + Starting < min_up` |
+| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or kept `Up + Starting < min_up`; a pool without `fork` forks a kept machine for the demand left once none is `Stopped` |
 | `Fork(job)` | unmet demand left after slots and resumes, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine with this job's label yet |
-| `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; start budget allows, `Up + Starting < max_boxes` |
+| `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand, no `Busy` or `Registered` runner, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` machines `Up` |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s` |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
