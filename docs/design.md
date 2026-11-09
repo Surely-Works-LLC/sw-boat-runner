@@ -95,7 +95,7 @@ covers. A kept machine gets boat's longest TTL, 30 days, after which boat archiv
 Every fork request's `Idempotency-Key` is a fresh UUID v4. boat answers a key it saw in
 the last 24 h with its first machine, even a deleted one, so a reused key would hand a
 job the dead machine after a `Delete` and the job would starve. Fresh keys never repeat.
-They cannot stop a crash from forking twice, so the restart wait below does that.
+They cannot stop a second fork for one job; the listing-lag and restart rules below do.
 
 Two facts are kept only in memory: when each machine last had a busy runner, and the
 cents spent on starts today (see [Start budget](#start-budget)). A machine first seen
@@ -114,6 +114,11 @@ else. Rules that keep the tool safe on a stale snapshot and across a restart, ea
 - Restart wait (`FixKeptInflight`): after a restart the tool makes no start until the
   HTTP request timeout (90 s) has passed, so a create sent before the crash is listed or
   has failed. Without it, kept machines could reach `max_boxes + 1`.
+- Listing lag (`FixListLag`): the tool keeps each fork boat accepted, with its pool and
+  job, until a listing shows it or the HTTP request timeout plus one tick has passed.
+  Until then `decide` counts it as a `Starting` machine, so boat's lag neither forks its
+  job again nor passes `max_boxes`. An entry that expires unlisted is dropped with a
+  warning.
 - Restart spend (`FixCrashSpend`): after a restart every pool's budget counts as spent
   until 00:00 UTC.
 

@@ -280,6 +280,17 @@ pub struct Loop<'a> {
     starts_blocked_until: UnixSecs,
     /// True until the first observe that succeeds after this process started.
     restarted: bool,
+    /// Forks this process created that boat has not listed yet.
+    pending: Vec<Pending>,
+}
+
+/// A fork boat accepted but may not list for a while. Until it is listed, `decide` sees
+/// it as a `Starting` machine, so boat's lag cannot fork its job again or pass `max_boxes`.
+struct Pending {
+    id: String,
+    pool: String,
+    job: Option<JobKey>,
+    sent: UnixSecs,
 }
 
 impl<'a> Loop<'a> {
@@ -309,6 +320,7 @@ impl<'a> Loop<'a> {
             // a new fork would not find it; wait until that create is listed or has failed.
             starts_blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             restarted: true,
+            pending: Vec::new(),
         }
     }
 
@@ -437,6 +449,29 @@ impl<'a> Loop<'a> {
         self.machines
             .retain(|id, _| machines.iter().any(|m| &m.id == id));
         self.restarted = false;
+        // A create that answered has had its full request timeout and a tick to show up.
+        let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
+        self.pending.retain(|p| {
+            if machines.iter().any(|m| m.id == p.id) {
+                return false;
+            }
+            let keep = now.saturating_sub(p.sent) <= lag_s;
+            if !keep {
+                eprintln!(
+                    "warn: fork {} in pool {} was never listed; dropped",
+                    p.id, p.pool
+                );
+            }
+            keep
+        });
+        machines.extend(self.pending.iter().map(|p| Machine {
+            id: p.id.clone(),
+            pool: p.pool.clone(),
+            state: MachineState::Starting,
+            since: p.sent,
+            last_busy: p.sent.saturating_sub(1),
+            job: p.job,
+        }));
 
         let limits = Limits {
             // A null price means boat would refuse the start.
@@ -503,10 +538,26 @@ impl<'a> Loop<'a> {
                 // first machine for 24 h, even a deleted one, so a reused key would give a
                 // job or a kept fork a dead machine (docs/design.md#observed-state).
                 let key = Uuid::new_v4().to_string();
-                self.start(now, starts, |b| {
-                    b.create_from_snapshot(&p.snapshot, &p.machine_type, &labels, ttl_s, &key)
-                        .map(drop)
-                })
+                let mut created = None;
+                let result = self.start(now, starts, |b| {
+                    created = Some(b.create_from_snapshot(
+                        &p.snapshot,
+                        &p.machine_type,
+                        &labels,
+                        ttl_s,
+                        &key,
+                    )?);
+                    Ok(())
+                });
+                if let Some(id) = created {
+                    self.pending.push(Pending {
+                        id,
+                        pool: p.name.clone(),
+                        job: *job,
+                        sent: now,
+                    });
+                }
+                result
             }
         }
     }
@@ -1131,6 +1182,110 @@ mod tests {
             reqs.contains(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
             "{reqs:?}"
         );
+    }
+
+    /// boat lists `listing(t)` and GitHub queues jobs `jobs(t)` on the t-th tick (from 1);
+    /// starts are included, and every create answers `bx_55555555`.
+    fn lagging(listing: fn(usize) -> &'static str, jobs: fn(usize) -> &'static str) -> Fake {
+        let ticks = std::cell::Cell::new(0);
+        Fake::new(move |s| {
+            let url = s.url.as_str();
+            if s.method == "GET" && url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                ticks.set(ticks.get() + 1);
+                let body = format!(
+                    r#"{{"sandboxes":[{}],
+                       "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#,
+                    listing(ticks.get())
+                );
+                respond(200, &[], &body)
+            } else if s.method == "GET" && url.starts_with(&format!("{GH}/runners?")) {
+                respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+            } else if s.method == "GET" && url.contains("/runs/5/jobs") {
+                respond(200, &[], &format!(r#"{{"jobs":[{}]}}"#, jobs(ticks.get())))
+            } else if s.method == "GET" && url.ends_with("/v1/limits") {
+                respond(200, &[], r#"{"canStart":true,"nextStartDollars":0}"#)
+            } else {
+                reply(s)
+            }
+        })
+    }
+
+    const JOB_70: &str =
+        r#"{"id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}"#;
+    const JOBS_70_71: &str = r#"{"id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]},
+        {"id":71,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}"#;
+    const LISTED_55: &str = r#"{"id":"bx_55555555","state":"provisioning",
+        "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}"#;
+
+    /// Machines `observe` hands `decide` at `now`.
+    fn observed(tick_loop: &mut Loop, now: UnixSecs) -> Vec<(String, MachineState)> {
+        tick_loop.gh.begin_tick(now);
+        let (snapshot, _) = tick_loop.observe(now).unwrap();
+        snapshot
+            .machines
+            .into_iter()
+            .map(|m| (m.id, m.state))
+            .collect()
+    }
+
+    fn fork_job_70(_: &Snapshot, p: &Pool) -> Vec<Action> {
+        vec![Action::Fork {
+            pool: p.name.clone(),
+            job: Some(JobKey { id: 70, attempt: 1 }),
+        }]
+    }
+
+    /// boat omits the fork for job 70 from the next listing. Once it lists it, the fork
+    /// counts once toward `max_boxes`, so job 71 still gets the second box.
+    #[test]
+    fn a_fork_boat_has_not_listed_is_not_forked_again() {
+        let mut cfg = config();
+        cfg.pools[0].paid_start_cents_per_day = 0;
+        cfg.pools[0].max_boxes = 2;
+        let fake = lagging(
+            |t| if t < 3 { "" } else { LISTED_55 },
+            |t| if t < 3 { JOB_70 } else { JOBS_70_71 },
+        );
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        assert_eq!(forks(&fake).len(), 1);
+        tick_loop.tick(NOW + 15, crate::decide::decide).unwrap();
+        assert_eq!(forks(&fake).len(), 1);
+        tick_loop.tick(NOW + 30, crate::decide::decide).unwrap();
+        let forks = forks(&fake);
+        assert_eq!(forks.len(), 2);
+        assert!(
+            forks[1]
+                .body_text()
+                .contains(r#""sw-boat-runner-job":"71-1""#)
+        );
+    }
+
+    #[test]
+    fn a_pending_fork_clears_once_boat_lists_it() {
+        let cfg = config();
+        // Listed on the third tick only; boat dropped it by the fourth.
+        let fake = lagging(|t| if t == 3 { LISTED_55 } else { "" }, |_| JOB_70);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, fork_job_70).unwrap();
+        let starting = [("bx_55555555".to_string(), MachineState::Starting)];
+        assert_eq!(observed(&mut tick_loop, NOW + 15), starting);
+        assert_eq!(observed(&mut tick_loop, NOW + 30), starting);
+        assert!(observed(&mut tick_loop, NOW + 45).is_empty());
+    }
+
+    #[test]
+    fn a_pending_fork_expires_after_the_request_timeout_and_a_tick() {
+        let cfg = config();
+        let fake = lagging(|_| "", |_| JOB_70);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, fork_job_70).unwrap();
+        let lag_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
+        assert_eq!(
+            observed(&mut tick_loop, NOW + lag_s),
+            [("bx_55555555".to_string(), MachineState::Starting)]
+        );
+        assert!(observed(&mut tick_loop, NOW + lag_s + 1).is_empty());
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {
