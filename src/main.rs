@@ -1,11 +1,14 @@
+mod boat;
 mod decide;
+mod github;
 mod model;
 mod policy;
+mod run;
 
 use std::path::Path;
 use std::process::ExitCode;
 
-use model::{Placement, RunnerMode};
+use model::Placement;
 
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
@@ -49,19 +52,14 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
                 Placement::Fork => "fork",
             })
             .collect();
-        let runner = match p.runner {
-            RunnerMode::Persistent => "persistent",
-            RunnerMode::Jit => "jit",
-        };
         println!(
-            "pool {} labels {} machine {} snapshot {} placement {} runner {} \
+            "pool {} labels {} machine {} snapshot {} placement {} \
              min_up {} max_boxes {} slots {} idle_stop {}s paid_cap {}c",
             p.name,
             p.labels.join(","),
             p.machine_type,
             p.snapshot,
             placement.join(","),
-            runner,
             p.min_up,
             p.max_boxes,
             p.slots_per_box,
@@ -95,8 +93,11 @@ fn cmd_plan(cfg: &model::Config, snapshot: &Path) -> ExitCode {
 }
 
 fn cmd_run(cfg: &model::Config) -> ExitCode {
-    // The clients branch replaces this body with `run::run(cfg, decide::decide)`.
-    let _ = cfg;
-    eprintln!("run: not wired yet");
-    ExitCode::from(2)
+    match run::run(cfg, decide::decide) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("run: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
