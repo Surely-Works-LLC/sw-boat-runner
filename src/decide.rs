@@ -225,7 +225,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             pool: pool.name.clone(),
             job: None,
         });
-        short -= 1;
+        short = short.saturating_sub(1);
         want = want.saturating_sub(pool.slots_per_box as usize);
     }
     if has(Placement::Fork) {
