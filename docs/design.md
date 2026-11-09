@@ -92,11 +92,11 @@ its `Idempotency-Key`, so a crash and restart cannot fork twice for one job.
 
 A kept machine is forked with no job label to bring the pool up to `min_up`, or, in a
 pool with `resume` and no `fork`, for demand that no stopped machine covers. Its
-`Idempotency-Key` is `sbr-<pool>-keep-<n>`, where n is the number of the pool's kept
-machines that are not `Gone` plus the kept forks sent earlier in the tick, so a retry
-after a crash returns the same machine. boat holds a key for 24 h, so a kept machine
-deleted by hand, or by `Delete` once stopped, blocks its key, and with it the pool's next
-kept fork, for up to 24 h. A kept machine gets boat's longest TTL, 30 days, after which
+`Idempotency-Key` is a fresh UUID v4 per fork request. Keys never repeat, so boat's 24 h
+hold on a key never blocks a later kept fork, even after a kept machine is deleted by
+hand or by `Delete` once stopped. The cost: a crash while a create is in flight can fork
+one extra kept machine if boat's listing does not show it yet, bounded by `max_boxes` and
+stopped by `idle_stop_s`. A kept machine gets boat's longest TTL, 30 days, after which
 boat archives it.
 
 Two facts are kept only in memory. When each machine last had a busy runner: a machine
