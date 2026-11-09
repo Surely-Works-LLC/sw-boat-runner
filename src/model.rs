@@ -134,11 +134,29 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
-    Register { pool: String, machine: String, slot: u32 },
-    Resume { machine: String },
-    Fork { pool: String, job: JobKey },
-    Stop { machine: String },
-    Delete { machine: String },
-    Unregister { runner: String },
-    RestartRunner { machine: String, slot: u32 },
+    Register {
+        pool: String,
+        machine: String,
+        slot: u32,
+    },
+    Resume {
+        machine: String,
+    },
+    Fork {
+        pool: String,
+        job: JobKey,
+    },
+    Stop {
+        machine: String,
+    },
+    Delete {
+        machine: String,
+    },
+    Unregister {
+        runner: String,
+    },
+    RestartRunner {
+        machine: String,
+        slot: u32,
+    },
 }
