@@ -105,18 +105,19 @@ with `tla2tools.jar` v1.7.4 (sha256
 `.github/workflows/ci.yml` lists each model's sed edit. The passing models must
 exit 0. The counterexample models must fail with the message given.
 
-| Model | Base | Change |
-| --- | --- | --- |
-| hybrid | `BoatRunner.cfg` | none |
-| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start |
-| warm | `BoatRunner.cfg` | placement `slot, resume` |
-| fork | `BoatRunnerFork.cfg` | none |
+| Model | Base | Change | Distinct states | CI job |
+| --- | --- | --- | --- | --- |
+| hybrid | `BoatRunner.cfg` | none | 27869 | 1m19s |
+| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | see run annotation | 2m15s |
+| warm | `BoatRunner.cfg` | placement `slot, resume` | 7918 | 30s |
+| fork | `BoatRunnerFork.cfg` | none | see run annotation | 7m36s |
 
 ## Known violations
 
 Each fix flag set to `FALSE` reproduces one design bug. CI checks every
 counterexample, so a model change that hides one fails the build. The counts
-are from TLC 2.19 on the CI runner (2 workers).
+are from TLC 2.19 on the CI runner (2 workers). With 2 workers, the count at a
+violation varies a little between runs.
 
 ### crash-spend: StartBudget
 
@@ -196,7 +197,7 @@ model list lag.
 
 `FixForkKey = FALSE`, fork model, `NoStarvation` as the only property (TLC
 does not name the failing temporal property). TLC: `Temporal properties were
-violated.`
+violated.` (5143 distinct states, 4 s.)
 
 Trace: j1 is forked onto m1. The runner never comes online, so it is
 unregistered and m1 is deleted. The next Fork for j1 reuses the same
