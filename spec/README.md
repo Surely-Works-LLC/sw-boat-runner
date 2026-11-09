@@ -98,7 +98,7 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 ## Fix flags
 
 Each `Fix*` constant switches on one fix for a violation below. `integrate`
-f8c670c has the first eight. The code does not do `FixLostSpend` yet. The main models set all nine to TRUE, and
+3da033f has all nine; `FixLostSpend` is `src/run.rs:565`. The main models set all nine to TRUE, and
 CI also checks that each flag off still yields its counterexample, so a model
 change that hides one fails CI.
 
@@ -325,10 +325,12 @@ is deleted. j1 is still queued, and the tool forks it again: `spent_today` is
 0, so the paid start passes, and boat has counted 2 paid starts against a
 budget of 1.
 
-Cause: `run::start` adds the price to `spent_cents` only on a successful
-create, but boat counts the start of a machine it made under a lost answer.
+Cause: before 3da033f, `run::start` added the price to `spent_cents` only on a
+successful create, but boat counts the start of a machine it made under a lost
+answer.
 
-Fix: add the price on any create without a definite answer as well. If boat
+Fix: add the price on any create without a definite answer as well
+(`src/run.rs:565`). If boat
 made no machine, the tool under-spends by one start; it never over-spends.
 
 ## Design notes
@@ -369,12 +371,15 @@ picks one reading.
 - Checked against `integrate` f8c670c: `self.pending` keeps each created fork
   until a listing shows it or `HTTP_TIMEOUT` plus one tick passes, and adds it
   to the snapshot as a Starting machine. That is the model's `Known`.
-  `run::start` adds the price only when boat answers Ok, so a lost create is
+  `run::start` added the price only when boat answered Ok, so a lost create was
   not paid for, which is why `FixLostSpend` is separate. `run::execute` closes
   starts until `HTTP_TIMEOUT` plus one tick after a create that may have
   applied (a691488). The model blocks starts while a `Lost` machine is
   unlisted, which assumes that wait outlasts the listing lag.
+- Checked against `integrate` 3da033f: after a create that may have applied,
+  `run::execute` adds the quoted price to `spent_cents` (`src/run.rs:565`), and
+  a 4xx, 429 or 503 refusal adds nothing. That is `FixLostSpend`.
 
 ## Base code
 
-This branch merges `integrate` f8c670c and does not touch Rust code itself.
+The model is checked against `integrate` 3da033f. The spec does not touch Rust code.
