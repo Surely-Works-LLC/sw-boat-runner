@@ -6,7 +6,7 @@
 (* snapshot and executed later, because run::execute does not look again; *)
 (* every other tool action reads the current state. The Fix* constants    *)
 (* switch on the fixes in spec/README.md. FixCrashSpend TRUE with the     *)
-(* other four FALSE is the code as it stands.                             *)
+(* other five FALSE is the code as it stands.                             *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -26,8 +26,10 @@ CONSTANTS
     FixRegSeen,     \* Register marks the machine as having had a runner
     FixCrashSeen,   \* after a restart an Up ephemeral machine counts as used
     FixForkKey,     \* a job fork's Idempotency-Key changes once its machine is Gone
-    FixStaleAct     \* Stop and Delete first remove the machine's GitHub runner,
+    FixStaleAct,    \* Stop and Delete first remove the machine's GitHub runner,
                     \* which GitHub refuses while it runs a job
+    FixKeptInflight \* after a restart the tool starts nothing until a kept fork
+                    \* sent before the crash has landed or failed
 
 ASSUME
     /\ InitStopped \subseteq Machines
@@ -36,7 +38,8 @@ ASSUME
     /\ MinUp > 0 => "slot" \in Placement
     /\ BoxCap \in Nat /\ MinUp \in Nat /\ Included \in Nat
     /\ PaidBudget \in Nat /\ MaxFaults \in Nat
-    /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct} \subseteq BOOLEAN
+    /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct,
+        FixKeptInflight} \subseteq BOOLEAN
     /\ NoJob \notin Jobs
     /\ NoMachine \notin Machines
 
@@ -55,10 +58,11 @@ VARIABLES
     spent_today,  \* tool memory: Limits.spent_today_cents, in start prices
     keys,         \* boat: job fork Idempotency-Keys already used today
     ran,          \* ghost: a job ran on this ephemeral machine
+    inflight,     \* boat: a kept fork sent before a crash, not yet in the listing
     faults
 
 vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
-          starts, spent_today, keys, ran, faults>>
+          starts, spent_today, keys, ran, inflight, faults>>
 
 -----------------------------------------------------------------------------
 (* What decide derives from one snapshot. *)
@@ -97,7 +101,7 @@ Short == MinUp - Count({m \in Machines : Kept(m) /\ Live(m)})
 \* price is the one for the next start.
 Price == IF starts < Included THEN 0 ELSE 1
 BudgetOK == Price = 0 \/ spent_today + Price <= PaidBudget
-StartOK == BudgetOK /\ Boxes < BoxCap
+StartOK == BudgetOK /\ Boxes < BoxCap /\ ~(FixKeptInflight /\ inflight)
 Pay == spent_today' = spent_today + Price
 Paid == IF starts > Included THEN starts - Included ELSE 0
 
@@ -195,19 +199,19 @@ Drop(m) ==
 Unregister(m) ==
     /\ UnregisterGuard(m)
     /\ runner' = [runner EXCEPT ![m] = "None"]
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 Delete(m) ==
     /\ DeleteGuard(m)
     /\ plan' = [plan EXCEPT ![m] = "Delete"]
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, age,
                    starts, spent_today, keys, ran, faults>>
 
 Stop(m) ==
     /\ StopGuard(m)
     /\ plan' = [plan EXCEPT ![m] = "Stop"]
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, age,
                    starts, spent_today, keys, ran, faults>>
 
 StopNow(m) ==
@@ -215,7 +219,7 @@ StopNow(m) ==
     /\ keep' = [keep EXCEPT ![m] = TRUE]
     /\ idle' = [idle EXCEPT ![m] = FALSE]
     /\ Drop(m)
-    /\ UNCHANGED <<job, seen, age, ran>>
+    /\ UNCHANGED <<inflight, job, seen, age, ran>>
 
 DeleteNow(m) ==
     /\ mstate' = [mstate EXCEPT ![m] = "Gone"]
@@ -232,15 +236,15 @@ Execute(m) ==
     /\ plan[m] # "None"
     /\ plan' = [plan EXCEPT ![m] = "None"]
     /\ IF FixStaleAct /\ runner[m] = "Busy"
-       THEN UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age, ran>>
+       THEN UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, age, ran>>
        ELSE IF plan[m] = "Stop" THEN StopNow(m) ELSE DeleteNow(m)
-    /\ UNCHANGED <<starts, spent_today, keys, faults>>
+    /\ UNCHANGED <<inflight, starts, spent_today, keys, faults>>
 
 Register(m) ==
     /\ RegisterGuard(m)
     /\ runner' = [runner EXCEPT ![m] = "Registered"]
     /\ seen' = IF FixRegSeen /\ IsEph(m) THEN [seen EXCEPT ![m] = TRUE] ELSE seen
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, status, jobOn, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 \* The tool adds the quoted price whether or not boat counts the start.
@@ -250,7 +254,7 @@ Resume(m) ==
     /\ keep' = [keep EXCEPT ![m] = FALSE]
     /\ starts' = IF keep[m] THEN starts ELSE starts + 1
     /\ Pay
-    /\ UNCHANGED <<job, runner, status, jobOn, seen, idle, age, plan, keys, ran, faults>>
+    /\ UNCHANGED <<inflight, job, runner, status, jobOn, seen, idle, age, plan, keys, ran, faults>>
 
 NewMachine(m, j) ==
     /\ mstate' = [mstate EXCEPT ![m] = "Starting"]
@@ -263,7 +267,7 @@ NewMachine(m, j) ==
 ForkKept ==
     /\ ForkKeptGuard
     /\ \E m \in FreeIds : NewMachine(m, NoJob)
-    /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, keys, ran, faults>>
+    /\ UNCHANGED <<inflight, keep, runner, status, jobOn, idle, plan, keys, ran, faults>>
 
 \* With the job key as Idempotency-Key, boat answers a reused key with the old,
 \* deleted machine: nothing starts, and the tool still adds the price.
@@ -272,9 +276,9 @@ Fork(j) ==
     /\ IF FixForkKey \/ j \notin keys
        THEN /\ \E m \in FreeIds : NewMachine(m, j)
             /\ keys' = IF FixForkKey THEN keys ELSE keys \cup {j}
-            /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran, faults>>
+            /\ UNCHANGED <<inflight, keep, runner, status, jobOn, idle, plan, ran, faults>>
        ELSE /\ Pay
-            /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age,
+            /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, age,
                            plan, starts, keys, ran, faults>>
 
 Observe(m) ==
@@ -282,7 +286,7 @@ Observe(m) ==
     /\ ObserveGuard(m)
     /\ seen' = [seen EXCEPT ![m] = @ \/ IsEph(m)]
     /\ idle' = [idle EXCEPT ![m] = FALSE]
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 -----------------------------------------------------------------------------
@@ -291,7 +295,7 @@ Observe(m) ==
 Arrive(j) ==
     /\ status[j] = "Pending"
     /\ status' = [status EXCEPT ![j] = "Queued"]
-    /\ UNCHANGED <<mstate, job, keep, runner, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 Assign(j, m) ==
@@ -302,7 +306,7 @@ Assign(j, m) ==
     /\ jobOn' = [jobOn EXCEPT ![j] = m]
     /\ runner' = [runner EXCEPT ![m] = "Busy"]
     /\ ran' = IF IsEph(m) THEN [ran EXCEPT ![m] = TRUE] ELSE ran
-    /\ UNCHANGED <<mstate, job, keep, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, seen, idle, age, plan,
                    starts, spent_today, keys, faults>>
 
 \* A JIT runner exits after its job and GitHub removes it.
@@ -311,7 +315,7 @@ Finish(j) ==
     /\ status' = [status EXCEPT ![j] = "Done"]
     /\ jobOn' = [jobOn EXCEPT ![j] = NoMachine]
     /\ runner' = [runner EXCEPT ![jobOn[j]] = "None"]
-    /\ UNCHANGED <<mstate, job, keep, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 \* A state change moves since, so age and the seen flag start over.
@@ -321,14 +325,14 @@ Boot(m) ==
     /\ age' = [age EXCEPT ![m] = 0]
     /\ seen' = [seen EXCEPT ![m] = FALSE]
     /\ idle' = [idle EXCEPT ![m] = FALSE]
-    /\ UNCHANGED <<job, keep, runner, status, jobOn, plan,
+    /\ UNCHANGED <<inflight, job, keep, runner, status, jobOn, plan,
                    starts, spent_today, keys, ran, faults>>
 
 ComeOnline(m) ==
     /\ mstate[m] = "Up"
     /\ runner[m] = "Registered"
     /\ runner' = [runner EXCEPT ![m] = "Idle"]
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 (* Time is abstract: a flag moves once its timeout has passed. The timing    *)
@@ -343,7 +347,7 @@ TickIdle(m) ==
     /\ runner[m] \in {"None", "Idle", "Offline"}
     /\ ~(Queued # {} /\ runner[m] \in {"None", "Idle"})
     /\ idle' = [idle EXCEPT ![m] = TRUE]
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 TickAge(m) ==
@@ -352,7 +356,7 @@ TickAge(m) ==
     /\ age[m] < 2
     /\ ~(m \in Fresh /\ Want0 > 0)
     /\ age' = [age EXCEPT ![m] = @ + 1]
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, plan,
                    starts, spent_today, keys, ran, faults>>
 
 \* boat keeps a stopped machine's disk for 10 minutes.
@@ -360,7 +364,7 @@ TickKeep(m) ==
     /\ mstate[m] = "Stopped"
     /\ keep[m]
     /\ keep' = [keep EXCEPT ![m] = FALSE]
-    /\ UNCHANGED <<mstate, job, runner, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, runner, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
 -----------------------------------------------------------------------------
@@ -375,7 +379,7 @@ Reassign(j) ==
     /\ status' = [status EXCEPT ![j] = "Queued"]
     /\ jobOn' = [jobOn EXCEPT ![j] = NoMachine]
     /\ runner' = [runner EXCEPT ![jobOn[j]] = "None"]
-    /\ UNCHANGED <<mstate, job, keep, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
 \* The resume then costs a counted start.
@@ -383,7 +387,7 @@ LoseKept(m) ==
     /\ Fault
     /\ keep[m]
     /\ keep' = [keep EXCEPT ![m] = FALSE]
-    /\ UNCHANGED <<mstate, job, runner, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, runner, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
 \* A JIT runner that never comes online; Expired means its timeout passed.
@@ -391,7 +395,7 @@ NeverOnline(m) ==
     /\ Fault
     /\ runner[m] = "Registered"
     /\ runner' = [runner EXCEPT ![m] = "Expired"]
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
 RunnerOffline(m) ==
@@ -399,7 +403,7 @@ RunnerOffline(m) ==
     /\ mstate[m] = "Up"
     /\ runner[m] = "Idle"
     /\ runner' = [runner EXCEPT ![m] = "Offline"]
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
 \* boat answers 429 or 503: nothing starts, nothing is counted, and the tool
@@ -407,14 +411,14 @@ RunnerOffline(m) ==
 RefuseStart ==
     /\ Fault
     /\ CanResume \/ ForkKeptGuard \/ \E j \in Jobs : ForkGuard(j)
-    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
+    /\ UNCHANGED <<inflight, mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
 (* A restart between two actions loses the tick's unexecuted plan. Every     *)
 (* machine's since and last_busy start over at first sight, and the online   *)
 (* set is lost, so a runner that went offline reads as Registered past its   *)
 (* timeout. spent_today cannot be recovered from boat.                       *)
-Crash ==
+CrashState ==
     /\ Fault
     /\ seen' = [m \in Machines |-> FixCrashSeen /\ IsEph(m) /\ mstate[m] = "Up"]
     /\ idle' = [m \in Machines |-> FALSE]
@@ -423,6 +427,37 @@ Crash ==
     /\ runner' = [m \in Machines |-> IF runner[m] = "Offline" THEN "Expired" ELSE runner[m]]
     /\ spent_today' = IF FixCrashSpend THEN PaidBudget ELSE 0
     /\ UNCHANGED <<mstate, job, keep, status, jobOn, starts, keys, ran>>
+
+Crash == CrashState /\ UNCHANGED inflight
+
+(* A crash after boat took a kept fork and before it lists the machine.     *)
+(* Kept forks carry a fresh UUID v4 key, so the tool cannot find the create *)
+(* again: it reads only the listing. boat counts the start when the machine *)
+(* appears, and the tool's memory of the spend is gone with the crash.      *)
+CrashInFork ==
+    /\ ~inflight
+    /\ ForkKeptGuard
+    /\ CrashState
+    /\ inflight' = TRUE
+
+\* The machine needs a free model id; without one the create is modelled as lost.
+Land ==
+    /\ inflight
+    /\ \E m \in FreeIds :
+          /\ mstate' = [mstate EXCEPT ![m] = "Starting"]
+          /\ job' = [job EXCEPT ![m] = NoJob]
+          /\ age' = [age EXCEPT ![m] = 0]
+          /\ seen' = [seen EXCEPT ![m] = FALSE]
+    /\ starts' = starts + 1
+    /\ inflight' = FALSE
+    /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, spent_today, keys, ran, faults>>
+
+\* boat cancels the create.
+Lost ==
+    /\ inflight
+    /\ inflight' = FALSE
+    /\ UNCHANGED <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
+                   starts, spent_today, keys, ran, faults>>
 
 -----------------------------------------------------------------------------
 
@@ -441,6 +476,7 @@ Init ==
     /\ spent_today = 0
     /\ keys = {}
     /\ ran = [m \in Machines |-> FALSE]
+    /\ inflight = FALSE
     /\ faults = 0
 
 ToolStep ==
@@ -466,6 +502,8 @@ EnvStep ==
           \/ TickIdle(m)
           \/ TickAge(m)
           \/ TickKeep(m)
+    \/ Land
+    \/ Lost
 
 FaultStep ==
     \/ \E j \in Jobs : Reassign(j)
@@ -475,6 +513,7 @@ FaultStep ==
           \/ RunnerOffline(m)
     \/ RefuseStart
     \/ Crash
+    \/ CrashInFork
 
 Next == ToolStep \/ EnvStep \/ FaultStep
 
@@ -496,6 +535,7 @@ Fairness ==
           /\ WF_vars(TickAge(m))
           /\ WF_vars(TickKeep(m))
     /\ WF_vars(ForkKept)
+    /\ WF_vars(Land \/ Lost)
     /\ \A j \in Jobs :
           /\ WF_vars(Fork(j))
           /\ WF_vars(Finish(j))
@@ -521,6 +561,7 @@ TypeOK ==
     /\ spent_today \in Nat
     /\ keys \subseteq Jobs
     /\ ran \in [Machines -> BOOLEAN]
+    /\ inflight \in BOOLEAN
     /\ faults \in 0..MaxFaults
 
 \* 1

@@ -32,8 +32,10 @@ and `src/run.rs` implement it on branch `integrate`. TLC checks it in CI (job `t
 - **Faults**, at most `MaxFaults` per behaviour: GitHub reassigns a running job
   (requeued, runner gone); boat loses a kept disk; boat refuses a start (429 or
   503); a JIT runner never comes online; an Idle runner goes offline; the tool
-  crashes. A crash wipes the tool's memory: the unexecuted plan, `since`,
-  `last_busy`, the online set, and `spent_today`.
+  crashes, possibly while boat creates a kept fork (`inflight`). A crash wipes the tool's memory: the unexecuted plan, `since`,
+  `last_busy`, the online set, and `spent_today`. A kept fork in flight at the
+  crash later lands (`Land`, a counted start) or fails (`Lost`), and the restarted
+  tool cannot see it until it lands.
 - **Time** is abstract. `age` is 0, 1 (past `register_timeout_s`) or 2 (past
   `fork_ttl_s`), counted from `since`, which restarts on every state change and
   on a crash. `idle` means `idle_stop_s` since `last_busy` and `min_up_s` since
@@ -49,7 +51,9 @@ and `src/run.rs` implement it on branch `integrate`. TLC checks it in CI (job `t
   refused start, and the GitHub API's own failures are not modelled.
 - A stopped or deleted machine requeues its running job; real GitHub fails it.
   Either way the job leaves the runner, which is what the properties need.
-- Kept fork keys (`sbr-<pool>-keep-<n>`) are not modelled; job fork keys are.
+- Kept fork keys are a fresh UUID v4 per request, so they never collide and are
+  not modelled; job fork keys are. An in-flight kept fork lands only on a free
+  model id; with none free it can only fail.
 - Timing assumptions, written into the time actions: the tool registers within a
   tick and GitHub assigns within seconds, both well inside `idle_stop_s` and
   `register_timeout_s`. So a kept machine that could serve a queued job does not
@@ -78,8 +82,8 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 ## Fix flags
 
 Each `Fix*` constant switches on one fix for a violation below. `FixCrashSpend`
-is already in the code; the other four are proposals. The main models set all
-five to TRUE, and CI also checks that each flag off still yields its
+is already in the code; the other five are proposals. The main models set all
+six to TRUE, and CI also checks that each flag off still yields its
 counterexample, so a model change that hides one fails CI.
 
 | Flag | Fix |
@@ -89,6 +93,7 @@ counterexample, so a model change that hides one fails CI.
 | `FixRegSeen` | Register sets `last_busy` on a job fork, so a fork that had a runner is never fresh again |
 | `FixCrashSeen` | after a restart, an Up job fork counts as used (it can be deleted, never re-registered) |
 | `FixForkKey` | the job fork Idempotency-Key also names the fork attempt, so a fork after a Delete starts a machine |
+| `FixKeptInflight` | after a restart, start nothing until boat's create timeout has passed, so a kept fork sent before the crash is listed or failed |
 
 ## Running TLC
 
@@ -210,6 +215,31 @@ gets the old answer.
 Fix: put an attempt counter in the key, for example `job-attempt`, and bump it
 whenever the previous fork for that job is gone.
 
+### kept-inflight: MaxBoxes
+
+`FixKeptInflight = FALSE`, hybrid model with `MinUp = 1`, no stopped machine at
+the start and `Included = 2`. TLC: `Invariant MaxBoxes is violated.` (Counts in the CI run annotation.)
+
+Trace: the pool is short of `min_up`, so the tool sends a free kept fork. The
+daemon crashes before boat lists the machine. The restarted daemon sees no kept
+machine and forks another, free. j1 and j2 arrive and j1 is forked, free, which
+fills `max_boxes` = 2. Then the first kept fork lands: 3 live machines.
+
+Cause: a kept fork's key is a fresh UUID v4, so the restarted daemon cannot find
+the create again, and it counts boxes from boat's listing, which does not show
+the machine yet. Every start it makes before the orphan lands is counted against
+too few boxes. With `PaidBudget = 0` the same stale count also breaks
+`StartBudget` (argued, not checked in CI): with `Included = 1` the orphan and the
+restarted daemon's kept fork are both priced free, and boat counts one as paid. With a paid
+budget of at least one start the cap absorbs it, because an orphan priced free
+means no paid start came before it.
+
+Fix: after a restart, make no start until boat's create timeout has passed, so
+any kept fork sent before the crash is listed or has failed. The model blocks
+every start while `inflight` holds. Alternatives: persist the pending kept-fork
+keys, or derive the kept key from the pool and the day (`<pool>-keep-<day>-<n>`)
+so a retry returns the same machine, which brings back key reuse after a delete.
+
 ## Design notes
 
 These are the places where `docs/design.md` is ambiguous or where the model
@@ -222,18 +252,24 @@ picks one reading.
 - The refused status codes are 409, 429 and 503 in one place and 429 and 503 in
   another. The model treats every refusal the same way.
 - The day never rolls over, so the budget is spent at most once per run.
-- A kept machine's fork key stays blocked for 24 hours after a delete. The model
-  never re-forks a kept slot.
+- `max_boxes` is not a hard bound across a restart: see kept-inflight. design.md
+  says the extra kept machine is "bounded by `max_boxes`"; it is bounded by
+  `max_boxes + 1` unless the restart waits for in-flight creates.
 - The race where the runner list lags behind boat is not modelled.
 - Kept forks ignore `placement`.
 - A free resume of a kept machine counts as a start, even when it costs nothing.
 - Drop requeues a job while GitHub marks it failed. The model requeues it.
 - The quote is re-read after each start.
+- Checked against `integrate` 8c5f6d9: the restart seeds `spent_cents` with the
+  largest pool cap (`FixCrashSpend`), a pool without resume deletes a Stopped
+  kept machine with no Busy runner (`DeleteGuard`), and in a pool with resume and
+  no fork the kept-fork loop also runs for demand within `max_boxes` and the
+  budget (`ForkKeptGuard`). The model already matched all three.
 - The model's Stop exclusion (no Stop while any demand is unmet) is coarser
   than the code's, which compares per label.
 
 ## Base code
 
-On commit `922a3b7`, the `rust` job fails `cargo fmt --check` in
-`src/model.rs` (the `Action` enum at line 134). This branch does not touch
-that file. Running `cargo fmt` on the base fixes it.
+On commit `922a3b7`, the `rust` job failed `cargo fmt --check` in
+`src/model.rs`. This branch merges `integrate` 8c5f6d9, which carries the
+formatting fix (`0302c82 model: rustfmt`), and does not touch Rust code itself.
