@@ -288,13 +288,13 @@ impl<'a> Loop<'a> {
             machines: HashMap::new(),
             online: HashSet::new(),
             spent_day: None,
-            // boat does not report what was spent today, so a restart assumes the
-            // smallest pool cap is used up.
+            // boat does not report what was spent today, so after a restart every pool's
+            // budget counts as spent until 00:00 UTC.
             spent_cents: cfg
                 .pools
                 .iter()
                 .map(|p| p.paid_start_cents_per_day)
-                .min()
+                .max()
                 .unwrap_or(0),
             starts_blocked_until: 0,
         }
@@ -770,7 +770,7 @@ mod tests {
             Limits {
                 can_start: true,
                 next_start_cents: 25,
-                // A fresh process assumes the smallest cap is spent.
+                // A fresh process assumes every pool's cap is spent.
                 spent_today_cents: 100
             }
         );
@@ -902,6 +902,27 @@ mod tests {
         assert_eq!(resumes, 1);
         assert!(!reqs.contains(&format!("POST {BOAT}/sandboxes")));
         assert_eq!(tick_loop.spent_cents, 100);
+    }
+
+    #[test]
+    fn a_restart_makes_no_paid_starts_until_the_day_ends() {
+        let mut cfg = config();
+        let mut big = cfg.pools[0].clone();
+        big.name = "big".into();
+        big.paid_start_cents_per_day = 500;
+        cfg.pools.insert(0, big);
+        let fake = Fake::new(reply);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
+        assert_eq!(tick_loop.spent_cents, 500);
+        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        // Job 70 is queued and every start is quoted at 25 cents.
+        let reqs = requests(&fake);
+        assert!(
+            !reqs.contains(&format!("POST {BOAT}/sandboxes")),
+            "{reqs:?}"
+        );
+        assert!(!reqs.iter().any(|r| r.ends_with("/resume")), "{reqs:?}");
+        assert_eq!(tick_loop.spent_cents, 500);
     }
 
     fn fork_two_kept(_: &Snapshot, p: &Pool) -> Vec<Action> {
