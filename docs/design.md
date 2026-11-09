@@ -125,6 +125,8 @@ else. Rules that keep the tool safe on a stale snapshot and across a restart, ea
   may still have started a machine. The tool then makes no start until the HTTP request
   timeout plus one tick has passed, so the machine is listed with its job label or never
   existed. A 4xx refusal does not wait; a 429 or 503 refusal waits its `Retry-After`.
+- Lost spend (`FixLostSpend`): such a create also adds its quoted price to today's spend,
+  as if it had succeeded, because boat may have charged for it. A refusal adds nothing.
 - Restart spend (`FixCrashSpend`): after a restart every pool's budget counts as spent
   until 00:00 UTC.
 
