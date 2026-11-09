@@ -112,10 +112,14 @@ exit 0. The counterexample models must fail with the message given.
 
 | Model | Base | Change | Distinct states | CI job |
 | --- | --- | --- | --- | --- |
-| hybrid | `BoatRunner.cfg` | none | 27869 | 1m19s |
-| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | see run annotation | 2m15s |
-| warm | `BoatRunner.cfg` | placement `slot, resume` | 7918 | 30s |
-| fork | `BoatRunnerFork.cfg` | none | see run annotation | 7m36s |
+| hybrid | `BoatRunner.cfg` | none | 27869 | 44s |
+| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | see run annotation | 1m26s |
+| warm | `BoatRunner.cfg` | placement `slot, resume` | see run annotation | 28s |
+| fork | `BoatRunnerFork.cfg` | none | see run annotation | 4m23s |
+
+hybrid's count is from the run before `inflight` was added. hybrid has no
+`min_up` and has fork, so it never forks a kept machine and its state space is
+unchanged.
 
 ## Known violations
 
@@ -126,7 +130,7 @@ violation varies a little between runs.
 
 ### crash-spend: StartBudget
 
-`FixCrashSpend = FALSE`. TLC: `Invariant StartBudget is violated.` (708
+`FixCrashSpend = FALSE`. TLC: `Invariant StartBudget is violated.` (698
 distinct states, 3 s.)
 
 Trace: job j1 arrives. The included free start resumes m1. j2 arrives. j1 is
@@ -143,8 +147,8 @@ persist it. The model sets it to `PaidBudget`.
 
 ### stale-act: NoBusyStop
 
-`FixStaleAct = FALSE`. TLC: `Action property NoBusyStop is violated.` (2804
-distinct states, 10 s.)
+`FixStaleAct = FALSE`. TLC: `Action property NoBusyStop is violated.` (2714
+distinct states, 9 s.)
 
 Trace: j1 is forked onto m2. The runner registers and comes online Idle while
 j1 is still queued. m2 ages past `fork_ttl_s` and the plan deletes it. Before
@@ -165,7 +169,7 @@ queue. The fix covers both cases.
 ### reg-seen: EphemeralIsolation
 
 `FixRegSeen = FALSE`, fork model. TLC: `Action property EphemeralIsolation is
-violated.` (7151 distinct states, 12 s.)
+violated.` (7152 distinct states, 12 s.)
 
 Trace: j1 arrives and is forked onto m1. The runner registers, comes online and
 runs j1. The runner then goes away and GitHub requeues j1 before any Observe
@@ -181,7 +185,7 @@ never register a second runner on a fork that is marked seen.
 ### crash-seen: EphemeralIsolation
 
 `FixCrashSeen = FALSE`, fork model. TLC: `Action property EphemeralIsolation
-is violated.` (9192 distinct states, 9 s.)
+is violated.` (8837 distinct states, 9 s.)
 
 Trace: as in reg-seen, except the fork was already marked seen, and a crash
 reset `seen` to empty. The restarted daemon registers a new runner on the used
@@ -202,7 +206,7 @@ model list lag.
 
 `FixForkKey = FALSE`, fork model, `NoStarvation` as the only property (TLC
 does not name the failing temporal property). TLC: `Temporal properties were
-violated.` (5143 distinct states, 4 s.)
+violated.` (2933 distinct states, 6 s.)
 
 Trace: j1 is forked onto m1. The runner never comes online, so it is
 unregistered and m1 is deleted. The next Fork for j1 reuses the same
@@ -218,9 +222,11 @@ whenever the previous fork for that job is gone.
 ### kept-inflight: MaxBoxes
 
 `FixKeptInflight = FALSE`, hybrid model with `MinUp = 1`, no stopped machine at
-the start and `Included = 2`. TLC: `Invariant MaxBoxes is violated.` (Counts in the CI run annotation.)
+the start and `Included = 2`. TLC: `Invariant MaxBoxes is violated.` (888 distinct
+states, 6 s.)
 
-Trace: the pool is short of `min_up`, so the tool sends a free kept fork. The
+A trace that reaches it (TLC's own trace is in the job log): the pool is
+short of `min_up`, so the tool sends a free kept fork. The
 daemon crashes before boat lists the machine. The restarted daemon sees no kept
 machine and forks another, free. j1 and j2 arrive and j1 is forked, free, which
 fills `max_boxes` = 2. Then the first kept fork lands: 3 live machines.
