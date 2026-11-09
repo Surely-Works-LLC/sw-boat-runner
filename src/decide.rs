@@ -417,7 +417,7 @@ mod tests {
             runner: offline[0].name.clone(),
         };
         let quiet = snap(vec![machine("m1", Ms::Up)], offline.clone(), &[]);
-        assert_eq!(decide(&quiet, &p), [unregister.clone()]);
+        assert_eq!(decide(&quiet, &p), std::slice::from_ref(&unregister));
 
         let queued = snap(vec![machine("m1", Ms::Up)], offline, &[1]);
         assert_eq!(decide(&queued, &p), [unregister, register("m1", 0)]);
