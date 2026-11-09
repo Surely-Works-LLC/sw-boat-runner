@@ -53,6 +53,14 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 - `N > 0`: also allow paid starts while the cents spent on starts today, plus the price
   of this start, stay at or under N.
 
+Within one tick, starts are free while `GET /limits` reports included starts left, and
+each start after that costs the reported price. One account serves every pool, so the
+spend each pool's actions add counts against the next pool in the same tick.
+
+The cents spent today are counted in memory. A restart cannot recover them, so after a
+restart the tool treats the day's budget as spent and makes only included starts until
+00:00 UTC. A crash can delay paid starts but never exceed the cap.
+
 boat never queues a start. A refused start (429 or 503) is not counted, and the tool
 retries it on a later tick.
 
@@ -74,9 +82,10 @@ Runner names carry what the tool needs to know about them:
 label `sw-boat-runner-job=<job id>-<attempt>`, and its fork request uses the same value as
 its `Idempotency-Key`, so a crash and restart cannot fork twice for one job.
 
-The one fact kept only in memory is when each machine last had a busy runner. After a
-restart it counts from the restart, which can only delay a stop. Restarting the process
-loses nothing else.
+Two facts are kept only in memory. When each machine last had a busy runner: after a
+restart it counts from the restart, which can only delay a stop. The cents spent on
+starts today: see [Start budget](#start-budget). Restarting the process loses nothing
+else.
 
 ## State machine
 
@@ -86,7 +95,7 @@ Machine states, mapped from boat's states:
 
 | State | boat states |
 | - | - |
-| `Starting` | `provisioning`, `provisioned`, `cloning`, or `ready` with no runner yet |
+| `Starting` | `provisioning`, `provisioned`, `cloning` |
 | `Up` | `ready`, `idle`, `running` |
 | `Stopping` | a stop in progress |
 | `Stopped` | stopped, disk kept |
@@ -100,15 +109,26 @@ Runner states: `Registered` (JIT config issued, not online yet), `Idle` (online,
 | Action | Guard |
 | - | - |
 | `Register(machine, slot)` | machine `Up`, slot free, unmet demand for the pool's labels |
-| `Resume(machine)` | machine `Stopped`, unmet demand left after free slots, `resume` in placement, start budget allows, `Up + Starting < max_boxes` |
+| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or `Up + Starting < min_up` |
 | `Fork(job)` | unmet demand left after slots and resumes, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine with this job's label yet |
-| `Stop(machine)` | machine `Up`, not ephemeral, no `Busy` or `Registered` runner, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` machines `Up` |
-| `Delete(machine)` | ephemeral machine whose job finished, or past its TTL |
-| `Unregister(runner)` | `Registered` past `register_timeout_s`, or runner on a machine that is not `Up` |
+| `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand, no `Busy` or `Registered` runner, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` machines `Up` |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s` |
+| `Unregister(runner)` | `Registered` past `register_timeout_s`, JIT runner `Offline`, or runner on a machine that is not `Up` |
 | `RestartRunner(machine, slot)` | persistent runner `Offline` on an `Up` machine |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
-in `Registered` or `Idle`.
+in `Registered` or `Idle`, minus the capacity of its `Starting` machines (one for an
+ephemeral machine, `slots_per_box` for any other). A job matches a pool when the job's
+labels, compared without case, are a subset of the pool's; list `self-hosted` in the
+pool's labels. A job that matches several pools counts only for the first one in the
+file.
+
+Stop needs `resume` in placement because without it a stopped machine never comes back.
+A `Busy` runner keeps its machine even past `fork_ttl_s`.
+
+An ephemeral machine's job has finished when the machine is `Stopped`, or when it is `Up`
+with no live runner and either a runner on it was seen busy or it is older than
+`register_timeout_s`.
 
 ## Properties
 
