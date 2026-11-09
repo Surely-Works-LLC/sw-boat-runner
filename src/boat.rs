@@ -56,6 +56,17 @@ impl Error {
     pub fn is_fatal(&self) -> bool {
         matches!(self, Error::BillingRequired | Error::Unauthorized { .. })
     }
+
+    /// Failures without a definite answer, so boat may have done what was asked: a
+    /// transport error or timeout, a 5xx that is not a refusal, or a 2xx whose body did
+    /// not parse. A 4xx is a refusal.
+    pub fn may_have_applied(&self) -> bool {
+        match self {
+            Error::Network(_) => true,
+            Error::Other { status, .. } => !(400..500).contains(status),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -240,7 +251,7 @@ impl<'t> Client<'t> {
     }
 
     /// Starts a new machine from the saved snapshot. boat returns the first sandbox again
-    /// for a repeat of the same key and body within 24 h, so a crash cannot fork twice.
+    /// for a repeat of the same key and body within 24 h, even a deleted one.
     /// `ttl_s` must be 1 to `MAX_TTL_S`.
     pub fn create_from_snapshot(
         &self,
@@ -418,6 +429,26 @@ mod tests {
             }
         );
         assert!(!err(429, &[], "").is_fatal());
+    }
+
+    #[test]
+    fn only_answerless_failures_may_have_applied() {
+        assert!(Error::Network("timed out".into()).may_have_applied());
+        assert!(err(500, &[], r#"{"code":"internal"}"#).may_have_applied());
+        assert!(err(503, &[], r#"{"code":"browser_not_ready"}"#).may_have_applied());
+        // A create that boat accepted but answered with a body this client cannot read.
+        for body in ["not json", r#"{"ok":true}"#] {
+            let fake = Fake::new(move |_| respond(202, &[], body));
+            let e = Client::new(&fake, "k".into())
+                .create_from_snapshot("base", "large", &BTreeMap::new(), 60, "key")
+                .unwrap_err();
+            assert!(e.may_have_applied(), "{e}");
+        }
+        assert!(!err(429, &[("Retry-After", "30")], "").may_have_applied());
+        assert!(!err(503, &[], r#"{"code":"no_ready_machine"}"#).may_have_applied());
+        assert!(!err(409, &[], r#"{"code":"idempotency_in_progress"}"#).may_have_applied());
+        assert!(!err(422, &[], r#"{"code":"invalid_request"}"#).may_have_applied());
+        assert!(!err(402, &[], "").may_have_applied());
     }
 
     #[test]
