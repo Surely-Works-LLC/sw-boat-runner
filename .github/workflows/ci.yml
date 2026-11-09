@@ -41,23 +41,25 @@ jobs:
           - name: crash-spend
             cfg: spec/BoatRunner.cfg
             edit: 's/^FixCrashSpend = TRUE/FixCrashSpend = FALSE/'
-            expect: EXPLORE
+            expect: Invariant StartBudget is violated.
           - name: stale-act
             cfg: spec/BoatRunner.cfg
             edit: 's/^FixStaleAct = TRUE/FixStaleAct = FALSE/'
-            expect: EXPLORE
+            expect: Action property NoBusyStop is violated.
           - name: reg-seen
             cfg: spec/BoatRunnerFork.cfg
             edit: 's/^FixRegSeen = TRUE/FixRegSeen = FALSE/'
-            expect: EXPLORE
+            expect: Action property EphemeralIsolation is violated.
           - name: crash-seen
             cfg: spec/BoatRunnerFork.cfg
             edit: 's/^FixCrashSeen = TRUE/FixCrashSeen = FALSE/'
-            expect: EXPLORE
+            expect: Action property EphemeralIsolation is violated.
+          # TLC does not name the temporal property that fails, so this model
+          # keeps NoStarvation alone.
           - name: fork-key
             cfg: spec/BoatRunnerFork.cfg
-            edit: 's/^FixForkKey = TRUE/FixForkKey = FALSE/;/^PROPERTY /d;$a PROPERTY NoStarvation'
-            expect: EXPLORE
+            edit: 's/^FixForkKey = TRUE/FixForkKey = FALSE/;/^PROPERTY NoStarvation$/!{/^PROPERTY /d;}'
+            expect: Temporal properties were violated.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -84,6 +86,9 @@ jobs:
             -config spec/Variant.cfg spec/BoatRunner.tla | tee tlc.log
           status=${PIPESTATUS[0]}
           set -e
+          # The counts show in the run's annotations.
+          stats=$(grep -E "distinct states found, [0-9]+ states left|^Finished in" tlc.log | tr '\n' ' ' || true)
+          echo "::notice title=TLC ${{ matrix.name }}::exit $status; $stats"
           if [ -z "$EXPECT" ]; then
             exit "$status"
           fi
