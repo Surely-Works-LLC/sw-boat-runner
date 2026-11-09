@@ -179,7 +179,6 @@ fn rank(a: &Action) -> u8 {
         Action::Register { .. } => 3,
         Action::Resume { .. } => 4,
         Action::Fork { .. } => 5,
-        Action::RestartRunner { .. } => 6,
     }
 }
 
@@ -228,10 +227,43 @@ struct Seen {
     last_busy: UnixSecs,
 }
 
-/// Whether this tick may still start machines, and the price `decide` was shown.
+/// Whether this tick may still start machines, the price `decide` was shown, and the
+/// kept machines each pool has forked so far this tick.
 struct Starts {
     open: bool,
     price: Cents,
+    kept_forks: HashMap<String, usize>,
+}
+
+/// The actions `decide` asks for across all pools, in file order. Each pool sees only the
+/// queued jobs it is the first in the file to serve, so two pools never fork for one job,
+/// and sees the spend of the starts earlier pools plan, so no pool overruns its cap.
+pub fn plan<'c>(
+    cfg: &'c Config,
+    snap: &Snapshot,
+    decide: fn(&Snapshot, &Pool) -> Vec<Action>,
+) -> Vec<(&'c Pool, Action)> {
+    let mut out = Vec::new();
+    let mut planned: Cents = 0;
+    for pool in &cfg.pools {
+        let mut routed = snap.clone();
+        routed.queued.retain(|j| {
+            cfg.pools
+                .iter()
+                .find(|p| p.serves(&j.labels))
+                .is_some_and(|p| p.name == pool.name)
+        });
+        routed.limits.spent_today_cents = snap.limits.spent_today_cents.saturating_add(planned);
+        let actions = decide(&routed, pool);
+        let starts = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Resume { .. } | Action::Fork { .. }))
+            .count();
+        let starts = Cents::try_from(starts).unwrap_or(Cents::MAX);
+        planned = planned.saturating_add(starts.saturating_mul(snap.limits.next_start_cents));
+        out.extend(actions.into_iter().map(|a| (pool, a)));
+    }
+    out
 }
 
 pub struct Loop<'a> {
@@ -241,7 +273,8 @@ pub struct Loop<'a> {
     machines: HashMap<String, Seen>,
     /// Runner names this process has seen online; see `github::runner_state`.
     online: HashSet<String>,
-    spent_day: u64,
+    /// The UTC day `spent_cents` counts; `None` until the first tick.
+    spent_day: Option<u64>,
     spent_cents: Cents,
     starts_blocked_until: UnixSecs,
 }
@@ -254,8 +287,15 @@ impl<'a> Loop<'a> {
             gh: github::Client::new(t, token, cfg.repo.clone()),
             machines: HashMap::new(),
             online: HashSet::new(),
-            spent_day: 0,
-            spent_cents: 0,
+            spent_day: None,
+            // boat does not report what was spent today, so a restart assumes the
+            // smallest pool cap is used up.
+            spent_cents: cfg
+                .pools
+                .iter()
+                .map(|p| p.paid_start_cents_per_day)
+                .min()
+                .unwrap_or(0),
             starts_blocked_until: 0,
         }
     }
@@ -266,10 +306,11 @@ impl<'a> Loop<'a> {
         now: UnixSecs,
         decide: fn(&Snapshot, &Pool) -> Vec<Action>,
     ) -> Result<(), Error> {
-        if now / DAY_S != self.spent_day {
-            self.spent_day = now / DAY_S;
+        let day = now / DAY_S;
+        if self.spent_day.is_some_and(|d| d != day) {
             self.spent_cents = 0;
         }
+        self.spent_day = Some(day);
         self.gh.begin_tick(now);
         let (snapshot, runner_ids) = match self.observe(now) {
             Ok(v) => v,
@@ -279,16 +320,15 @@ impl<'a> Loop<'a> {
                 return Ok(());
             }
         };
-        let mut actions: Vec<Action> = self
-            .cfg
-            .pools
-            .iter()
-            .flat_map(|p| decide(&snapshot, p))
+        let mut actions: Vec<Action> = plan(self.cfg, &snapshot, decide)
+            .into_iter()
+            .map(|(_, a)| a)
             .collect();
         actions.sort_by_key(rank);
         let mut starts = Starts {
             open: snapshot.limits.can_start,
             price: snapshot.limits.next_start_cents,
+            kept_forks: HashMap::new(),
         };
         for action in &actions {
             match self.execute(now, action, &snapshot, &runner_ids, &mut starts) {
@@ -361,7 +401,8 @@ impl<'a> Loop<'a> {
             let seen = self.machines.entry(id.clone()).or_insert(Seen {
                 state,
                 since: now,
-                last_busy: now,
+                // Just before first sight, so a fresh machine has not yet had a busy runner.
+                last_busy: now.saturating_sub(1),
             });
             if seen.state != state {
                 seen.state = state;
@@ -426,39 +467,33 @@ impl<'a> Loop<'a> {
             Action::Resume { machine } => self.start(now, starts, |b| b.resume(machine)),
             Action::Fork { pool, job } => {
                 let p = self.pool(pool)?;
-                let key = job_label(*job);
-                let labels = BTreeMap::from([
-                    (boat::POOL_LABEL.to_string(), p.name.clone()),
-                    (boat::JOB_LABEL.to_string(), key.clone()),
-                ]);
-                self.start(now, starts, |b| {
-                    b.create_from_snapshot(
-                        &p.snapshot,
-                        &p.machine_type,
-                        &labels,
-                        p.fork_ttl_s,
-                        &key,
-                    )
-                    .map(drop)
-                })
-            }
-            Action::RestartRunner { machine, slot } => {
-                let pool = snapshot
-                    .machines
-                    .iter()
-                    .find(|m| m.id == *machine)
-                    .map(|m| m.pool.clone())
-                    .ok_or_else(|| Error::Invalid(format!("unknown machine {machine}")))?;
-                let old = snapshot
-                    .runners
-                    .iter()
-                    .filter(|r| r.machine == *machine && r.slot == *slot);
-                for r in old {
-                    if let Some(&id) = runner_ids.get(&r.name) {
-                        self.delete_runner(id)?;
+                let mut labels = BTreeMap::from([(boat::POOL_LABEL.to_string(), p.name.clone())]);
+                let (key, ttl_s) = match job {
+                    Some(job) => {
+                        let key = job_label(*job);
+                        labels.insert(boat::JOB_LABEL.to_string(), key.clone());
+                        (key, p.fork_ttl_s)
                     }
-                }
-                self.register(now, &pool, machine, *slot)
+                    None => {
+                        // Counting the pool's kept machines keeps the key stable across
+                        // ticks until the fork shows up in the list.
+                        let kept = snapshot
+                            .machines
+                            .iter()
+                            .filter(|m| {
+                                m.pool == p.name && m.job.is_none() && m.state != MachineState::Gone
+                            })
+                            .count();
+                        let sent = starts.kept_forks.entry(p.name.clone()).or_insert(0);
+                        let n = kept + *sent;
+                        *sent += 1;
+                        (format!("sbr-{}-keep-{n}", p.name), boat::MAX_TTL_S)
+                    }
+                };
+                self.start(now, starts, |b| {
+                    b.create_from_snapshot(&p.snapshot, &p.machine_type, &labels, ttl_s, &key)
+                        .map(drop)
+                })
             }
         }
     }
@@ -624,7 +659,7 @@ pub mod fake {
 mod tests {
     use super::fake::{Fake, Sent, respond};
     use super::*;
-    use crate::model::{Placement, RunnerMode};
+    use crate::model::{Placement, QueuedJob};
 
     const BOAT: &str = "https://boat.dev/api/v1";
     const GH: &str = "https://api.github.com/repos/o/r/actions";
@@ -640,7 +675,6 @@ mod tests {
                 machine_type: "large".into(),
                 snapshot: "runner-base".into(),
                 placement: vec![Placement::Fork],
-                runner: RunnerMode::Jit,
                 min_up: 0,
                 max_boxes: 4,
                 slots_per_box: 2,
@@ -714,11 +748,10 @@ mod tests {
             ]
         );
         assert_eq!(s.machines[2].job, Some(JobKey { id: 7, attempt: 2 }));
-        assert!(
-            s.machines
-                .iter()
-                .all(|m| m.since == NOW && m.last_busy == NOW)
-        );
+        assert!(s.machines.iter().all(|m| m.since == NOW));
+        // Only bx_44444444 has a runner that may still pick up a job.
+        let busy: Vec<_> = s.machines.iter().map(|m| m.last_busy).collect();
+        assert_eq!(busy, [NOW - 1, NOW - 1, NOW]);
         let runners: Vec<_> = s
             .runners
             .iter()
@@ -737,18 +770,15 @@ mod tests {
             Limits {
                 can_start: true,
                 next_start_cents: 25,
-                spent_today_cents: 0
+                // A fresh process assumes the smallest cap is spent.
+                spent_today_cents: 100
             }
         );
         let m = |id: &str| id.to_string();
         vec![
-            Action::RestartRunner {
-                machine: m("bx_22222222"),
-                slot: 0,
-            },
             Action::Fork {
                 pool: m("ci"),
-                job: JobKey { id: 70, attempt: 1 },
+                job: Some(JobKey { id: 70, attempt: 1 }),
             },
             Action::Resume {
                 machine: m("bx_33333333"),
@@ -806,9 +836,7 @@ mod tests {
             format!("GET {BOAT}/limits"),
             format!("POST {BOAT}/sandboxes"),
             format!("GET {BOAT}/limits"),
-            format!("DELETE {GH}/runners/11"),
         ]);
-        expected.extend(register);
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
@@ -832,11 +860,10 @@ mod tests {
             let leaks = s.url.contains("JITSECRET")
                 || s.headers.iter().any(|(_, v)| v.contains("JITSECRET"))
                 || s.body_text().contains("JITSECRET");
-            assert_eq!(leaks, i == 10 || i == 18, "request {i}: {}", s.url);
+            assert_eq!(leaks, i == 10, "request {i}: {}", s.url);
         }
-        assert_eq!(sent[18].method, "PUT");
-        // Two accepted starts at the 25-cent quote.
-        assert_eq!(tick_loop.spent_cents, 50);
+        // Two accepted starts at the 25-cent quote, on top of the assumed 100.
+        assert_eq!(tick_loop.spent_cents, 150);
 
         tick_loop.tick(DAY_S, |_, _| Vec::new()).unwrap();
         assert_eq!(tick_loop.spent_cents, 0);
@@ -849,7 +876,7 @@ mod tests {
         vec![
             Action::Fork {
                 pool: "ci".into(),
-                job: JobKey { id: 70, attempt: 1 },
+                job: Some(JobKey { id: 70, attempt: 1 }),
             },
             Action::Resume {
                 machine: "bx_33333333".into(),
@@ -874,7 +901,87 @@ mod tests {
         let resumes = reqs.iter().filter(|r| r.ends_with("/resume")).count();
         assert_eq!(resumes, 1);
         assert!(!reqs.contains(&format!("POST {BOAT}/sandboxes")));
-        assert_eq!(tick_loop.spent_cents, 0);
+        assert_eq!(tick_loop.spent_cents, 100);
+    }
+
+    fn fork_two_kept(_: &Snapshot, p: &Pool) -> Vec<Action> {
+        let kept = Action::Fork {
+            pool: p.name.clone(),
+            job: None,
+        };
+        vec![kept.clone(), kept]
+    }
+
+    #[test]
+    fn kept_forks_count_the_pools_kept_machines() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
+        tick_loop.tick(NOW, fork_two_kept).unwrap();
+        let forks: Vec<_> = fake
+            .sent()
+            .into_iter()
+            .filter(|s| s.method == "POST" && s.url == format!("{BOAT}/sandboxes"))
+            .collect();
+        // bx_22222222 and bx_33333333 are kept; bx_44444444 belongs to a job.
+        let keys: Vec<_> = forks.iter().map(|s| s.header("idempotency-key")).collect();
+        assert_eq!(keys, [Some("sbr-ci-keep-2"), Some("sbr-ci-keep-3")]);
+        for fork in &forks {
+            assert!(!fork.body_text().contains("sw-boat-runner-job"));
+            assert!(fork.body_text().contains(r#""ttlSeconds":2592000"#));
+        }
+    }
+
+    fn job(id: u64, labels: &[&str]) -> QueuedJob {
+        QueuedJob {
+            key: JobKey { id, attempt: 1 },
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+        }
+    }
+
+    fn fork_each_job(s: &Snapshot, p: &Pool) -> Vec<Action> {
+        // Pool "b" comes second, so it sees the 25-cent start pool "ci" planned.
+        let spent = if p.name == "b" { 35 } else { 10 };
+        assert_eq!(s.limits.spent_today_cents, spent, "pool {}", p.name);
+        s.queued
+            .iter()
+            .map(|j| Action::Fork {
+                pool: p.name.clone(),
+                job: Some(j.key),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_routes_each_job_to_the_first_pool_that_serves_it() {
+        let mut cfg = config();
+        let mut b = cfg.pools[0].clone();
+        b.name = "b".into();
+        b.labels.push("gpu".into());
+        cfg.pools.push(b);
+        let snap = Snapshot {
+            now: NOW,
+            machines: Vec::new(),
+            runners: Vec::new(),
+            queued: vec![
+                job(1, &["self-hosted", "large"]),
+                job(2, &["self-hosted", "GPU"]),
+                job(3, &["self-hosted", "linux"]),
+            ],
+            limits: Limits {
+                can_start: true,
+                next_start_cents: 25,
+                spent_today_cents: 10,
+            },
+        };
+        let planned: Vec<_> = plan(&cfg, &snap, fork_each_job)
+            .into_iter()
+            .map(|(p, a)| match a {
+                Action::Fork { job: Some(j), .. } => (p.name.as_str(), j.id),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(planned, [("ci", 1), ("b", 2)]);
     }
 
     #[test]

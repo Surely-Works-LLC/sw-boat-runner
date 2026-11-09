@@ -15,6 +15,8 @@ pub const BASE: &str = "https://boat.dev/api/v1";
 pub const POOL_LABEL: &str = "sw-boat-runner";
 /// Label of a forked machine: `sw-boat-runner-job=<job id>-<attempt>`.
 pub const JOB_LABEL: &str = "sw-boat-runner-job";
+/// The longest `ttlSeconds` boat accepts. Expiry archives a machine; it does not delete it.
+pub const MAX_TTL_S: u64 = 2_592_000;
 
 /// `GET /sandboxes` pages of 200 (the documented maximum); a pool never gets near this.
 const PAGE_LIMIT: u32 = 200;
@@ -98,15 +100,16 @@ pub struct Limits {
 }
 
 /// boat state → model state. boat's `archived` is a stop with the disk kept, so it maps to
-/// `Stopped`; `cancelled` is a create or fork that got no machine. An unknown state counts
-/// as `Starting`: it holds a `max_boxes` slot and draws no action until it settles.
+/// `Stopped`; `cancelled` is a create or fork that got no machine, and `deleted` one that
+/// is still listed after a delete. An unknown state counts as `Starting`: it holds a
+/// `max_boxes` slot and draws no action until it settles.
 pub fn machine_state(state: &str) -> MachineState {
     match state {
         "init" | "provisioning" | "provisioned" | "cloning" => MachineState::Starting,
         "ready" | "idle" | "running" => MachineState::Up,
         "archiving" => MachineState::Stopping,
         "archived" => MachineState::Stopped,
-        "error" | "cancelled" => MachineState::Gone,
+        "error" | "cancelled" | "deleted" => MachineState::Gone,
         _ => MachineState::Starting,
     }
 }
@@ -238,6 +241,7 @@ impl<'t> Client<'t> {
 
     /// Starts a new machine from the saved snapshot. boat returns the first sandbox again
     /// for a repeat of the same key and body within 24 h, so a crash cannot fork twice.
+    /// `ttl_s` must be 1 to `MAX_TTL_S`.
     pub fn create_from_snapshot(
         &self,
         snapshot: &str,
@@ -250,12 +254,12 @@ impl<'t> Client<'t> {
         struct Created {
             sandbox: Sandbox,
         }
+        assert!((1..=MAX_TTL_S).contains(&ttl_s), "ttl {ttl_s}");
         let body = json!({
             "from": snapshot,
             "type": machine_type,
             "labels": labels,
-            // boat accepts 1..=2592000; expiry stops (archives) the machine, it does not delete it.
-            "ttlSeconds": ttl_s.clamp(1, 2_592_000),
+            "ttlSeconds": ttl_s,
         });
         let created: Created = parse(self.call(
             "POST",
@@ -424,6 +428,8 @@ mod tests {
         assert_eq!(machine_state("archiving"), MachineState::Stopping);
         assert_eq!(machine_state("archived"), MachineState::Stopped);
         assert_eq!(machine_state("cancelled"), MachineState::Gone);
+        assert_eq!(machine_state("deleted"), MachineState::Gone);
+        assert_eq!(machine_state("init"), MachineState::Starting);
         assert_eq!(machine_state("something_new"), MachineState::Starting);
     }
 
@@ -490,7 +496,7 @@ mod tests {
             (JOB_LABEL.to_string(), "7-2".to_string()),
         ]);
         let id = boat
-            .create_from_snapshot("runner-base", "large", &labels, 0, "7-2")
+            .create_from_snapshot("runner-base", "large", &labels, 3600, "7-2")
             .unwrap();
         assert_eq!(id, "bx_44444444");
         let sent = fake.sent();
@@ -500,7 +506,7 @@ mod tests {
         let body: Value = serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body,
-            json!({"from":"runner-base","type":"large","ttlSeconds":1,
+            json!({"from":"runner-base","type":"large","ttlSeconds":3600,
                    "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"7-2"}})
         );
     }

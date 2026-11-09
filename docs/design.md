@@ -29,20 +29,23 @@ Its `placement` lists, in order, the ways to find a runner for a queued job:
 The first step that fits is used. If none fits, the job waits in GitHub's queue and the
 next tick tries again. Presets:
 
-| Preset | `placement` | `runner` | Idle machines | Fits |
-| - | - | - | - | - |
-| `pool` | `slot` | persistent | always up | steady load, trusted code, lowest overhead |
-| `pool-jit` | `slot` | jit | always up | as `pool`, with a clean runner per job |
-| `warm` | `slot, resume` | jit | stopped after `idle_stop_s` | load with quiet hours |
-| `fork` | `fork` | jit | none | untrusted code (fork PRs), rare jobs |
-| `hybrid` | `slot, resume, fork` | jit | stopped after `idle_stop_s` | bursts above the pool size |
+| Preset | `placement` | Idle machines | Fits |
+| - | - | - | - |
+| `pool` | `slot` | `min_up` always up | steady load, trusted code, lowest overhead |
+| `warm` | `slot, resume` | stopped after `idle_stop_s` | load with quiet hours |
+| `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
+| `hybrid` | `slot, resume, fork` | stopped after `idle_stop_s` | bursts above the pool size |
 
-`hybrid` is the default.
+`hybrid` is the default. `min_up` needs `slot`, the only step that registers runners on
+kept machines.
 
-- A `persistent` runner registers once and takes job after job. The tool only keeps its
-  machine up and restarts the runner service when GitHub reports it offline.
-- A `jit` runner is registered through GitHub's just-in-time config, takes one job and
-  exits. This is what GitHub recommends for autoscaling.
+Every runner is a just-in-time runner: it is registered through GitHub's JIT config,
+takes one job and exits. A long-lived runner would need a registration token on the
+machine, and boat stores every command for 90 days, so the token would end up in boat's
+command history. On a kept machine, a slot whose runner finished or went `Offline` gets
+`Unregister`, and then a fresh `Register` for the next queued job, in the same tick when
+one is waiting. The runner's work directory
+stays on the machine, so its caches survive from job to job.
 
 ## Start budget
 
@@ -53,13 +56,16 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 - `N > 0`: also allow paid starts while the cents spent on starts today, plus the price
   of this start, stay at or under N.
 
-Within one tick, starts are free while `GET /limits` reports included starts left, and
-each start after that costs the reported price. One account serves every pool, so the
-spend each pool's actions add counts against the next pool in the same tick.
+`GET /limits` reports the next start's price but not how many included starts are left,
+so `decide` prices every start of a tick at the quote it was shown. After each accepted
+start the tool reads `GET /limits` again and makes no more starts that tick if the price
+changed. One account serves every pool, so each pool's cap is checked against the
+account-wide spend, including the starts that pools earlier in the file planned in the
+same tick.
 
 The cents spent today are counted in memory. A restart cannot recover them, so after a
-restart the tool treats the day's budget as spent and makes only included starts until
-00:00 UTC. A crash can delay paid starts but never exceed the cap.
+restart the tool sets them to the smallest pool cap and makes only included starts in
+that pool until 00:00 UTC. A crash can delay paid starts but never exceed the cap.
 
 boat never queues a start. A refused start (429 or 503) is not counted, and the tool
 retries it on a later tick.
@@ -75,15 +81,24 @@ The tool keeps no database. Each tick it reads:
 
 - boat: `GET /sandboxes?label=sw-boat-runner=<pool>` and `GET /limits`;
 - GitHub: the repository's runners whose names start with `sbr-<pool>-`, and the queued
-  jobs whose labels match a pool.
+  jobs. Before `decide` runs, each queued job goes only to the first pool in the file
+  whose labels match it.
 
 Runner names carry what the tool needs to know about them:
 `sbr-<pool>-<machine id>-<slot>-<registered unix time>`. A forked machine carries the
 label `sw-boat-runner-job=<job id>-<attempt>`, and its fork request uses the same value as
 its `Idempotency-Key`, so a crash and restart cannot fork twice for one job.
 
-Two facts are kept only in memory. When each machine last had a busy runner: after a
-restart it counts from the restart, which can only delay a stop. The cents spent on
+A kept machine is forked with no job label to bring the pool up to `min_up`. Its
+`Idempotency-Key` is `sbr-<pool>-keep-<n>`, where n is the number of the pool's kept
+machines that are not `Gone`, so a retry after a crash returns the same machine. boat
+holds a key for 24 h, so a kept machine deleted by hand blocks its key, and with it the
+pool's next kept fork, for up to 24 h. A kept machine gets boat's longest TTL, 30 days,
+after which boat archives it.
+
+Two facts are kept only in memory. When each machine last had a busy runner: a machine
+first seen counts as never busy, and after a restart it counts from the restart, which
+can only delay a stop. The cents spent on
 starts today: see [Start budget](#start-budget). Restarting the process loses nothing
 else.
 
@@ -95,36 +110,48 @@ Machine states, mapped from boat's states:
 
 | State | boat states |
 | - | - |
-| `Starting` | `provisioning`, `provisioned`, `cloning` |
+| `Starting` | `init`, `provisioning`, `provisioned`, `cloning`, and any state boat adds later |
 | `Up` | `ready`, `idle`, `running` |
-| `Stopping` | a stop in progress |
-| `Stopped` | stopped, disk kept |
-| `Gone` | `archiving`, `archived`, `error`, deleted |
+| `Stopping` | `archiving` |
+| `Stopped` | `archived` |
+| `Gone` | `error`, `cancelled`, `deleted` |
 
-Runner states: `Registered` (JIT config issued, not online yet), `Idle` (online, no job),
-`Busy` (running a job), `Offline` (was online, now not).
+Runner states, mapped from GitHub's `status` and `busy`:
+
+| State | GitHub |
+| - | - |
+| `Busy` | `busy` |
+| `Idle` | `online`, not busy |
+| `Offline` | `offline`, after this process saw it `online` |
+| `Registered` | `offline` and never seen `online`: JIT config issued, not started yet |
+
+A `Registered` runner that never comes online times out `register_timeout_s` after the
+registration time in its name. After a restart, a runner that went offline before the
+process saw it online is `Registered` until that timeout.
 
 `decide(snapshot, policy) -> [Action]` is a pure function. Actions:
 
 | Action | Guard |
 | - | - |
-| `Register(machine, slot)` | machine `Up`, slot free, unmet demand for the pool's labels |
-| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or `Up + Starting < min_up` |
+| `Register(machine, slot)` | machine `Up`, slot free (a slot whose runner gets `Unregister` this tick counts as free), unmet demand for the pool's labels |
+| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or kept `Up + Starting < min_up` |
 | `Fork(job)` | unmet demand left after slots and resumes, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine with this job's label yet |
+| `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand, no `Busy` or `Registered` runner, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` machines `Up` |
 | `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s` |
-| `Unregister(runner)` | `Registered` past `register_timeout_s`, JIT runner `Offline`, or runner on a machine that is not `Up` |
-| `RestartRunner(machine, slot)` | persistent runner `Offline` on an `Up` machine |
+| `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
 in `Registered` or `Idle`, minus the capacity of its `Starting` machines (one for an
 ephemeral machine, `slots_per_box` for any other). A job matches a pool when the job's
-labels, compared without case, are a subset of the pool's; list `self-hosted` in the
-pool's labels. A job that matches several pools counts only for the first one in the
-file.
+labels, compared without case, are a subset of the pool's. A JIT runner carries only the
+pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects a pool
+without it. A job that matches several pools counts only for the first one in the file.
 
 Stop needs `resume` in placement because without it a stopped machine never comes back.
-A `Busy` runner keeps its machine even past `fork_ttl_s`.
+A `Busy` runner keeps its machine even past `fork_ttl_s`. The policy accepts
+`fork_ttl_s` from 1 to 2592000 (30 days, boat's longest TTL) and rejects anything else
+rather than clamping it.
 
 An ephemeral machine's job has finished when the machine is `Stopped`, or when it is `Up`
 with no live runner and either a runner on it was seen busy or it is older than
@@ -138,7 +165,7 @@ Safety, checked by TLC and by property tests on `decide`:
 2. `OneJobPerRunner`: a JIT runner runs at most one job.
 3. `MaxBoxes`: machines in `Up` or `Starting` never exceed `max_boxes`.
 4. `StartBudget`: paid starts stay within `paid_start_cents_per_day`, so none when it is 0.
-5. `NoDoubleFork`: at most one machine per job id and attempt.
+5. `NoDoubleFork`: at most one job fork per job id and attempt.
 6. `EphemeralIsolation`: a pool whose placement is only `fork` never runs two jobs on one
    machine.
 7. `NoLeak`: every ephemeral machine is deleted after its job ends or its TTL passes.

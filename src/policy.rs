@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::model::{Cents, Config, Placement, Pool, RunnerMode};
+use crate::boat::MAX_TTL_S;
+use crate::model::{Cents, Config, Placement, Pool};
 
 // Mirrors the serde default on `model::Config::tick_s`, which this raw parse bypasses.
 const DEFAULT_TICK_S: u64 = 15;
@@ -92,7 +93,6 @@ struct RawPool {
     #[serde(default)]
     preset: Preset,
     placement: Option<Vec<Placement>>,
-    runner: Option<RunnerMode>,
     min_up: Option<u32>,
     slots_per_box: Option<u32>,
     idle_stop_s: Option<u64>,
@@ -107,7 +107,6 @@ struct RawPool {
 #[serde(rename_all = "kebab-case")]
 enum Preset {
     Pool,
-    PoolJit,
     Warm,
     Fork,
     #[default]
@@ -115,33 +114,27 @@ enum Preset {
 }
 
 impl Preset {
-    /// Placement, runner mode and `min_up`. Pools without `resume` keep their machines up,
-    /// so they keep one up by default; the others scale to zero when idle.
-    fn shape(self) -> (&'static [Placement], RunnerMode, u32) {
+    /// Placement and `min_up`. Pools without `resume` keep their machines up, so they keep
+    /// one up by default; the others scale to zero when idle.
+    fn shape(self) -> (&'static [Placement], u32) {
         match self {
-            Preset::Pool => (&[Placement::Slot], RunnerMode::Persistent, 1),
-            Preset::PoolJit => (&[Placement::Slot], RunnerMode::Jit, 1),
-            Preset::Warm => (&[Placement::Slot, Placement::Resume], RunnerMode::Jit, 0),
-            Preset::Fork => (&[Placement::Fork], RunnerMode::Jit, 0),
-            Preset::Hybrid => (
-                &[Placement::Slot, Placement::Resume, Placement::Fork],
-                RunnerMode::Jit,
-                0,
-            ),
+            Preset::Pool => (&[Placement::Slot], 1),
+            Preset::Warm => (&[Placement::Slot, Placement::Resume], 0),
+            Preset::Fork => (&[Placement::Fork], 0),
+            Preset::Hybrid => (&[Placement::Slot, Placement::Resume, Placement::Fork], 0),
         }
     }
 }
 
 impl RawPool {
     fn into_pool(self) -> Pool {
-        let (placement, runner, min_up) = self.preset.shape();
+        let (placement, min_up) = self.preset.shape();
         Pool {
             name: self.name,
             labels: self.labels,
             machine_type: self.machine_type,
             snapshot: self.snapshot,
             placement: self.placement.unwrap_or_else(|| placement.to_vec()),
-            runner: self.runner.unwrap_or(runner),
             min_up: self.min_up.unwrap_or(min_up),
             max_boxes: self.max_boxes,
             slots_per_box: self.slots_per_box.unwrap_or(1),
@@ -169,6 +162,14 @@ fn validate(p: &Pool) -> Result<(), String> {
     if p.labels.is_empty() || p.labels.iter().any(String::is_empty) {
         return Err("labels must be a non-empty list of non-empty labels".into());
     }
+    // A JIT runner carries only the pool's labels, and self-hosted jobs ask for `self-hosted`.
+    if !p
+        .labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case("self-hosted"))
+    {
+        return Err("labels must include self-hosted".into());
+    }
     if !MACHINE_TYPES.contains(&p.machine_type.as_str()) {
         return Err(format!(
             "machine_type {:?} is not one of {}",
@@ -195,11 +196,8 @@ fn validate(p: &Pool) -> Result<(), String> {
     if p.placement.contains(&Placement::Resume) && !p.placement.contains(&Placement::Slot) {
         return Err("resume needs slot, which registers runners on resumed machines".into());
     }
-    if p.placement.contains(&Placement::Fork) && p.runner != RunnerMode::Jit {
-        return Err("fork placement needs runner = \"jit\"".into());
-    }
-    if p.runner == RunnerMode::Persistent && p.placement != [Placement::Slot] {
-        return Err("a persistent runner needs placement = [\"slot\"]".into());
+    if p.min_up > 0 && !p.placement.contains(&Placement::Slot) {
+        return Err("min_up needs slot, which registers runners on kept machines".into());
     }
     if p.max_boxes == 0 {
         return Err("max_boxes must be at least 1".into());
@@ -212,6 +210,9 @@ fn validate(p: &Pool) -> Result<(), String> {
     }
     if p.slots_per_box == 0 {
         return Err("slots_per_box must be at least 1".into());
+    }
+    if !(1..=MAX_TTL_S).contains(&p.fork_ttl_s) {
+        return Err(format!("fork_ttl_s must be 1 to {MAX_TTL_S}"));
     }
     Ok(())
 }
@@ -242,7 +243,7 @@ mod tests {
     const POOL: &str = r#"
 [[pool]]
 name = "ci"
-labels = ["boat", "large"]
+labels = ["self-hosted", "large"]
 machine_type = "large"
 snapshot = "snap-1"
 max_boxes = 4
@@ -265,11 +266,10 @@ max_boxes = 4
             cfg.pools,
             vec![Pool {
                 name: "ci".into(),
-                labels: vec!["boat".into(), "large".into()],
+                labels: vec!["self-hosted".into(), "large".into()],
                 machine_type: "large".into(),
                 snapshot: "snap-1".into(),
                 placement: vec![Placement::Slot, Placement::Resume, Placement::Fork],
-                runner: RunnerMode::Jit,
                 min_up: 0,
                 max_boxes: 4,
                 slots_per_box: 1,
@@ -283,20 +283,18 @@ max_boxes = 4
     }
 
     #[test]
-    fn presets_set_placement_runner_and_min_up() {
+    fn presets_set_placement_and_min_up() {
         use Placement::{Fork, Resume, Slot};
-        let cases: [(&str, &[Placement], RunnerMode, u32); 5] = [
-            ("pool", &[Slot], RunnerMode::Persistent, 1),
-            ("pool-jit", &[Slot], RunnerMode::Jit, 1),
-            ("warm", &[Slot, Resume], RunnerMode::Jit, 0),
-            ("fork", &[Fork], RunnerMode::Jit, 0),
-            ("hybrid", &[Slot, Resume, Fork], RunnerMode::Jit, 0),
+        let cases: [(&str, &[Placement], u32); 4] = [
+            ("pool", &[Slot], 1),
+            ("warm", &[Slot, Resume], 0),
+            ("fork", &[Fork], 0),
+            ("hybrid", &[Slot, Resume, Fork], 0),
         ];
-        for (preset, placement, runner, min_up) in cases {
+        for (preset, placement, min_up) in cases {
             let cfg = parse(&policy(&format!("preset = \"{preset}\""))).unwrap();
             let pool = &cfg.pools[0];
             assert_eq!(pool.placement, placement, "{preset}");
-            assert_eq!(pool.runner, runner, "{preset}");
             assert_eq!(pool.min_up, min_up, "{preset}");
         }
     }
@@ -325,6 +323,8 @@ max_boxes = 4
         assert!(error(&policy("idle_stop = 60")).contains("unknown field `idle_stop`"));
         assert!(error(&format!("colour = 1\n{}", policy(""))).contains("unknown field `colour`"));
         assert!(error(&policy("preset = \"lazy\"")).contains("unknown variant `lazy`"));
+        assert!(error(&policy("preset = \"pool-jit\"")).contains("unknown variant `pool-jit`"));
+        assert!(error(&policy("runner = \"jit\"")).contains("unknown field `runner`"));
     }
 
     #[test]
@@ -341,7 +341,11 @@ max_boxes = 4
             (REPO.to_string(), "no [[pool]]"),
             (format!("{}{POOL}", policy("")), "defined twice"),
             (policy("").replace("\"ci\"", "\"ci-big\""), "lowercase"),
-            (policy("").replace("[\"boat\", \"large\"]", "[]"), "labels"),
+            (
+                policy("").replace("[\"self-hosted\", \"large\"]", "[]"),
+                "labels",
+            ),
+            (policy("").replace("\"self-hosted\", ", ""), "self-hosted"),
             (
                 policy("").replace("\"large\"\n", "\"huge\"\n"),
                 "machine_type",
@@ -350,14 +354,9 @@ max_boxes = 4
             (policy("placement = [\"slot\", \"slot\"]"), "twice"),
             (policy("placement = [\"resume\", \"slot\"]"), "order"),
             (policy("placement = [\"resume\"]"), "resume needs slot"),
-            (
-                policy("placement = [\"fork\"]\nrunner = \"persistent\""),
-                "runner = \"jit\"",
-            ),
-            (
-                policy("preset = \"pool\"\nplacement = [\"slot\", \"resume\"]"),
-                "persistent",
-            ),
+            (policy("preset = \"fork\"\nmin_up = 1"), "min_up needs slot"),
+            (policy("fork_ttl_s = 0"), "fork_ttl_s"),
+            (policy("fork_ttl_s = 2592001"), "fork_ttl_s"),
             (policy("min_up = 5"), "above max_boxes"),
             (policy("slots_per_box = 0"), "slots_per_box"),
             (
