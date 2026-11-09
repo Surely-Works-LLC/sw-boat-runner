@@ -14,7 +14,8 @@ use crate::model::{
 };
 
 const DAY_S: u64 = 86_400;
-/// boat's file write and command calls wait up to 60 s for a machine that is starting.
+/// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
+/// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct NetworkError(pub String);
@@ -150,7 +151,7 @@ pub fn run(cfg: &Config, decide: fn(&Snapshot, &Pool) -> Vec<Action>) -> Result<
     let boat_key = env("BOAT_API_KEY")?;
     let token = env("GITHUB_TOKEN")?;
     let transport = Ureq::new(HTTP_TIMEOUT);
-    let mut tick_loop = Loop::new(cfg, &transport, boat_key, token);
+    let mut tick_loop = Loop::new(cfg, &transport, boat_key, token, unix_now());
     let period = Duration::from_secs(cfg.tick_s.max(1));
     loop {
         let started = Instant::now();
@@ -184,7 +185,7 @@ fn rank(a: &Action) -> u8 {
     }
 }
 
-/// `<job id>-<attempt>`: the job label of a forked machine and its fork's Idempotency-Key.
+/// `<job id>-<attempt>`: the job label of a forked machine.
 fn job_label(job: JobKey) -> String {
     format!("{}-{}", job.id, job.attempt)
 }
@@ -277,10 +278,18 @@ pub struct Loop<'a> {
     spent_day: Option<u64>,
     spent_cents: Cents,
     starts_blocked_until: UnixSecs,
+    /// True until the first observe that succeeds after this process started.
+    restarted: bool,
 }
 
 impl<'a> Loop<'a> {
-    pub fn new(cfg: &'a Config, t: &'a dyn Transport, boat_key: String, token: String) -> Self {
+    pub fn new(
+        cfg: &'a Config,
+        t: &'a dyn Transport,
+        boat_key: String,
+        token: String,
+        now: UnixSecs,
+    ) -> Self {
         Loop {
             cfg,
             boat: boat::Client::new(t, boat_key),
@@ -296,7 +305,10 @@ impl<'a> Loop<'a> {
                 .map(|p| p.paid_start_cents_per_day)
                 .max()
                 .unwrap_or(0),
-            starts_blocked_until: 0,
+            // A fork sent before a crash may not be listed yet. Its key is a fresh UUID, so
+            // a new fork would not find it; wait until that create is listed or has failed.
+            starts_blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
+            restarted: true,
         }
     }
 
@@ -312,7 +324,7 @@ impl<'a> Loop<'a> {
         }
         self.spent_day = Some(day);
         self.gh.begin_tick(now);
-        let (snapshot, runner_ids) = match self.observe(now) {
+        let (snapshot, mut runner_ids) = match self.observe(now) {
             Ok(v) => v,
             Err(e) if e.is_fatal() => return Err(e),
             Err(e) => {
@@ -330,7 +342,7 @@ impl<'a> Loop<'a> {
             price: snapshot.limits.next_start_cents,
         };
         for action in &actions {
-            match self.execute(now, action, &runner_ids, &mut starts) {
+            match self.execute(now, action, &mut runner_ids, &mut starts) {
                 Ok(()) => {}
                 Err(e) if e.is_fatal() => return Err(e),
                 Err(e @ Error::GitHub(github::Error::RateLimited { .. })) => {
@@ -397,11 +409,14 @@ impl<'a> Loop<'a> {
             .collect();
         let mut machines = Vec::with_capacity(observed.len());
         for (id, pool, state, job) in observed {
+            // After a restart nothing records whether an Up fork already had a runner, so
+            // it counts as used: deleted, never registered again. A fork that never had one
+            // wastes its start. Otherwise, just before first sight, so it has not.
+            let used = self.restarted && job.is_some() && state == MachineState::Up;
             let seen = self.machines.entry(id.clone()).or_insert(Seen {
                 state,
                 since: now,
-                // Just before first sight, so a fresh machine has not yet had a busy runner.
-                last_busy: now.saturating_sub(1),
+                last_busy: if used { now } else { now.saturating_sub(1) },
             });
             if seen.state != state {
                 seen.state = state;
@@ -421,6 +436,7 @@ impl<'a> Loop<'a> {
         }
         self.machines
             .retain(|id, _| machines.iter().any(|m| &m.id == id));
+        self.restarted = false;
 
         let limits = Limits {
             // A null price means boat would refuse the start.
@@ -444,19 +460,29 @@ impl<'a> Loop<'a> {
         &mut self,
         now: UnixSecs,
         action: &Action,
-        runner_ids: &HashMap<String, u64>,
+        runner_ids: &mut HashMap<String, u64>,
         starts: &mut Starts,
     ) -> Result<(), Error> {
         match action {
             Action::Unregister { runner } => match runner_ids.get(runner) {
-                Some(&id) => self.delete_runner(id),
+                Some(&id) => {
+                    self.delete_runner(id)?;
+                    runner_ids.remove(runner);
+                    Ok(())
+                }
                 None => Ok(()),
             },
-            Action::Delete { machine } => match self.boat.delete(machine) {
-                Err(boat::Error::NotFound) => Ok(()),
-                r => r.map_err(Error::from),
-            },
-            Action::Stop { machine } => self.boat.stop(machine).map_err(Error::from),
+            Action::Delete { machine } => {
+                self.remove_runners(machine, runner_ids)?;
+                match self.boat.delete(machine) {
+                    Err(boat::Error::NotFound) => Ok(()),
+                    r => r.map_err(Error::from),
+                }
+            }
+            Action::Stop { machine } => {
+                self.remove_runners(machine, runner_ids)?;
+                self.boat.stop(machine).map_err(Error::from)
+            }
             Action::Register {
                 pool,
                 machine,
@@ -466,17 +492,17 @@ impl<'a> Loop<'a> {
             Action::Fork { pool, job } => {
                 let p = self.pool(pool)?;
                 let mut labels = BTreeMap::from([(boat::POOL_LABEL.to_string(), p.name.clone())]);
-                let (key, ttl_s) = match job {
+                let ttl_s = match job {
                     Some(job) => {
-                        let key = job_label(*job);
-                        labels.insert(boat::JOB_LABEL.to_string(), key.clone());
-                        (key, p.fork_ttl_s)
+                        labels.insert(boat::JOB_LABEL.to_string(), job_label(*job));
+                        p.fork_ttl_s
                     }
-                    // A fresh key per fork, never reused, so a deleted kept machine
-                    // cannot hold boat's 24 h key and block the next kept fork
-                    // (docs/design.md#observed-state).
-                    None => (Uuid::new_v4().to_string(), boat::MAX_TTL_S),
+                    None => boat::MAX_TTL_S,
                 };
+                // A fresh key per fork, never reused: boat answers a known key with the
+                // first machine for 24 h, even a deleted one, so a reused key would give a
+                // job or a kept fork a dead machine (docs/design.md#observed-state).
+                let key = Uuid::new_v4().to_string();
                 self.start(now, starts, |b| {
                     b.create_from_snapshot(&p.snapshot, &p.machine_type, &labels, ttl_s, &key)
                         .map(drop)
@@ -500,6 +526,30 @@ impl<'a> Loop<'a> {
         }
     }
 
+    /// Deletes every GitHub runner on `machine` before boat stops or deletes it, because a
+    /// runner `decide` saw idle may have taken a job since. A deleted runner takes no job,
+    /// and GitHub refuses to delete one that runs a job; that error skips the machine this
+    /// tick.
+    fn remove_runners(
+        &mut self,
+        machine: &str,
+        runner_ids: &mut HashMap<String, u64>,
+    ) -> Result<(), Error> {
+        let mut on_machine: Vec<(String, u64)> = runner_ids
+            .iter()
+            .filter(|(name, _)| {
+                github::parse_runner_name(name).is_some_and(|n| n.machine == machine)
+            })
+            .map(|(name, &id)| (name.clone(), id))
+            .collect();
+        on_machine.sort_unstable_by_key(|&(_, id)| id);
+        for (name, id) in on_machine {
+            self.delete_runner(id)?;
+            runner_ids.remove(&name);
+        }
+        Ok(())
+    }
+
     /// If the file write or the command fails, the GitHub runner stays `Registered` and
     /// `decide` unregisters it after `register_timeout_s`.
     fn register(
@@ -512,6 +562,11 @@ impl<'a> Loop<'a> {
         let p = self.pool(pool)?;
         let name = github::runner_name(pool, machine, slot, now);
         let jit = self.gh.generate_jitconfig(&name, &p.labels)?;
+        // The runner may run its job and vanish before the next observe; mark the machine
+        // used now, so a fork never gets a second runner.
+        if let Some(seen) = self.machines.get_mut(machine) {
+            seen.last_busy = now;
+        }
         self.boat
             .write_file(machine, &jit_path(slot), jit.expose())?;
         self.boat.exec_detached(machine, &start_command(slot))?;
@@ -651,6 +706,8 @@ mod tests {
     const BOAT: &str = "https://boat.dev/api/v1";
     const GH: &str = "https://api.github.com/repos/o/r/actions";
     const NOW: UnixSecs = 1_000;
+    /// A process started this long before `NOW` has waited out the restart wait.
+    const STARTED: UnixSecs = NOW - HTTP_TIMEOUT.as_secs();
 
     fn config() -> Config {
         Config {
@@ -798,7 +855,7 @@ mod tests {
     fn tick_executes_in_order() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "boat_k".into(), "gh_t".into());
+        let mut tick_loop = Loop::new(&cfg, &fake, "boat_k".into(), "gh_t".into(), STARTED);
         tick_loop.tick(NOW, decide_all).unwrap();
 
         let register = [
@@ -814,7 +871,10 @@ mod tests {
             format!("GET {GH}/runs?status=in_progress&per_page=100"),
             format!("GET {BOAT}/limits"),
             format!("DELETE {GH}/runners/12"),
+            // Runner 12 is already gone, so only the machine is deleted.
             format!("DELETE {BOAT}/sandboxes/bx_44444444"),
+            // Stop deletes the machine's runner first.
+            format!("DELETE {GH}/runners/11"),
             format!("POST {BOAT}/sandboxes/bx_22222222/stop"),
         ];
         expected.extend(register.clone());
@@ -827,27 +887,26 @@ mod tests {
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
-        let fork = &sent[14];
-        assert_eq!(fork.header("idempotency-key"), Some("70-1"));
+        let fork = &sent[15];
         assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
         assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
-        let jit = &sent[9];
+        let jit = &sent[10];
         assert!(
             jit.body_text()
                 .contains(r#""name":"sbr-ci-bx_22222222-1-1000""#)
         );
         assert!(
-            sent[10]
+            sent[11]
                 .body_text()
                 .contains(r#""path":"/home/user/.sbr-jit-1""#)
         );
-        assert!(sent[11].body_text().contains("/home/user/.sbr-jit-1"));
+        assert!(sent[12].body_text().contains("/home/user/.sbr-jit-1"));
         // The jit config goes into the file write only: never a URL, a command or a header.
         for (i, s) in sent.iter().enumerate() {
             let leaks = s.url.contains("JITSECRET")
                 || s.headers.iter().any(|(_, v)| v.contains("JITSECRET"))
                 || s.body_text().contains("JITSECRET");
-            assert_eq!(leaks, i == 10, "request {i}: {}", s.url);
+            assert_eq!(leaks, i == 11, "request {i}: {}", s.url);
         }
         // Two accepted starts at the 25-cent quote, on top of the assumed 100.
         assert_eq!(tick_loop.spent_cents, 150);
@@ -881,7 +940,7 @@ mod tests {
                 reply(s)
             }
         });
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         tick_loop.tick(NOW, decide_starts).unwrap();
         tick_loop.tick(NOW + 30, decide_starts).unwrap();
         let reqs = requests(&fake);
@@ -899,7 +958,7 @@ mod tests {
         big.paid_start_cents_per_day = 500;
         cfg.pools.insert(0, big);
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         assert_eq!(tick_loop.spent_cents, 500);
         tick_loop.tick(NOW, crate::decide::decide).unwrap();
         // Job 70 is queued and every start is quoted at 25 cents.
@@ -912,38 +971,166 @@ mod tests {
         assert_eq!(tick_loop.spent_cents, 500);
     }
 
-    fn fork_two_kept(_: &Snapshot, p: &Pool) -> Vec<Action> {
+    fn fork_twice_each(_: &Snapshot, p: &Pool) -> Vec<Action> {
         let kept = Action::Fork {
             pool: p.name.clone(),
             job: None,
         };
-        vec![kept.clone(), kept]
+        let job = Action::Fork {
+            pool: p.name.clone(),
+            job: Some(JobKey { id: 70, attempt: 1 }),
+        };
+        vec![kept.clone(), kept, job.clone(), job]
     }
 
-    #[test]
-    fn kept_forks_send_fresh_uuid_v4_keys() {
-        let cfg = config();
-        let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
-        tick_loop.tick(NOW, fork_two_kept).unwrap();
-        let forks: Vec<_> = fake
-            .sent()
+    fn forks(fake: &Fake) -> Vec<Sent> {
+        fake.sent()
             .into_iter()
             .filter(|s| s.method == "POST" && s.url == format!("{BOAT}/sandboxes"))
-            .collect();
-        let keys: Vec<_> = forks
+            .collect()
+    }
+
+    /// The second fork of a job stands for a fork after the first one was deleted: with the
+    /// same key boat would return the deleted machine.
+    #[test]
+    fn forks_send_fresh_uuid_v4_keys() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, fork_twice_each).unwrap();
+        let forks = forks(&fake);
+        let keys: HashSet<_> = forks
             .iter()
             .map(|s| s.header("idempotency-key").unwrap().to_string())
             .collect();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
+        assert_eq!(keys.len(), 4, "{keys:?}");
         for key in &keys {
             assert_eq!(Uuid::parse_str(key).unwrap().get_version_num(), 4, "{key}");
         }
-        for fork in &forks {
+        for fork in &forks[..2] {
             assert!(!fork.body_text().contains("sw-boat-runner-job"));
             assert!(fork.body_text().contains(r#""ttlSeconds":2592000"#));
         }
+        for fork in &forks[2..] {
+            assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
+            assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
+        }
+    }
+
+    fn fork_kept(_: &Snapshot, p: &Pool) -> Vec<Action> {
+        vec![Action::Fork {
+            pool: p.name.clone(),
+            job: None,
+        }]
+    }
+
+    #[test]
+    fn a_restart_makes_no_start_until_an_inflight_create_has_landed() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), NOW);
+        tick_loop.tick(NOW, fork_kept).unwrap();
+        tick_loop.tick(NOW + 89, fork_kept).unwrap();
+        assert!(forks(&fake).is_empty());
+        tick_loop.tick(NOW + 90, fork_kept).unwrap();
+        assert_eq!(forks(&fake).len(), 1);
+    }
+
+    fn stop_and_delete(_: &Snapshot, _: &Pool) -> Vec<Action> {
+        vec![
+            Action::Stop {
+                machine: "bx_22222222".into(),
+            },
+            Action::Delete {
+                machine: "bx_44444444".into(),
+            },
+        ]
+    }
+
+    /// Runner 11 took a job after the snapshot showed it idle.
+    #[test]
+    fn stop_and_delete_skip_a_machine_whose_runner_took_a_job() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") {
+                respond(422, &[], r#"{"message":"Runner is still running a job"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, stop_and_delete).unwrap();
+        let reqs = requests(&fake);
+        assert_eq!(
+            reqs[6..],
+            [
+                format!("DELETE {GH}/runners/12"),
+                format!("DELETE {BOAT}/sandboxes/bx_44444444"),
+                format!("DELETE {GH}/runners/11"),
+            ]
+        );
+    }
+
+    /// One job fork `bx_66666666` for queued job 70 and no runners. boat lists it in
+    /// `states[i]` on the i-th tick, and in the last state after that.
+    fn one_fork(states: &'static [&'static str]) -> Fake {
+        let ticks = std::cell::Cell::new(0);
+        Fake::new(move |s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                let state = states[ticks.get().min(states.len() - 1)];
+                ticks.set(ticks.get() + 1);
+                let body = format!(
+                    r#"{{"sandboxes":[{{"id":"bx_66666666","state":"{state}",
+                         "labels":{{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}}}],
+                       "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#
+                );
+                respond(200, &[], &body)
+            } else if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+            } else {
+                reply(s)
+            }
+        })
+    }
+
+    fn registers(fake: &Fake) -> usize {
+        requests(fake)
+            .iter()
+            .filter(|r| r.ends_with("/generate-jitconfig"))
+            .count()
+    }
+
+    /// The runner ran job 70 and went away between two ticks, and GitHub requeued the job.
+    #[test]
+    fn a_fork_that_got_a_runner_never_gets_another() {
+        let cfg = config();
+        let fake = one_fork(&["provisioning", "idle"]);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW - 15, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        assert_eq!(registers(&fake), 1);
+        tick_loop.tick(NOW + 15, crate::decide::decide).unwrap();
+        assert_eq!(registers(&fake), 1);
+        let reqs = requests(&fake);
+        assert!(
+            reqs.contains(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
+            "{reqs:?}"
+        );
+    }
+
+    /// The fork may have run job 70 before the restart, and GitHub requeued the job.
+    #[test]
+    fn after_a_restart_an_up_fork_counts_as_used() {
+        let cfg = config();
+        let fake = one_fork(&["idle"]);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        assert_eq!(registers(&fake), 0);
+        let reqs = requests(&fake);
+        assert!(
+            reqs.contains(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
+            "{reqs:?}"
+        );
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {
@@ -1008,7 +1195,7 @@ mod tests {
                 reply(s)
             }
         });
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         let err = tick_loop.tick(NOW, |_, _| Vec::new()).unwrap_err();
         assert!(matches!(err, Error::Boat(boat::Error::BillingRequired)));
     }

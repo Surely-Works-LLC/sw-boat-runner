@@ -86,24 +86,36 @@ The tool keeps no database. Each tick it reads:
   whose labels match it.
 
 Runner names carry what the tool needs to know about them:
-`sbr-<pool>-<machine id>-<slot>-<registered unix time>`. A forked machine carries the
-label `sw-boat-runner-job=<job id>-<attempt>`, and its fork request uses the same value as
-its `Idempotency-Key`, so a crash and restart cannot fork twice for one job.
+`sbr-<pool>-<machine id>-<slot>-<registered unix time>`. A machine forked for a job
+carries the label `sw-boat-runner-job=<job id>-<attempt>`, which `decide` matches to make
+at most one fork per job. A kept machine is forked with no job label to bring the pool up
+to `min_up`, or, in a pool with `resume` and no `fork`, for demand that no stopped machine
+covers. A kept machine gets boat's longest TTL, 30 days, after which boat archives it.
 
-A kept machine is forked with no job label to bring the pool up to `min_up`, or, in a
-pool with `resume` and no `fork`, for demand that no stopped machine covers. Its
-`Idempotency-Key` is a fresh UUID v4 per fork request. Keys never repeat, so boat's 24 h
-hold on a key never blocks a later kept fork, even after a kept machine is deleted by
-hand or by `Delete` once stopped. The cost: a crash while a create is in flight can fork
-one extra kept machine if boat's listing does not show it yet, bounded by `max_boxes` and
-stopped by `idle_stop_s`. A kept machine gets boat's longest TTL, 30 days, after which
-boat archives it.
+Every fork request's `Idempotency-Key` is a fresh UUID v4. boat answers a key it saw in
+the last 24 h with its first machine, even a deleted one, so a reused key would hand a
+job the dead machine after a `Delete` and the job would starve. Fresh keys never repeat.
+They cannot stop a crash from forking twice, so the restart wait below does that.
 
-Two facts are kept only in memory. When each machine last had a busy runner: a machine
-first seen counts as never busy, and after a restart it counts from the restart, which
-can only delay a stop. The cents spent on
-starts today: see [Start budget](#start-budget). Restarting the process loses nothing
-else.
+Two facts are kept only in memory: when each machine last had a busy runner, and the
+cents spent on starts today (see [Start budget](#start-budget)). A machine first seen
+counts as never busy, which can only delay a stop. Restarting the process loses nothing
+else. Rules that keep the tool safe on a stale snapshot and across a restart, each a
+`Fix*` flag in `spec/BoatRunner.tla`:
+
+- Stale act (`FixStaleAct`): `Stop` and `Delete` first delete the machine's GitHub
+  runners. If GitHub refuses, because a runner took a job since the snapshot, the tool
+  skips that machine this tick.
+- Register marks used (`FixRegSeen`): a `Register` counts the machine as busy at once, so
+  a requeued job cannot put a second runner on a used ephemeral machine.
+- Up fork after a restart is used (`FixCrashSeen`): an `Up` job fork first seen after a
+  restart counts as busy. A fork that never got a runner is deleted, wasting one start.
+- Fresh fork key (`FixForkKey`): see above.
+- Restart wait (`FixKeptInflight`): after a restart the tool makes no start until the
+  HTTP request timeout (90 s) has passed, so a create sent before the crash is listed or
+  has failed. Without it, kept machines could reach `max_boxes + 1`.
+- Restart spend (`FixCrashSpend`): after a restart every pool's budget counts as spent
+  until 00:00 UTC.
 
 ## State machine
 
