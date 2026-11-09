@@ -557,6 +557,16 @@ impl<'a> Loop<'a> {
                         sent: now,
                     });
                 }
+                // boat may have started a machine this process never heard about, and the
+                // next fork's fresh key would not find it. Wait as after a restart: by then
+                // the machine is listed with its job label, or it never existed.
+                if matches!(&result, Err(Error::Boat(e)) if e.may_have_applied()) {
+                    let wait = now
+                        .saturating_add(HTTP_TIMEOUT.as_secs())
+                        .saturating_add(self.cfg.tick_s);
+                    self.starts_blocked_until = self.starts_blocked_until.max(wait);
+                    starts.open = false;
+                }
                 result
             }
         }
@@ -696,12 +706,17 @@ pub mod fake {
 
     /// Answers every request with `reply` and records what was sent.
     pub struct Fake {
-        reply: Box<dyn Fn(&Sent) -> Response>,
+        reply: Box<dyn Fn(&Sent) -> Result<Response, NetworkError>>,
         sent: RefCell<Vec<Sent>>,
     }
 
     impl Fake {
         pub fn new(reply: impl Fn(&Sent) -> Response + 'static) -> Self {
+            Fake::failing(move |s| Ok(reply(s)))
+        }
+
+        /// Like `new`, but `reply` may fail as the network would.
+        pub fn failing(reply: impl Fn(&Sent) -> Result<Response, NetworkError> + 'static) -> Self {
             Fake {
                 reply: Box::new(reply),
                 sent: RefCell::new(Vec::new()),
@@ -732,7 +747,7 @@ pub mod fake {
             };
             let resp = (self.reply)(&sent);
             self.sent.borrow_mut().push(sent);
-            Ok(resp)
+            resp
         }
     }
 
@@ -1187,26 +1202,42 @@ mod tests {
     /// boat lists `listing(t)` and GitHub queues jobs `jobs(t)` on the t-th tick (from 1);
     /// starts are included, and every create answers `bx_55555555`.
     fn lagging(listing: fn(usize) -> &'static str, jobs: fn(usize) -> &'static str) -> Fake {
+        lagging_creates(listing, jobs, |_| None)
+    }
+
+    /// As `lagging`, but a create on tick t gets `create(t)` when that is `Some`.
+    fn lagging_creates(
+        listing: fn(usize) -> &'static str,
+        jobs: fn(usize) -> &'static str,
+        create: fn(usize) -> Option<Result<Response, NetworkError>>,
+    ) -> Fake {
         let ticks = std::cell::Cell::new(0);
-        Fake::new(move |s| {
+        Fake::failing(move |s| {
             let url = s.url.as_str();
-            if s.method == "GET" && url.starts_with(&format!("{BOAT}/sandboxes?")) {
-                ticks.set(ticks.get() + 1);
-                let body = format!(
-                    r#"{{"sandboxes":[{}],
-                       "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#,
-                    listing(ticks.get())
-                );
-                respond(200, &[], &body)
-            } else if s.method == "GET" && url.starts_with(&format!("{GH}/runners?")) {
-                respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
-            } else if s.method == "GET" && url.contains("/runs/5/jobs") {
-                respond(200, &[], &format!(r#"{{"jobs":[{}]}}"#, jobs(ticks.get())))
-            } else if s.method == "GET" && url.ends_with("/v1/limits") {
-                respond(200, &[], r#"{"canStart":true,"nextStartDollars":0}"#)
-            } else {
-                reply(s)
+            if s.method == "POST" && url == format!("{BOAT}/sandboxes") {
+                if let Some(r) = create(ticks.get()) {
+                    return r;
+                }
             }
+            Ok(
+                if s.method == "GET" && url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                    ticks.set(ticks.get() + 1);
+                    let body = format!(
+                        r#"{{"sandboxes":[{}],
+                       "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#,
+                        listing(ticks.get())
+                    );
+                    respond(200, &[], &body)
+                } else if s.method == "GET" && url.starts_with(&format!("{GH}/runners?")) {
+                    respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+                } else if s.method == "GET" && url.contains("/runs/5/jobs") {
+                    respond(200, &[], &format!(r#"{{"jobs":[{}]}}"#, jobs(ticks.get())))
+                } else if s.method == "GET" && url.ends_with("/v1/limits") {
+                    respond(200, &[], r#"{"canStart":true,"nextStartDollars":0}"#)
+                } else {
+                    reply(s)
+                },
+            )
         })
     }
 
@@ -1286,6 +1317,49 @@ mod tests {
             [("bx_55555555".to_string(), MachineState::Starting)]
         );
         assert!(observed(&mut tick_loop, NOW + lag_s + 1).is_empty());
+    }
+
+    /// The first create times out after boat may have accepted it.
+    fn first_create_lost(t: usize) -> Option<Result<Response, NetworkError>> {
+        (t == 1).then(|| Err(NetworkError("timed out reading response".into())))
+    }
+
+    /// Ticks every 15 s from `NOW` to `NOW + until_s` and counts forks after each.
+    fn forks_per_tick(tick_loop: &mut Loop, fake: &Fake, until_s: UnixSecs) -> Vec<usize> {
+        (0..=until_s / 15)
+            .map(|k| {
+                tick_loop.tick(NOW + 15 * k, crate::decide::decide).unwrap();
+                forks(fake).len()
+            })
+            .collect()
+    }
+
+    /// boat never lists the lost create, so it never existed: the next start waits for the
+    /// request timeout plus one tick, then forks job 70 again.
+    #[test]
+    fn a_create_without_an_answer_blocks_starts_until_it_would_be_listed() {
+        let cfg = config();
+        let fake = lagging_creates(|_| "", |_| JOB_70, first_create_lost);
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let wait_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
+        let mut want = vec![1; (wait_s / 15) as usize];
+        want.push(2);
+        assert_eq!(forks_per_tick(&mut tick_loop, &fake, wait_s), want);
+    }
+
+    /// boat accepted the lost create and lists it, with its job label, from the third tick.
+    #[test]
+    fn a_lost_create_that_boat_lists_is_not_forked_again() {
+        let cfg = config();
+        let fake = lagging_creates(
+            |t| if t < 3 { "" } else { LISTED_55 },
+            |_| JOB_70,
+            first_create_lost,
+        );
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let until_s = HTTP_TIMEOUT.as_secs() + 2 * cfg.tick_s;
+        let counts = forks_per_tick(&mut tick_loop, &fake, until_s);
+        assert!(counts.iter().all(|&n| n == 1), "{counts:?}");
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {
