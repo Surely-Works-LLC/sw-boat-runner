@@ -5,9 +5,8 @@
 (* implement it on branch integrate. Stop and Delete are decided from one *)
 (* snapshot and executed later, because run::execute does not look again; *)
 (* every other tool action reads the current state. The Fix* constants    *)
-(* switch on the fixes in spec/README.md. integrate bf34e1f has every     *)
-(* fix up to FixListLag. The core agent is adding FixLostCreate, and the  *)
-(* code does not do FixLostSpend.                                         *)
+(* switch on the fixes in spec/README.md. integrate f8c670c has every     *)
+(* fix up to FixLostCreate; the code does not do FixLostSpend.            *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 

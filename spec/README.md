@@ -98,8 +98,7 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 ## Fix flags
 
 Each `Fix*` constant switches on one fix for a violation below. `integrate`
-bf34e1f has the first seven. The core agent is adding `FixLostCreate`, and the
-code does not do `FixLostSpend` yet. The main models set all nine to TRUE, and
+f8c670c has the first eight. The code does not do `FixLostSpend` yet. The main models set all nine to TRUE, and
 CI also checks that each flag off still yields its counterexample, so a model
 change that hides one fails CI.
 
@@ -367,14 +366,15 @@ picks one reading.
   forks as well as kept ones, and the restart wait covers both
   (`FixKeptInflight`). `CrashInFork`, `Land`, `Lost` and `inflight` are gone;
   `lag` models both the in-flight create and the listing lag.
-- Checked against `integrate` bf34e1f: `self.pending` keeps each created fork
+- Checked against `integrate` f8c670c: `self.pending` keeps each created fork
   until a listing shows it or `HTTP_TIMEOUT` plus one tick passes, and adds it
   to the snapshot as a Starting machine. That is the model's `Known`.
   `run::start` adds the price only when boat answers Ok, so a lost create is
-  not paid for, which is why `FixLostSpend` is separate. `FixLostCreate` is
-  modelled from the coordinator's description; the core agent's code was not
-  on `integrate` yet.
+  not paid for, which is why `FixLostSpend` is separate. `run::execute` closes
+  starts until `HTTP_TIMEOUT` plus one tick after a create that may have
+  applied (a691488). The model blocks starts while a `Lost` machine is
+  unlisted, which assumes that wait outlasts the listing lag.
 
 ## Base code
 
-This branch merges `integrate` bf34e1f and does not touch Rust code itself.
+This branch merges `integrate` f8c670c and does not touch Rust code itself.
