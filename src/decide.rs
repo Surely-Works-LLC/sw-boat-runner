@@ -12,6 +12,8 @@ use crate::model::{
 
 /// The actions for `pool`, in this order: runner cleanup, deletes, registers, resumes,
 /// forks, stops. Inputs are sorted by id first, so their order in `snap` does not matter.
+/// A pool that can resume also resumes stopped machines, jobs or not, until `min_up` kept
+/// machines are up or starting.
 ///
 /// Ephemeral machines are the ones with `job: Some(_)`, made by `Fork`. One gets exactly one
 /// runner in its life, so "fresh" and "finished" are decided from `last_busy` (the last time
@@ -169,18 +171,27 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         taken: 0,
     };
     if has(Placement::Resume) {
+        // `min_up` counts kept machines that are up or on their way up. Only a resume can
+        // bring one back: `Fork` always makes an ephemeral machine for one job.
+        let mut held = machines
+            .iter()
+            .filter(kept)
+            .filter(|m| matches!(m.state, MachineState::Up | MachineState::Starting))
+            .count();
         // boat may have dropped the kept disk, so every resume is priced as a start.
         for m in machines
             .iter()
             .filter(kept)
             .filter(in_state(MachineState::Stopped))
         {
-            if want == 0 || !starts.take() {
+            let short = held < pool.min_up as usize;
+            if (want == 0 && !short) || !starts.take() {
                 break;
             }
             actions.push(Action::Resume {
                 machine: m.id.clone(),
             });
+            held += 1;
             want = want.saturating_sub(pool.slots_per_box as usize);
         }
     }
@@ -432,6 +443,31 @@ mod tests {
     }
 
     #[test]
+    fn warm_resumes_up_to_min_up_without_jobs() {
+        let p = pool("warm", "min_up = 2");
+        let stopped = vec![
+            machine("m1", Ms::Stopped),
+            machine("m2", Ms::Stopped),
+            machine("m3", Ms::Stopped),
+        ];
+        let s = snap(stopped.clone(), vec![], &[]);
+        assert_eq!(decide(&s, &p), [resume("m1"), resume("m2")]);
+
+        let mut starting = stopped;
+        starting[0].state = Ms::Starting;
+        let s = snap(starting, vec![], &[]);
+        assert_eq!(decide(&s, &p), [resume("m2")]);
+
+        // An ephemeral machine is not one of the `min_up` kept machines.
+        let s = snap(
+            vec![forked("f1", 1, Ms::Starting), machine("m1", Ms::Stopped)],
+            vec![],
+            &[1],
+        );
+        assert_eq!(decide(&s, &pool("hybrid", "min_up = 1")), [resume("m1")]);
+    }
+
+    #[test]
     fn fork_gives_each_job_one_machine_and_deletes_it_after_use() {
         let p = pool("fork", "");
         assert_eq!(decide(&snap(vec![], vec![], &[1]), &p), [fork(1)]);
@@ -656,16 +692,56 @@ mod tests {
                 }
             }
 
-            /// Settles: with nothing queued, nothing is started or registered.
+            /// Settles: with nothing queued, nothing is registered or forked, and a resume
+            /// only brings the pool's kept machines up to `min_up`.
             #[test]
             fn no_queue_no_starts(mut snap in arb_snapshot(), pool in arb_pool()) {
                 snap.queued.clear();
+                let mut held = snap
+                    .machines
+                    .iter()
+                    .filter(|m| m.pool == pool.name && m.job.is_none())
+                    .filter(|m| matches!(m.state, Ms::Up | Ms::Starting))
+                    .count();
                 for a in decide(&snap, &pool) {
-                    let starts_work = matches!(
-                        a,
-                        Action::Register { .. } | Action::Resume { .. } | Action::Fork { .. }
-                    );
+                    let starts_work = matches!(a, Action::Register { .. } | Action::Fork { .. });
                     prop_assert!(!starts_work, "{a:?}");
+                    if let Action::Resume { .. } = a {
+                        held += 1;
+                        prop_assert!(held <= pool.min_up as usize, "{a:?}");
+                    }
+                }
+            }
+
+            /// MinUp: a pool that can resume, with starts allowed and free, ends the tick
+            /// with `min_up` kept machines up or starting while stopped ones are left.
+            #[test]
+            fn resume_reaches_min_up(mut snap in arb_snapshot(), pool in arb_pool()) {
+                snap.limits = Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0 };
+                let own = |m: &&Machine| m.pool == pool.name;
+                let count = |states: &[Ms]| {
+                    snap.machines
+                        .iter()
+                        .filter(own)
+                        .filter(|m| m.job.is_none() && states.contains(&m.state))
+                        .count()
+                };
+                let held = count(&[Ms::Up, Ms::Starting]);
+                let stopped = count(&[Ms::Stopped]);
+                let boxes = snap
+                    .machines
+                    .iter()
+                    .filter(own)
+                    .filter(|m| matches!(m.state, Ms::Up | Ms::Starting))
+                    .count();
+                let resumed = decide(&snap, &pool)
+                    .iter()
+                    .filter(|a| matches!(a, Action::Resume { .. }))
+                    .count();
+                if pool.placement.contains(&Placement::Resume) {
+                    let room = (pool.max_boxes as usize).saturating_sub(boxes);
+                    let reachable = (pool.min_up as usize).min(held + stopped.min(room));
+                    prop_assert!(held + resumed >= reachable);
                 }
             }
 
