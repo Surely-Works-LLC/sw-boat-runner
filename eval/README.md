@@ -1,5 +1,8 @@
 # Evals
 
+This is an offline analysis that shells out to `gh` and `boat`, not part of the daemon,
+so it stays a standard-library Python script outside the crate.
+
 `evals.py` compares GitHub Actions jobs before and after a repository moves from
 boat per-job sandboxes (`runs-on: boat`) to persistent self-hosted runners.
 
