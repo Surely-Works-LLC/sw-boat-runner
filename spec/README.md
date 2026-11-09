@@ -130,12 +130,15 @@ with `tla2tools.jar` v1.7.4 (sha256
 `.github/workflows/ci.yml` lists each model's sed edit. The passing models must
 exit 0. The counterexample models must fail with the message given.
 
-| Model | Base | Change | Distinct states | CI job |
+| Model | Base | Change | Distinct states | TLC time |
 | --- | --- | --- | --- | --- |
-| hybrid | `BoatRunner.cfg` | none | see run annotation | |
-| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | see run annotation | |
-| warm | `BoatRunner.cfg` | placement `slot, resume` | see run annotation | |
-| fork | `BoatRunnerFork.cfg` | none | see run annotation | |
+| hybrid | `BoatRunner.cfg` | none | 18827 | 54 s |
+| hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | 40676 | 1 min 46 s |
+| warm | `BoatRunner.cfg` | placement `slot, resume` | 4131 | 9 s |
+| fork | `BoatRunnerFork.cfg` | none | not in the run's annotations | job 5 min 18 s |
+
+Counts are from CI run 42712725121 at c54061d. GitHub shows only some jobs'
+annotations; the rest are in the job logs.
 
 ## Known violations
 
@@ -146,8 +149,8 @@ violation varies a little between runs.
 
 ### crash-spend: StartBudget
 
-`FixCrashSpend = FALSE`. TLC: `Invariant StartBudget is violated.` (698
-distinct states, 3 s.)
+`FixCrashSpend = FALSE`. TLC: `Invariant StartBudget is violated.` (783
+distinct states, 4 s.)
 
 Trace: job j1 arrives. The included free start resumes m1. j2 arrives. j1 is
 forked onto m3, a paid start (`spent_today` 1). m3 boots, then the daemon
@@ -163,8 +166,8 @@ persist it. The model sets it to `PaidBudget`.
 
 ### stale-act: NoBusyStop
 
-`FixStaleAct = FALSE`. TLC: `Action property NoBusyStop is violated.` (2714
-distinct states, 9 s.)
+`FixStaleAct = FALSE`. TLC: `Action property NoBusyStop is violated.` (3527
+distinct states, 12 s.)
 
 Trace: j1 is forked onto m2. The runner registers and comes online Idle while
 j1 is still queued. m2 ages past `fork_ttl_s` and the plan deletes it. Before
@@ -188,7 +191,7 @@ queue. The fix covers both cases.
 ### reg-seen: EphemeralIsolation
 
 `FixRegSeen = FALSE`, fork model. TLC: `Action property EphemeralIsolation is
-violated.` (7152 distinct states, 12 s.)
+violated.` (10747 distinct states, 16 s.)
 
 Trace: j1 arrives and is forked onto m1. The runner registers, comes online and
 runs j1. The runner then goes away and GitHub requeues j1 before any Observe
@@ -206,7 +209,7 @@ runner. On a kept machine it restarts the idle timer, which the model shows as
 ### crash-seen: EphemeralIsolation
 
 `FixCrashSeen = FALSE`, fork model. TLC: `Action property EphemeralIsolation
-is violated.` (8837 distinct states, 9 s.)
+is violated.` (13050 distinct states, 13 s.)
 
 Trace: as in reg-seen, except the fork was already marked seen, and a crash
 reset `seen` to empty. The restarted daemon registers a new runner on the used
@@ -227,7 +230,7 @@ model that list's lag.
 
 `FixForkKey = FALSE`, fork model, `NoStarvation` as the only property (TLC
 does not name the failing temporal property). TLC: `Temporal properties were
-violated.` (2933 distinct states, 6 s.)
+violated.` (job 21 s; count in the job log.)
 
 Trace: j1 is forked onto m1. The runner never comes online, so it is
 unregistered and m1 is deleted. The next Fork for j1 reuses the same
@@ -243,7 +246,8 @@ whenever the previous fork for that job is gone.
 ### kept-inflight: MaxBoxes
 
 `FixKeptInflight = FALSE`, hybrid model with `MinUp = 1`, no stopped machine at
-the start and `Included = 3`. TLC: `Invariant MaxBoxes is violated.`
+the start and `Included = 3`. TLC: `Invariant MaxBoxes is violated.` (345 distinct
+states, 4 s.)
 
 A trace that reaches it (TLC's own trace is in the job log): the pool is short
 of `min_up`, so the tool forks a free kept machine. The daemon crashes before
@@ -270,8 +274,10 @@ listed or has failed. The model blocks every start while an `Orphan` exists.
 `FixListLag = FALSE`, fork model. CI checks the two invariants in separate
 models, because TLC stops at the first one that fails.
 
-- list-lag, without `NoDoubleFork`: `Invariant MaxBoxes is violated.`
-- list-lag-fork, without `MaxBoxes`: `Invariant NoDoubleFork is violated.`
+- list-lag, without `NoDoubleFork`: `Invariant MaxBoxes is violated.` (107
+  distinct states, 1 s.)
+- list-lag-fork, without `MaxBoxes`: `Invariant NoDoubleFork is violated.` (23
+  distinct states, 1 s.)
 
 Trace: j1 arrives and is forked onto m1. On the next tick boat's listing does
 not show m1 yet, so the tool sees no live machine, no pending fork and no fork
@@ -289,8 +295,10 @@ model's `Known` state is that memory; with it on both invariants hold.
 
 `FixLostCreate = FALSE`, fork model, split like list-lag.
 
-- lost-create, without `NoDoubleFork`: `Invariant MaxBoxes is violated.`
+- lost-create, without `NoDoubleFork`: `Invariant MaxBoxes is violated.` (job
+  10 s; count in the job log.)
 - lost-create-fork, without `MaxBoxes`: `Invariant NoDoubleFork is violated.`
+  (55 distinct states, 2 s.)
 
 Trace: j1 arrives. The fork create for j1 times out, but boat makes m1. The
 tool has no machine id to remember, so `FixListLag` cannot count m1, and the
@@ -308,7 +316,7 @@ machine, `HTTP_TIMEOUT` plus one tick. The model blocks every start while a
 ### lost-spend: StartBudget
 
 `FixLostSpend = FALSE`, fork model, every other fix on. TLC: `Invariant
-StartBudget is violated.`
+StartBudget is violated.` (job 1 min 2 s; count in the job log.)
 
 A trace that reaches it: j1 is forked twice in a row, each fork aging past
 `fork_ttl_s` before it boots and being deleted, which uses the two included
