@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use uuid::Uuid;
+
 use crate::boat;
 use crate::github;
 use crate::model::{
@@ -227,12 +229,10 @@ struct Seen {
     last_busy: UnixSecs,
 }
 
-/// Whether this tick may still start machines, the price `decide` was shown, and the
-/// kept machines each pool has forked so far this tick.
+/// Whether this tick may still start machines, and the price `decide` was shown.
 struct Starts {
     open: bool,
     price: Cents,
-    kept_forks: HashMap<String, usize>,
 }
 
 /// The actions `decide` asks for across all pools, in file order. Each pool sees only the
@@ -328,10 +328,9 @@ impl<'a> Loop<'a> {
         let mut starts = Starts {
             open: snapshot.limits.can_start,
             price: snapshot.limits.next_start_cents,
-            kept_forks: HashMap::new(),
         };
         for action in &actions {
-            match self.execute(now, action, &snapshot, &runner_ids, &mut starts) {
+            match self.execute(now, action, &runner_ids, &mut starts) {
                 Ok(()) => {}
                 Err(e) if e.is_fatal() => return Err(e),
                 Err(e @ Error::GitHub(github::Error::RateLimited { .. })) => {
@@ -445,7 +444,6 @@ impl<'a> Loop<'a> {
         &mut self,
         now: UnixSecs,
         action: &Action,
-        snapshot: &Snapshot,
         runner_ids: &HashMap<String, u64>,
         starts: &mut Starts,
     ) -> Result<(), Error> {
@@ -474,21 +472,10 @@ impl<'a> Loop<'a> {
                         labels.insert(boat::JOB_LABEL.to_string(), key.clone());
                         (key, p.fork_ttl_s)
                     }
-                    None => {
-                        // Counting the pool's kept machines keeps the key stable across
-                        // ticks until the fork shows up in the list.
-                        let kept = snapshot
-                            .machines
-                            .iter()
-                            .filter(|m| {
-                                m.pool == p.name && m.job.is_none() && m.state != MachineState::Gone
-                            })
-                            .count();
-                        let sent = starts.kept_forks.entry(p.name.clone()).or_insert(0);
-                        let n = kept + *sent;
-                        *sent += 1;
-                        (format!("sbr-{}-keep-{n}", p.name), boat::MAX_TTL_S)
-                    }
+                    // A fresh key per fork, never reused, so a deleted kept machine
+                    // cannot hold boat's 24 h key and block the next kept fork
+                    // (docs/design.md#observed-state).
+                    None => (Uuid::new_v4().to_string(), boat::MAX_TTL_S),
                 };
                 self.start(now, starts, |b| {
                     b.create_from_snapshot(&p.snapshot, &p.machine_type, &labels, ttl_s, &key)
@@ -934,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn kept_forks_count_the_pools_kept_machines() {
+    fn kept_forks_send_fresh_uuid_v4_keys() {
         let cfg = config();
         let fake = Fake::new(reply);
         let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into());
@@ -944,9 +931,15 @@ mod tests {
             .into_iter()
             .filter(|s| s.method == "POST" && s.url == format!("{BOAT}/sandboxes"))
             .collect();
-        // bx_22222222 and bx_33333333 are kept; bx_44444444 belongs to a job.
-        let keys: Vec<_> = forks.iter().map(|s| s.header("idempotency-key")).collect();
-        assert_eq!(keys, [Some("sbr-ci-keep-2"), Some("sbr-ci-keep-3")]);
+        let keys: Vec<_> = forks
+            .iter()
+            .map(|s| s.header("idempotency-key").unwrap().to_string())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        for key in &keys {
+            assert_eq!(Uuid::parse_str(key).unwrap().get_version_num(), 4, "{key}");
+        }
         for fork in &forks {
             assert!(!fork.body_text().contains("sw-boat-runner-job"));
             assert!(fork.body_text().contains(r#""ttlSeconds":2592000"#));
