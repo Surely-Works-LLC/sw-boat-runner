@@ -28,15 +28,6 @@ pub enum Placement {
     Fork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunnerMode {
-    /// Registered once, takes job after job.
-    Persistent,
-    /// Just-in-time config, one job, then the runner exits.
-    Jit,
-}
-
 /// A pool after its preset has been applied; see `policy::load`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pool {
@@ -48,7 +39,6 @@ pub struct Pool {
     /// Saved snapshot that `Fork` starts from.
     pub snapshot: String,
     pub placement: Vec<Placement>,
-    pub runner: RunnerMode,
     pub min_up: u32,
     pub max_boxes: u32,
     pub slots_per_box: u32,
@@ -57,6 +47,17 @@ pub struct Pool {
     pub register_timeout_s: u64,
     pub fork_ttl_s: u64,
     pub paid_start_cents_per_day: Cents,
+}
+
+impl Pool {
+    /// A job goes to a pool when it names at least one label and each is one of the pool's.
+    /// GitHub matches runner labels case-insensitively.
+    pub fn serves(&self, job_labels: &[String]) -> bool {
+        !job_labels.is_empty()
+            && job_labels
+                .iter()
+                .all(|l| self.labels.iter().any(|p| p.eq_ignore_ascii_case(l)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -84,7 +85,7 @@ pub struct Machine {
     pub since: UnixSecs,
     /// Last time a runner on it was `Busy` or `Registered`; in memory only.
     pub last_busy: UnixSecs,
-    /// The job an ephemeral (forked) machine was made for.
+    /// The job an ephemeral (forked) machine was made for; `None` for a kept machine.
     pub job: Option<JobKey>,
 }
 
@@ -134,11 +135,26 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
-    Register { pool: String, machine: String, slot: u32 },
-    Resume { machine: String },
-    Fork { pool: String, job: JobKey },
-    Stop { machine: String },
-    Delete { machine: String },
-    Unregister { runner: String },
-    RestartRunner { machine: String, slot: u32 },
+    Register {
+        pool: String,
+        machine: String,
+        slot: u32,
+    },
+    Resume {
+        machine: String,
+    },
+    /// `job: None` makes a kept machine, which stays in the pool after its first job.
+    Fork {
+        pool: String,
+        job: Option<JobKey>,
+    },
+    Stop {
+        machine: String,
+    },
+    Delete {
+        machine: String,
+    },
+    Unregister {
+        runner: String,
+    },
 }
