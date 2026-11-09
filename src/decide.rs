@@ -173,17 +173,17 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     if has(Placement::Resume) {
         // `min_up` counts kept machines that are up or on their way up. Only a resume can
         // bring one back: `Fork` always makes an ephemeral machine for one job.
-        let mut held = machines
+        let held = machines
             .iter()
             .filter(kept)
             .filter(|m| matches!(m.state, MachineState::Up | MachineState::Starting))
             .count();
-        // boat may have dropped the kept disk, so every resume is priced as a start.
-        for m in machines
+        let stopped = machines
             .iter()
             .filter(kept)
-            .filter(in_state(MachineState::Stopped))
-        {
+            .filter(in_state(MachineState::Stopped));
+        // boat may have dropped the kept disk, so every resume is priced as a start.
+        for (held, m) in (held..).zip(stopped) {
             let short = held < pool.min_up as usize;
             if (want == 0 && !short) || !starts.take() {
                 break;
@@ -191,7 +191,6 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             actions.push(Action::Resume {
                 machine: m.id.clone(),
             });
-            held += 1;
             want = want.saturating_sub(pool.slots_per_box as usize);
         }
     }
