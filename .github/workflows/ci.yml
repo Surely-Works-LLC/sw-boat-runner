@@ -74,6 +74,19 @@ jobs:
             cfg: spec/BoatRunnerFork.cfg
             edit: 's/^FixListLag = TRUE/FixListLag = FALSE/;/^INVARIANT MaxBoxes$/d'
             expect: Invariant NoDoubleFork is violated.
+          # A create whose answer is lost while boat makes the machine.
+          - name: lost-create
+            cfg: spec/BoatRunnerFork.cfg
+            edit: 's/^FixLostCreate = TRUE/FixLostCreate = FALSE/;/^INVARIANT NoDoubleFork$/d'
+            expect: Invariant MaxBoxes is violated.
+          - name: lost-create-fork
+            cfg: spec/BoatRunnerFork.cfg
+            edit: 's/^FixLostCreate = TRUE/FixLostCreate = FALSE/;/^INVARIANT MaxBoxes$/d'
+            expect: Invariant NoDoubleFork is violated.
+          - name: lost-spend
+            cfg: spec/BoatRunnerFork.cfg
+            edit: 's/^FixLostSpend = TRUE/FixLostSpend = FALSE/'
+            expect: Invariant StartBudget is violated.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

@@ -5,8 +5,9 @@
 (* implement it on branch integrate. Stop and Delete are decided from one *)
 (* snapshot and executed later, because run::execute does not look again; *)
 (* every other tool action reads the current state. The Fix* constants    *)
-(* switch on the fixes in spec/README.md. integrate e351752 has every    *)
-(* fix but FixListLag, which the core agent is adding.                    *)
+(* switch on the fixes in spec/README.md. integrate bf34e1f has every    *)
+(* fix up to FixListLag. The core agent is adding FixLostCreate, and the  *)
+(* code does not do FixLostSpend.                                         *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -30,8 +31,11 @@ CONSTANTS
                     \* which GitHub refuses while it runs a job
     FixKeptInflight,\* after a restart the tool starts nothing until every fork
                     \* sent before the crash is listed or has failed
-    FixListLag      \* the tool counts the forks it created until the listing
+    FixListLag,     \* the tool counts the forks it created until the listing
                     \* shows them
+    FixLostCreate,  \* after a create with no definite answer the tool starts
+                    \* nothing until boat lists the machine
+    FixLostSpend    \* a create with no definite answer counts its price as spent
 
 ASSUME
     /\ InitStopped \subseteq Machines
@@ -41,7 +45,7 @@ ASSUME
     /\ BoxCap \in Nat /\ MinUp \in Nat /\ Included \in Nat
     /\ PaidBudget \in Nat /\ MaxFaults \in Nat
     /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct,
-        FixKeptInflight, FixListLag} \subseteq BOOLEAN
+        FixKeptInflight, FixListLag, FixLostCreate, FixLostSpend} \subseteq BOOLEAN
     /\ NoJob \notin Jobs
     /\ NoMachine \notin Machines
 
@@ -75,6 +79,7 @@ Has(step) == step \in Placement
 (* boat lists a created machine some time after the create returns. Listed: *)
 (* in the listing. Known: not yet listed; the tool remembers creating it and *)
 (* counts it as a Starting machine. Hidden: not yet listed and not counted.  *)
+(* Lost: not yet listed, and the create's answer never reached the tool.    *)
 (* Orphan: not yet listed and created before a restart, which lost the      *)
 (* tool's memory. The listing catches up before the machine boots; an Up    *)
 (* machine missing from it would add only a delay, since the tool registers *)
@@ -116,7 +121,10 @@ BudgetOK == Price = 0 \/ spent_today + Price <= PaidBudget
 \* The restart wait outlasts every create sent before the crash and the
 \* listing's lag behind it.
 Orphans == \E m \in Machines : lag[m] = "Orphan"
-StartOK == BudgetOK /\ ToolBoxes < BoxCap /\ ~(FixKeptInflight /\ Orphans)
+\* The lost-create wait, HTTP_TIMEOUT and one tick, outlasts the listing's lag.
+LostOnes == \E m \in Machines : lag[m] = "Lost"
+StartOK == /\ BudgetOK /\ ToolBoxes < BoxCap
+           /\ ~(FixKeptInflight /\ Orphans) /\ ~(FixLostCreate /\ LostOnes)
 Pay == spent_today' = spent_today + Price
 Paid == IF starts > Included THEN starts - Included ELSE 0
 
@@ -274,14 +282,16 @@ Resume(m) ==
     /\ Pay
     /\ UNCHANGED <<lag, job, runner, status, jobOn, seen, idle, age, plan, keys, ran, faults>>
 
-NewMachine(m, j) ==
+\* boat makes machine m for job j and counts the start; l is the listing state.
+Create(m, j, l) ==
     /\ mstate' = [mstate EXCEPT ![m] = "Starting"]
-    /\ lag' = [lag EXCEPT ![m] = IF FixListLag THEN "Known" ELSE "Hidden"]
+    /\ lag' = [lag EXCEPT ![m] = l]
     /\ job' = [job EXCEPT ![m] = j]
     /\ age' = [age EXCEPT ![m] = 0]
     /\ seen' = [seen EXCEPT ![m] = FALSE]
     /\ starts' = starts + 1
-    /\ Pay
+
+NewMachine(m, j) == Create(m, j, IF FixListLag THEN "Known" ELSE "Hidden") /\ Pay
 
 ForkKept ==
     /\ ForkKeptGuard
@@ -439,6 +449,20 @@ RefuseUnregister(m) ==
     /\ UNCHANGED <<lag, mstate, job, keep, runner, status, jobOn, seen, idle, age,
                    starts, spent_today, keys, ran>>
 
+\* A create times out, fails in transport or gets a 5xx, and boat made the
+\* machine anyway. run::start adds the price only on a definite answer, so
+\* without FixLostSpend the tool does not count the start boat counted. A lost
+\* create of a machine boat never made only delays the next start.
+LostCreate ==
+    /\ Fault
+    /\ \/ ForkKeptGuard /\ \E m \in FreeIds : Create(m, NoJob, "Lost") /\ UNCHANGED keys
+       \/ \E j \in Jobs : /\ ForkGuard(j)
+                          /\ FixForkKey \/ j \notin keys
+                          /\ \E m \in FreeIds : Create(m, j, "Lost")
+                          /\ keys' = IF FixForkKey THEN keys ELSE keys \cup {j}
+    /\ spent_today' = IF FixLostSpend THEN spent_today + Price ELSE spent_today
+    /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
+
 \* boat answers 429 or 503: nothing starts, nothing is counted, and the tool
 \* tries again on a later tick.
 RefuseStart ==
@@ -517,6 +541,7 @@ FaultStep ==
           \/ RunnerOffline(m)
           \/ RefuseUnregister(m)
     \/ RefuseStart
+    \/ LostCreate
     \/ Crash
 
 Next == ToolStep \/ EnvStep \/ FaultStep
@@ -564,7 +589,7 @@ TypeOK ==
     /\ spent_today \in Nat
     /\ keys \subseteq Jobs
     /\ ran \in [Machines -> BOOLEAN]
-    /\ lag \in [Machines -> {"Listed", "Known", "Hidden", "Orphan"}]
+    /\ lag \in [Machines -> {"Listed", "Known", "Hidden", "Lost", "Orphan"}]
     /\ faults \in 0..MaxFaults
 
 \* 1

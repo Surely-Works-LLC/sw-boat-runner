@@ -34,10 +34,13 @@ and `src/run.rs` implement it on branch `integrate`. TLC checks it in CI (job `t
   snapshot, unless the tool remembers creating it (`Known`, the FixListLag
   rule). A crash turns every unlisted machine into an `Orphan`: the memory is
   gone, and every fork key is a fresh UUID v4, so the tool cannot find the
-  create again. The listing catches up by the time the machine boots.
+  create again. A create whose answer is lost (timeout, transport error, 5xx)
+  while boat makes the machine leaves it `Lost`: not listed, and not known to
+  the tool. The listing catches up by the time the machine boots.
 - **Faults**, at most `MaxFaults` per behaviour: GitHub reassigns a running job
   (requeued, runner gone); boat loses a kept disk; boat refuses a start (429 or
-  503); a JIT runner never comes online; an Idle runner goes offline; GitHub
+  503); a create's answer is lost while boat makes the machine (`LostCreate`);
+  a JIT runner never comes online; an Idle runner goes offline; GitHub
   fails a runner delete before a Stop or Delete (`RefuseUnregister`); the tool
   crashes. A crash wipes the tool's memory: the unexecuted plan, `since`,
   `last_busy`, the online set, `spent_today`, and the forks it created that boat
@@ -53,10 +56,13 @@ and `src/run.rs` implement it on branch `integrate`. TLC checks it in CI (job `t
   Routing between pools is out of scope.
 - Prices are one unit per paid start; the budget is in those units. No day
   rollover: everything happens within one UTC day.
-- Stopping is folded into Stopped. HTTP errors other than a refused start and
-  a refused runner delete are not modelled.
-- The listing lag ends by boot, and is shorter than both the FixListLag memory
-  timeout and the restart wait. An Up machine missing from the listing would
+- Stopping is folded into Stopped. HTTP errors other than a refused start, a
+  lost create and a refused runner delete are not modelled. A lost create of a
+  machine boat never made is a refused start with a longer wait, so the model
+  leaves it out.
+- The listing lag ends by boot, and is shorter than the FixListLag memory
+  timeout, the lost-create wait (`HTTP_TIMEOUT` plus one tick) and the restart
+  wait. An Up machine missing from the listing would
   only delay its Register, because the tool registers runners on listed
   machines alone. A resumed machine stays listed. A create still in flight at a
   crash is an Orphan created a moment earlier: boat counts its start either way.
@@ -92,9 +98,10 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 ## Fix flags
 
 Each `Fix*` constant switches on one fix for a violation below. `integrate`
-e351752 has the first six; the core agent is adding `FixListLag`. The main
-models set all seven to TRUE, and CI also checks that each flag off still
-yields its counterexample, so a model change that hides one fails CI.
+bf34e1f has the first seven. The core agent is adding `FixLostCreate`, and the
+code does not do `FixLostSpend` yet. The main models set all nine to TRUE, and
+CI also checks that each flag off still yields its counterexample, so a model
+change that hides one fails CI.
 
 | Flag | Fix |
 | --- | --- |
@@ -105,6 +112,8 @@ yields its counterexample, so a model change that hides one fails CI.
 | `FixForkKey` | the job fork Idempotency-Key also names the fork attempt, so a fork after a Delete starts a machine |
 | `FixKeptInflight` | after a restart, start nothing until boat's create timeout has passed, so every fork sent before the crash, kept or job, is listed or failed |
 | `FixListLag` | the tool remembers each fork it created until a listing shows it or a timeout passes, and counts it as a Starting machine |
+| `FixLostCreate` | after a create with no definite answer (timeout, transport error, 5xx), start nothing for `HTTP_TIMEOUT` plus one tick, by which time boat lists the machine if it made one |
+| `FixLostSpend` | a create with no definite answer adds its price to `spent_today`, as if it had succeeded |
 
 ## Running TLC
 
@@ -276,6 +285,45 @@ Fix: remember each fork the loop created until a listing shows it or a timeout
 longer than the listing lag passes, and count it as a Starting machine. The
 model's `Known` state is that memory; with it on both invariants hold.
 
+### lost-create: MaxBoxes and NoDoubleFork
+
+`FixLostCreate = FALSE`, fork model, split like list-lag.
+
+- lost-create, without `NoDoubleFork`: `Invariant MaxBoxes is violated.`
+- lost-create-fork, without `MaxBoxes`: `Invariant NoDoubleFork is violated.`
+
+Trace: j1 arrives. The fork create for j1 times out, but boat makes m1. The
+tool has no machine id to remember, so `FixListLag` cannot count m1, and the
+listing does not show it yet. The next tick forks j1 again: two live forks for
+one job. With j2 queued too, or a second lost create, a third fork makes 3 live
+machines against `max_boxes` = 2.
+
+Cause: a create with no definite answer may still have made a machine, and the
+tool counts only the machines it knows about.
+
+Fix: after such a failure, start nothing until boat would have listed the
+machine, `HTTP_TIMEOUT` plus one tick. The model blocks every start while a
+`Lost` machine exists.
+
+### lost-spend: StartBudget
+
+`FixLostSpend = FALSE`, fork model, every other fix on. TLC: `Invariant
+StartBudget is violated.`
+
+A trace that reaches it: j1 is forked twice in a row, each fork aging past
+`fork_ttl_s` before it boots and being deleted, which uses the two included
+starts. The third create, a paid one, loses its answer, and boat makes m3.
+`FixLostCreate` waits until m3 is listed; m3 gets a runner, ages out unused and
+is deleted. j1 is still queued, and the tool forks it again: `spent_today` is
+0, so the paid start passes, and boat has counted 2 paid starts against a
+budget of 1.
+
+Cause: `run::start` adds the price to `spent_cents` only on a successful
+create, but boat counts the start of a machine it made under a lost answer.
+
+Fix: add the price on any create without a definite answer as well. If boat
+made no machine, the tool under-spends by one start; it never over-spends.
+
 ## Design notes
 
 These are the places where `docs/design.md` is ambiguous or where the model
@@ -311,7 +359,14 @@ picks one reading.
   forks as well as kept ones, and the restart wait covers both
   (`FixKeptInflight`). `CrashInFork`, `Land`, `Lost` and `inflight` are gone;
   `lag` models both the in-flight create and the listing lag.
+- Checked against `integrate` bf34e1f: `self.pending` keeps each created fork
+  until a listing shows it or `HTTP_TIMEOUT` plus one tick passes, and adds it
+  to the snapshot as a Starting machine. That is the model's `Known`.
+  `run::start` adds the price only when boat answers Ok, so a lost create is
+  not paid for, which is why `FixLostSpend` is separate. `FixLostCreate` is
+  modelled from the coordinator's description; the core agent's code was not
+  on `integrate` yet.
 
 ## Base code
 
-This branch merges `integrate` e351752 and does not touch Rust code itself.
+This branch merges `integrate` bf34e1f and does not touch Rust code itself.
