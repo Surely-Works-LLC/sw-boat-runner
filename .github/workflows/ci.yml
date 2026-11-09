@@ -60,6 +60,11 @@ jobs:
             cfg: spec/BoatRunnerFork.cfg
             edit: 's/^FixForkKey = TRUE/FixForkKey = FALSE/;/^PROPERTY NoStarvation$/!{/^PROPERTY /d;}'
             expect: Temporal properties were violated.
+          # A second included start leaves room for the free orphan under max_boxes 2.
+          - name: kept-inflight
+            cfg: spec/BoatRunner.cfg
+            edit: 's/^MinUp = 0/MinUp = 1/;s/^InitStopped = {m1}/InitStopped = {}/;s/^Included = 1/Included = 2/;s/^FixKeptInflight = TRUE/FixKeptInflight = FALSE/'
+            expect: Invariant MaxBoxes is violated.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
