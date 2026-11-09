@@ -704,9 +704,12 @@ pub mod fake {
         }
     }
 
+    /// What the network gives back for one request.
+    pub type Reply = Result<Response, NetworkError>;
+
     /// Answers every request with `reply` and records what was sent.
     pub struct Fake {
-        reply: Box<dyn Fn(&Sent) -> Result<Response, NetworkError>>,
+        reply: Box<dyn Fn(&Sent) -> Reply>,
         sent: RefCell<Vec<Sent>>,
     }
 
@@ -716,7 +719,7 @@ pub mod fake {
         }
 
         /// Like `new`, but `reply` may fail as the network would.
-        pub fn failing(reply: impl Fn(&Sent) -> Result<Response, NetworkError> + 'static) -> Self {
+        pub fn failing(reply: impl Fn(&Sent) -> Reply + 'static) -> Self {
             Fake {
                 reply: Box::new(reply),
                 sent: RefCell::new(Vec::new()),
@@ -765,7 +768,7 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{Fake, Sent, respond};
+    use super::fake::{Fake, Reply, Sent, respond};
     use super::*;
     use crate::model::{Placement, QueuedJob};
 
@@ -1209,7 +1212,7 @@ mod tests {
     fn lagging_creates(
         listing: fn(usize) -> &'static str,
         jobs: fn(usize) -> &'static str,
-        create: fn(usize) -> Option<Result<Response, NetworkError>>,
+        create: fn(usize) -> Option<Reply>,
     ) -> Fake {
         let ticks = std::cell::Cell::new(0);
         Fake::failing(move |s| {
@@ -1320,7 +1323,7 @@ mod tests {
     }
 
     /// The first create times out after boat may have accepted it.
-    fn first_create_lost(t: usize) -> Option<Result<Response, NetworkError>> {
+    fn first_create_lost(t: usize) -> Option<Reply> {
         (t == 1).then(|| Err(NetworkError("timed out reading response".into())))
     }
 
