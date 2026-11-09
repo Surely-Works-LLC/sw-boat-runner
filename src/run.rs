@@ -557,10 +557,12 @@ impl<'a> Loop<'a> {
                         sent: now,
                     });
                 }
-                // boat may have started a machine this process never heard about, and the
-                // next fork's fresh key would not find it. Wait as after a restart: by then
-                // the machine is listed with its job label, or it never existed.
+                // boat may have started, and charged for, a machine this process never heard
+                // about, and the next fork's fresh key would not find it. Count the quote as
+                // spent and wait as after a restart: by then the machine is listed with its
+                // job label, or it never existed.
                 if matches!(&result, Err(Error::Boat(e)) if e.may_have_applied()) {
+                    self.spent_cents = self.spent_cents.saturating_add(starts.price);
                     let wait = now
                         .saturating_add(HTTP_TIMEOUT.as_secs())
                         .saturating_add(self.cfg.tick_s);
@@ -1205,14 +1207,16 @@ mod tests {
     /// boat lists `listing(t)` and GitHub queues jobs `jobs(t)` on the t-th tick (from 1);
     /// starts are included, and every create answers `bx_55555555`.
     fn lagging(listing: fn(usize) -> &'static str, jobs: fn(usize) -> &'static str) -> Fake {
-        lagging_creates(listing, jobs, |_| None)
+        lagging_creates(listing, jobs, |_| None, "0")
     }
 
-    /// As `lagging`, but a create on tick t gets `create(t)` when that is `Some`.
+    /// As `lagging`, but a create on tick t gets `create(t)` when that is `Some`, and every
+    /// start is quoted at `dollars`.
     fn lagging_creates(
         listing: fn(usize) -> &'static str,
         jobs: fn(usize) -> &'static str,
         create: fn(usize) -> Option<Reply>,
+        dollars: &'static str,
     ) -> Fake {
         let ticks = std::cell::Cell::new(0);
         Fake::failing(move |s| {
@@ -1236,7 +1240,8 @@ mod tests {
                 } else if s.method == "GET" && url.contains("/runs/5/jobs") {
                     respond(200, &[], &format!(r#"{{"jobs":[{}]}}"#, jobs(ticks.get())))
                 } else if s.method == "GET" && url.ends_with("/v1/limits") {
-                    respond(200, &[], r#"{"canStart":true,"nextStartDollars":0}"#)
+                    let body = format!(r#"{{"canStart":true,"nextStartDollars":{dollars}}}"#);
+                    respond(200, &[], &body)
                 } else {
                     reply(s)
                 },
@@ -1342,7 +1347,7 @@ mod tests {
     #[test]
     fn a_create_without_an_answer_blocks_starts_until_it_would_be_listed() {
         let cfg = config();
-        let fake = lagging_creates(|_| "", |_| JOB_70, first_create_lost);
+        let fake = lagging_creates(|_| "", |_| JOB_70, first_create_lost, "0");
         let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         let wait_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
         let mut want = vec![1; (wait_s / 15) as usize];
@@ -1358,11 +1363,33 @@ mod tests {
             |t| if t < 3 { "" } else { LISTED_55 },
             |_| JOB_70,
             first_create_lost,
+            "0",
         );
         let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         let until_s = HTTP_TIMEOUT.as_secs() + 2 * cfg.tick_s;
         let counts = forks_per_tick(&mut tick_loop, &fake, until_s);
         assert!(counts.iter().all(|&n| n == 1), "{counts:?}");
+    }
+
+    /// boat started and charged for the lost 30-cent create for job 70. Once the wait has
+    /// passed, job 71 would take the spend to 60 of a 50-cent cap, so it gets no fork.
+    #[test]
+    fn a_lost_create_counts_its_quote_as_spent() {
+        let mut cfg = config();
+        cfg.pools[0].paid_start_cents_per_day = 50;
+        let fake = lagging_creates(
+            |t| if t < 3 { "" } else { LISTED_55 },
+            |t| if t < 3 { JOB_70 } else { JOBS_70_71 },
+            first_create_lost,
+            "0.30",
+        );
+        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        // As on a new UTC day, past the restart's assumed spend.
+        tick_loop.spent_cents = 0;
+        let until_s = HTTP_TIMEOUT.as_secs() + 2 * cfg.tick_s;
+        let counts = forks_per_tick(&mut tick_loop, &fake, until_s);
+        assert!(counts.iter().all(|&n| n == 1), "{counts:?}");
+        assert_eq!(tick_loop.spent_cents, 30);
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {
