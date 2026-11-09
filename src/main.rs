@@ -82,12 +82,10 @@ fn cmd_plan(cfg: &model::Config, snapshot: &Path) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for pool in &cfg.pools {
-        for action in decide::decide(&snap, pool) {
-            let mut line = serde_json::to_value(&action).expect("an Action always serializes");
-            line["pool"] = serde_json::Value::from(pool.name.as_str());
-            println!("{line}");
-        }
+    for (pool, action) in run::plan(cfg, &snap, decide::decide) {
+        let mut line = serde_json::to_value(&action).expect("an Action always serializes");
+        line["pool"] = serde_json::Value::from(pool.name.as_str());
+        println!("{line}");
     }
     ExitCode::SUCCESS
 }
