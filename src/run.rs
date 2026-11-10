@@ -295,11 +295,12 @@ const WAIT_FOR_HOME: &str = "n=0; \
 /// command for 90 days and offers no stdin or env on commands, so the jit config travels
 /// as a file the command reads into `ACTIONS_RUNNER_INPUT_JITCONFIG` and then deletes. The
 /// `[b]in` pattern keeps `pkill` from matching this shell's own command line. boat's file
-/// write takes no mode, so the command makes the file owner-only before anything else.
+/// write takes no mode, so once home is mounted the command makes the file owner-only; a
+/// refused chmod does not fail the start.
 fn start_command(slot: u32) -> String {
     let f = jit_path(slot);
     format!(
-        "set -eu; f={f}; chmod 600 \"$f\"; {WAIT_FOR_HOME}; d=/home/user/sbr/{slot}; \
+        "set -eu; f={f}; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; d=/home/user/sbr/{slot}; \
          pkill -f \"/home/user/sbr/{slot}/[b]in/Runner\" || true; \
          if [ ! -x \"$d/run.sh\" ]; then mkdir -p /home/user/sbr; cp -a /home/user/actions-runner \"$d\"; fi; \
          cd \"$d\"; rm -f .runner .credentials .credentials_rsaparams; \
@@ -1143,7 +1144,7 @@ mod tests {
         // leaves no jit config behind.
         assert_eq!(wait_for_home(u32::MAX), (false, 300, false));
         assert!(start_command(1).starts_with(&format!(
-            "set -eu; f=/home/user/.sbr-jit-1; chmod 600 \"$f\"; {WAIT_FOR_HOME}; "
+            "set -eu; f=/home/user/.sbr-jit-1; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; "
         )));
     }
 
