@@ -15,12 +15,12 @@ and in the `tla` workflow on main.
   its disk for a while (`keep`), so resuming it is free; otherwise a resume is a
   counted start. `starts` is boat's count of counted starts today; `Included`
   of them are free, and each one after that costs one price unit.
-- **The tool**, one action per decide output, in decide's order: Unregister,
-  Delete, Register (fresh job forks before free kept slots), Resume, Fork without
-  a job (kept machine, for the `min_up` shortfall or, in a pool with resume and no
-  fork, for demand), Fork for a job, Stop. Observe is run::observe updating
-  `last_busy`. Every runner is JIT; a kept machine's slot gets a fresh Register
-  after its runner finishes or goes offline.
+- **The tool**, one action per tick, in the order `run::rank` sorts them:
+  Unregister, Delete, Stop, Register (fresh job forks before free kept slots),
+  Resume, Fork without a job (kept machine, for the `min_up` shortfall or, in a
+  pool with resume and no fork, for demand), Fork for a job. Observe is
+  run::observe updating `last_busy`. Every runner is JIT; a kept machine's slot
+  gets a fresh Register after its runner finishes or goes offline.
 - **The snapshot-to-act gap.** Stop and Delete are decided from one snapshot
   (`plan`) and executed by a later `Execute`, because run::execute calls boat with
   no fresh look at the runner. GitHub may assign a job in between. Other tool
