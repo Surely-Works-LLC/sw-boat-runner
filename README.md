@@ -89,6 +89,9 @@ Each pool starts its machines from a boat snapshot. The snapshot needs an extrac
 `/home/user/actions-runner`, with its dependencies installed. Leave it unconfigured.
 For each slot the tool copies that directory to `/home/user/sbr/<slot>`, writes the JIT
 config to a file, and starts `run.sh`. Rebuild the snapshot to update the runner.
+A new machine's `/home/user` is a FUSE mount until boat finishes copying the snapshot
+to disk, and every file there then gets a new device and inode, so the runner starts
+only once the mount is gone. Keep `register_timeout_s` above that copy time.
 
 The tool labels its machines `sw-boat-runner=<pool>` and names its runners
 `sbr-<pool>-...`. It ignores other machines and runners.
