@@ -112,10 +112,9 @@ pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
 }
 
 /// GitHub reports only `online`/`offline` and `busy`, so "never came online" is what this
-/// process has not seen online: busy → `Busy`; online → `Idle`; offline after this process
-/// saw it online → `Offline`; any other offline runner → `Registered`. After a restart a
-/// runner that went offline earlier is `Registered`, and `decide` unregisters it once
-/// `register_timeout_s` has passed since its `registered_at`.
+/// process has not seen online. After a restart a runner that went offline earlier is
+/// `Registered`, and `decide` unregisters it once `register_timeout_s` has passed since its
+/// `registered_at`.
 pub fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
     if busy {
         RunnerState::Busy

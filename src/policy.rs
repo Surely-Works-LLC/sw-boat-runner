@@ -114,8 +114,8 @@ enum Preset {
 }
 
 impl Preset {
-    /// Placement and `min_up`. Pools without `resume` keep their machines up, so they keep
-    /// one up by default; the others scale to zero when idle.
+    /// Placement and `min_up`. A `pool` pool never stops its machines, so it keeps one up
+    /// by default; the others scale to zero when idle.
     fn shape(self) -> (&'static [Placement], u32) {
         match self {
             Preset::Pool => (&[Placement::Slot], 1),
