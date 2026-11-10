@@ -56,7 +56,7 @@ VARIABLES
     jobOn,        \* GitHub: the machine running the job
     seen,         \* daemon memory: last_busy >= since on an ephemeral machine
     idle,         \* daemon memory: idle_stop_s since last_busy and min_up_s since since
-    age,          \* now - since: 0, 1 past register_timeout_s, 2 past fork_ttl_s
+    age,          \* now - since: 0, RegTimeout or ForkTtl
     plan,         \* daemon: a Stop or Delete decided this tick and not yet executed
     starts,       \* boat: counted starts today
     spent_today,  \* daemon memory: Limits.spent_today_cents, in start prices
@@ -67,6 +67,9 @@ VARIABLES
 
 vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
           starts, spent_today, keys, ran, lag, faults>>
+
+RegTimeout == 1   \* age past register_timeout_s
+ForkTtl == 2      \* age past fork_ttl_s
 
 -----------------------------------------------------------------------------
 (* What decide derives from one snapshot. *)
@@ -85,7 +88,7 @@ Vis(m) == lag[m] \in {"Listed", "Known"}
 Live(m) == mstate[m] \in {"Starting", "Up"}
 IsEph(m) == job[m] # NoJob
 Kept(m) == job[m] = NoJob /\ mstate[m] # "Gone"
-PastTtl(m) == IsEph(m) /\ age[m] = 2
+PastTtl(m) == IsEph(m) /\ age[m] = ForkTtl
 Boxes == Cardinality({m \in Machines : Live(m)})
 ToolBoxes == Cardinality({m \in Machines : Live(m) /\ Vis(m)})
 Queued == {j \in Jobs : status[j] = "Queued"}
@@ -129,7 +132,7 @@ FreeIds == {m \in Machines : mstate[m] = "Gone" /\ runner[m] = "None"}
 Finished(m) ==
     \/ /\ mstate[m] = "Up"
        /\ runner[m] \in {"None", "Offline"}
-       /\ seen[m] \/ age[m] >= 1
+       /\ seen[m] \/ age[m] >= RegTimeout
     \/ mstate[m] = "Stopped"
 
 \* run::observe sets last_busy for every machine with a Busy or Registered runner
@@ -380,7 +383,7 @@ TickAge(m) ==
     /\ IsEph(m)
     /\ Live(m)
     /\ Vis(m)
-    /\ age[m] < 2
+    /\ age[m] < ForkTtl
     /\ ~(m \in Fresh /\ Want0 > 0)
     /\ age' = [age EXCEPT ![m] = @ + 1]
     /\ UNCHANGED <<lag, mstate, job, keep, runner, status, jobOn, seen, idle, plan,
@@ -580,7 +583,7 @@ TypeOK ==
     /\ jobOn \in [Jobs -> Machines \cup {NoMachine}]
     /\ seen \in [Machines -> BOOLEAN]
     /\ idle \in [Machines -> BOOLEAN]
-    /\ age \in [Machines -> 0..2]
+    /\ age \in [Machines -> 0..ForkTtl]
     /\ plan \in [Machines -> {"None", "Stop", "Delete"}]
     /\ starts \in Nat
     /\ spent_today \in Nat
