@@ -110,6 +110,7 @@ fn workload(jobs_per_day: u64, seed: u64) -> Vec<Job> {
             }
         }
     }
+    jobs.sort_by_key(|j| j.created);
     jobs
 }
 
@@ -142,8 +143,7 @@ struct World {
     now: u64,
     sandboxes: Vec<Sandbox>,
     runners: Vec<GhRunner>,
-    /// Every job, tick by tick as `workload` made them (not sorted by `created` within a
-    /// tick); `arrived` of them are visible so far.
+    /// Every job, sorted by `created`; `arrived` of them are visible so far.
     jobs: Vec<Job>,
     arrived: usize,
     next_id: u64,
@@ -176,7 +176,8 @@ impl World {
             match s.state {
                 State::Booting { until } if until <= now => s.state = State::Up,
                 State::Archiving { until } if until <= now => {
-                    s.state = State::Archived { at: until }
+                    // The keep window counts from the stop request.
+                    s.state = State::Archived { at: until - TICK_S }
                 }
                 _ => {}
             }
@@ -354,6 +355,7 @@ impl World {
                 } else {
                     Vec::new()
                 };
+                pushes.sort_unstable();
                 pushes.dedup();
                 pushes.truncate(100);
                 let runs: Vec<Value> = pushes.iter().map(|p| json!({ "id": p })).collect();
@@ -449,16 +451,18 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
 
 fn row(setup: &'static str, target: u64, jobs: &[Job], world: &World) -> Row {
     let day: Vec<&Job> = jobs.iter().filter(|j| j.created >= DAY_START).collect();
+    // A job that never got a runner waited until the simulation ended.
+    let end = DAY_START + DAY_S + DRAIN_S;
     let mut queue: Vec<u64> = day
         .iter()
-        .filter_map(|j| Some(j.started? - j.created))
+        .map(|j| j.started.unwrap_or(end) - j.created)
         .collect();
     queue.sort_unstable();
     Row {
         setup,
         target,
         jobs: day.len(),
-        unserved: day.len() - queue.len(),
+        unserved: day.iter().filter(|j| j.started.is_none()).count(),
         starts: world.starts,
         paid_starts: world.paid_starts,
         machine_hours: world.machine_s as f64 / 3_600.0,
@@ -470,15 +474,15 @@ fn row(setup: &'static str, target: u64, jobs: &[Job], world: &World) -> Row {
 /// `runs-on: boat`: every job starts its own machine, which is gone when the job ends.
 fn managed(target: u64, jobs: &[Job]) -> Row {
     let mut jobs = jobs.to_vec();
-    // `advance` needs a clock that never goes back.
-    jobs.sort_by_key(|j| j.created);
     let mut world = World::default();
     for job in &mut jobs {
         world.advance(job.created);
         world.count_start();
         job.started = Some(job.created + BOOT_S);
         if world.in_day() {
-            world.machine_s += BOOT_S + job.run_s;
+            // Cut off at midnight, as the daemon's machine time is.
+            let end = (job.created + BOOT_S + job.run_s).min(DAY_START + DAY_S);
+            world.machine_s += end - job.created;
         }
     }
     row("runs-on: boat", target, &jobs, &world)
@@ -550,8 +554,8 @@ fn svg(rows: &[Row]) -> String {
     const H: f64 = 430.0;
     let (left, right, top, bottom) = (64.0, 150.0, 64.0, 48.0);
     let max = 5_000.0;
-    let x = |v: f64| left + v / max * (W - left - right);
-    let y = |v: f64| H - bottom - v / max * (H - top - bottom);
+    let x = |v: f64| ((left + v / max * (W - left - right)) * 10.0).round() / 10.0;
+    let y = |v: f64| ((H - bottom - v / max * (H - top - bottom)) * 10.0).round() / 10.0;
     let x_end = x(max);
 
     let (mut light, mut dark) = (String::new(), String::new());
@@ -562,7 +566,7 @@ fn svg(rows: &[Row]) -> String {
     let mut s = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title id="t">boat starts per day against CI jobs per day</title>
-<desc id="d">Simulated. runs-on: boat makes one start per job; the warm and hybrid presets stay far below the plan's included starts. bench/results.csv has the numbers.</desc>
+<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the plan's included starts. bench/results.csv has the numbers.</desc>
 <style>
 .bg{{fill:#fcfcfb}} .ink{{fill:#0b0b0b}} .dim{{fill:#52514e}} .grid{{stroke:#e4e3df}} .ref{{stroke:#8a8983}}
 {light}

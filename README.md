@@ -13,11 +13,11 @@ them when idle, and forks a fresh one only when a job needs it.
 | Jobs a day | Setup | Starts | Paid starts | Queue p50 / p90 |
 | - | - | - | - | - |
 | 962 | `runs-on: boat` | 962 | 0 | 8 s / 8 s |
-| | `warm` | 84 | 0 | 18 s / 26 s |
+| | `warm` | 84 | 0 | 18 s / 25 s |
 | 2,000 | `runs-on: boat` | 2,000 | 750 | 8 s / 8 s |
-| | `warm` | 101 | 0 | 17 s / 24 s |
+| | `warm` | 103 | 0 | 17 s / 24 s |
 | 4,772 | `runs-on: boat` | 4,772 | 3,522 | 8 s / 8 s |
-| | `warm` | 119 | 0 | 17 s / 24 s |
+| | `warm` | 118 | 0 | 17 s / 24 s |
 
 The numbers come from `cargo run --release --example bench`, which simulates a day of CI.
 `runs-on: boat` is mocked as one start per job; the daemon's real loop runs against a
