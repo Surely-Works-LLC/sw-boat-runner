@@ -57,9 +57,10 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 - `N > 0`: also allow paid starts while the cents spent on starts today, plus the price
   of this start, stay at or under N.
 
-The daemon reads only `canStart` and `nextStartDollars` from `GET /limits`, not the
-starts left in each window, so `decide` prices every start of a tick at the quote it was
-shown. After each accepted
+`GET /limits` quotes one price, for the next start, so `decide` prices every start of a
+tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
+boat's minute, hour and day windows, because the price past them is not known until the
+next tick. After each accepted
 start the daemon reads `GET /limits` again and makes no more starts that tick if the
 price changed. One account serves every pool, so each pool's cap is checked against the
 account-wide spend, including the starts that pools earlier in the file planned in the
@@ -93,6 +94,9 @@ carries the label `sw-boat-runner-job=<job id>-<attempt>`, which `decide` matche
 at most one fork per job. A kept machine is forked with no job label to bring the pool up
 to `min_up`, or, in a pool with `resume` and no `fork`, for demand that no stopped machine
 covers. A kept machine gets boat's longest TTL, 30 days, after which boat archives it.
+boat may delete the disk of a machine that has been stopped for 14 days. A `Resume` of one
+fails with `409 snapshot_data_expired`; the daemon then deletes the machine, and the pool
+forks a new one if it still needs it.
 
 Every fork request's `Idempotency-Key` is a fresh UUID v4. boat answers a key it saw in
 the last 24 h with its first machine, even a deleted one, so a reused key would hand a

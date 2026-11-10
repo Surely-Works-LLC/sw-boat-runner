@@ -14,6 +14,9 @@ use crate::model::{
 };
 
 const DAY_S: u64 = 86_400;
+/// boat's 409 code for a resume of a machine whose disk it has deleted, which it may do
+/// once the machine has been stopped for 14 days.
+const DISK_EXPIRED: &str = "snapshot_data_expired";
 /// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
 /// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -278,7 +281,7 @@ struct Starts {
 
 /// `snap` restricted to what `pool` is first in line to serve, with `planned` added to
 /// today's spend (see `plan`).
-fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents) -> Snapshot {
+fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents, starts: u32) -> Snapshot {
     let mut routed = snap.clone();
     routed.queued.retain(|j| {
         cfg.pools
@@ -287,6 +290,10 @@ fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents) -> Snapshot
             .is_some_and(|p| p.name == pool.name)
     });
     routed.limits.spent_today_cents = snap.limits.spent_today_cents.saturating_add(planned);
+    routed.limits.free_starts_left = snap
+        .limits
+        .free_starts_left
+        .map(|left| left.saturating_sub(starts));
     routed
 }
 
@@ -300,8 +307,9 @@ pub fn plan<'c>(
 ) -> Vec<(&'c Pool, Action)> {
     let mut out = Vec::new();
     let mut planned: Cents = 0;
+    let mut planned_starts: u32 = 0;
     for pool in &cfg.pools {
-        let routed = route(cfg, snap, pool, planned);
+        let routed = route(cfg, snap, pool, planned, planned_starts);
         let actions = decide(&routed, pool);
         let starts = actions
             .iter()
@@ -309,6 +317,7 @@ pub fn plan<'c>(
             .count();
         let starts = Cents::try_from(starts).unwrap_or(Cents::MAX);
         planned = planned.saturating_add(starts.saturating_mul(snap.limits.next_start_cents));
+        planned_starts = planned_starts.saturating_add(starts);
         out.extend(actions.into_iter().map(|a| (pool, a)));
     }
     out
@@ -524,6 +533,10 @@ impl<'a> Loop<'a> {
             can_start: boat_can_start(&limits) && now >= self.starts_blocked_until,
             next_start_cents: cents(limits.next_start_dollars),
             spent_today_cents: self.spent_cents,
+            free_starts_left: limits
+                .starts_left
+                .filter(|_| cents(limits.next_start_dollars) == 0)
+                .map(|left| u32::try_from(left).unwrap_or(u32::MAX)),
         };
         let snapshot = Snapshot {
             now,
@@ -566,7 +579,22 @@ impl<'a> Loop<'a> {
                 machine,
                 slot,
             } => self.register(now, pool, machine, *slot),
-            Action::Resume { machine } => self.start(now, starts, |b| b.resume(machine)),
+            Action::Resume { machine } => {
+                let result = self.start(now, starts, |b| b.resume(machine));
+                // boat deleted the disk of a machine that stayed stopped too long. It can
+                // never resume, so delete it; the pool then forks a new one if it needs to.
+                if matches!(&result, Err(Error::Boat(boat::Error::Conflict { code }))
+                    if code == DISK_EXPIRED)
+                {
+                    eprintln!("warn: {machine} lost its disk; deleting it");
+                    self.remove_runners(machine, runner_ids)?;
+                    return match self.boat.delete(machine) {
+                        Err(boat::Error::NotFound) => Ok(()),
+                        r => r.map_err(Error::from),
+                    };
+                }
+                result
+            }
             Action::Fork { pool, job } => {
                 let p = self.pool(pool)?;
                 let mut labels = BTreeMap::from([(boat::POOL_LABEL.to_string(), p.name.clone())]);
@@ -925,7 +953,8 @@ mod tests {
                 can_start: true,
                 next_start_cents: 25,
                 // A fresh process assumes every pool's cap is spent.
-                spent_today_cents: 100
+                spent_today_cents: 100,
+                free_starts_left: None,
             }
         );
         let m = |id: &str| id.to_string();
@@ -1251,6 +1280,32 @@ mod tests {
         );
     }
 
+    fn resume_stopped(_: &Snapshot, _: &Pool) -> Vec<Action> {
+        vec![Action::Resume {
+            machine: "bx_33333333".into(),
+        }]
+    }
+
+    #[test]
+    fn a_stopped_machine_whose_disk_boat_deleted_is_deleted() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.url.ends_with("/resume") {
+                respond(409, &[], r#"{"code":"snapshot_data_expired"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        started(&cfg, &fake).tick(NOW, resume_stopped).unwrap();
+        assert_eq!(
+            requests(&fake)[6..],
+            [
+                format!("POST {BOAT}/sandboxes/bx_33333333/resume"),
+                format!("DELETE {BOAT}/sandboxes/bx_33333333"),
+            ]
+        );
+    }
+
     /// One job fork `bx_66666666` for queued job 70 and no runners. boat lists it in
     /// `states[i]` on the i-th tick, and in the last state after that.
     fn one_fork(states: &'static [&'static str]) -> Fake {
@@ -1549,16 +1604,26 @@ mod tests {
                 can_start: true,
                 next_start_cents: 25,
                 spent_today_cents: 10,
+                free_starts_left: None,
             },
         };
-        let planned: Vec<_> = plan(&cfg, &snap, fork_each_job)
-            .into_iter()
-            .map(|(p, a)| match a {
-                Action::Fork { job: Some(j), .. } => (p.name.as_str(), j.id),
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(planned, [("ci", 1), ("b", 2)]);
+        let forks = |snap: &Snapshot, decide| -> Vec<(String, u64)> {
+            plan(&cfg, snap, decide)
+                .into_iter()
+                .map(|(p, a)| match a {
+                    Action::Fork { job: Some(j), .. } => (p.name.clone(), j.id),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let both = [("ci".to_string(), 1), ("b".to_string(), 2)];
+        assert_eq!(forks(&snap, fork_each_job), both);
+
+        // The pools share boat's free starts: the second sees what the first took.
+        let mut free = snap.clone();
+        free.limits.next_start_cents = 0;
+        free.limits.free_starts_left = Some(1);
+        assert_eq!(forks(&free, decide), both[..1]);
     }
 
     #[test]

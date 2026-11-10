@@ -109,6 +109,9 @@ pub(crate) struct Limits {
     /// 0 inside every limit, `None` when boat would refuse the start.
     #[serde(default)]
     pub next_start_dollars: Option<f64>,
+    /// The fewest starts left among boat's minute, hour and day windows, if it sent them.
+    #[serde(skip)]
+    pub starts_left: Option<u64>,
 }
 
 /// boat state → model state. boat's `archived` is a stop with the disk kept, so it maps to
@@ -291,7 +294,19 @@ impl<'t> Client<'t> {
     }
 
     pub(crate) fn limits(&self) -> Result<Limits, Error> {
-        parse(self.call("GET", "/limits", None, &[])?)
+        let body = self.call("GET", "/limits", None, &[])?;
+        let starts_left = ["minute", "hour", "day"]
+            .iter()
+            .filter_map(|window| {
+                body.pointer(&format!("/starts/{window}/remaining"))?
+                    .as_u64()
+            })
+            .min();
+        let limits: Limits = parse(body)?;
+        Ok(Limits {
+            starts_left,
+            ..limits
+        })
     }
 }
 
@@ -546,10 +561,27 @@ mod tests {
     }
 
     #[test]
+    fn limits_report_the_fewest_starts_left() {
+        let fake = Fake::new(|_| {
+            respond(
+                200,
+                &[],
+                r#"{"canStart":true,"nextStartDollars":0,"starts":{"unlimited":false,
+                    "minute":{"limit":10,"used":3,"remaining":7},
+                    "hour":{"limit":50,"used":46,"remaining":4},
+                    "day":{"limit":150,"used":47,"remaining":103}}}"#,
+            )
+        });
+        let limits = Client::new(&fake, "k".into()).limits().unwrap();
+        assert_eq!(limits.starts_left, Some(4));
+    }
+
+    #[test]
     fn limits_null_price() {
         let fake = Fake::new(|_| respond(200, &[], r#"{"canStart":true,"nextStartDollars":null}"#));
         let limits = Client::new(&fake, "k".into()).limits().unwrap();
         assert!(limits.can_start);
         assert_eq!(limits.next_start_dollars, None);
+        assert_eq!(limits.starts_left, None);
     }
 }

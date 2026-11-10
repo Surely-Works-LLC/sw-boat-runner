@@ -281,7 +281,13 @@ impl StartBudget {
         let price = u64::from(self.limits.next_start_cents);
         let spent = u64::from(self.limits.spent_today_cents) + (self.taken + 1) * price;
         let affordable = price == 0 || spent <= u64::from(self.cap);
-        if self.boxes >= self.max_boxes || !self.limits.can_start || !affordable {
+        // Past the free starts the price is not known; the next tick gets a new quote.
+        let quoted = price != 0
+            || self
+                .limits
+                .free_starts_left
+                .is_none_or(|left| self.taken < u64::from(left));
+        if self.boxes >= self.max_boxes || !self.limits.can_start || !affordable || !quoted {
             return false;
         }
         self.boxes += 1;
@@ -359,6 +365,7 @@ mod tests {
                 can_start: true,
                 next_start_cents: 0,
                 spent_today_cents: 0,
+                free_starts_left: None,
             },
         }
     }
@@ -602,6 +609,19 @@ mod tests {
         assert_eq!(decide(&s, &capped), [register("m1", 0), resume("m2")]);
     }
 
+    #[test]
+    fn free_starts_stop_at_the_number_boat_has_left() {
+        let machines = vec![machine("m1", Ms::Up), machine("m2", Ms::Stopped)];
+        let mut s = snap(machines, vec![], &[1, 2, 3]);
+        let hybrid = pool("hybrid", "");
+        assert_eq!(
+            decide(&s, &hybrid),
+            [register("m1", 0), resume("m2"), fork(1)]
+        );
+        s.limits.free_starts_left = Some(1);
+        assert_eq!(decide(&s, &hybrid), [register("m1", 0), resume("m2")]);
+    }
+
     mod properties {
         use super::*;
         use proptest::collection::vec;
@@ -707,6 +727,7 @@ mod tests {
                         can_start: limits.0,
                         next_start_cents: limits.1,
                         spent_today_cents: limits.2,
+                        free_starts_left: None,
                     },
                 })
         }
@@ -810,7 +831,7 @@ mod tests {
             /// `max_boxes` leaves room.
             #[test]
             fn reaches_min_up(mut snap in arb_snapshot(), pool in arb_pool()) {
-                snap.limits = Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0 };
+                snap.limits = Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None };
                 let own = |m: &&Machine| m.pool == pool.name;
                 let count = |states: &[Ms]| {
                     snap.machines
@@ -864,7 +885,7 @@ mod tests {
                     machines,
                     runners: vec![],
                     queued: vec![],
-                    limits: Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0 },
+                    limits: Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None },
                 };
                 let actions = decide(&snap, &pool);
                 prop_assert!(actions.is_empty(), "{actions:?}");

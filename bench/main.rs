@@ -287,7 +287,15 @@ impl World {
         match (method, parts.as_slice()) {
             ("GET", ["limits"]) => {
                 let price = self.next_start_cents().map(|c| c as f64 / 100.0);
-                (200, json!({ "canStart": true, "nextStartDollars": price }))
+                let [minute, hour, day] = std::array::from_fn(|i| {
+                    let left = START_WINDOWS[i].1.saturating_sub(self.window_starts[i]);
+                    json!({ "remaining": left })
+                });
+                (
+                    200,
+                    json!({ "canStart": true, "nextStartDollars": price,
+                            "starts": { "minute": minute, "hour": hour, "day": day } }),
+                )
             }
             ("GET", ["sandboxes", _]) => {
                 let list: Vec<Value> = self
