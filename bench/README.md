@@ -16,7 +16,9 @@ Four policies run through the daemon: `fork` (may pay for starts), `hybrid` with
 `min_up = 4`, `warm`, and `pool` with 16 machines. The first three allow 48 machines.
 `fork` makes a start per job, as `runs-on: boat` does, so the chart leaves it out. The 16
 `pool` machines make no start and cost $27.65 a day at any load; past about 2,000 jobs a
-day they are too few and jobs queue.
+day they are too few and jobs queue. From 3,000 jobs a day `hybrid` uses all 1,250
+included starts and, with no paid starts allowed, queues jobs: the p90 wait is 5.6 h at
+3,000, and 1,045 jobs never get a runner at 5,000.
 
 ## Assumptions
 
