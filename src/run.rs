@@ -1028,7 +1028,11 @@ mod tests {
         let script = |name: &str, body: &str| {
             let path = dir.join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::process::Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+            std::process::Command::new("chmod")
+                .arg("+x")
+                .arg(&path)
+                .status()
+                .unwrap();
         };
         let calls = dir.join("calls");
         script(
@@ -1049,7 +1053,10 @@ mod tests {
             .unwrap();
         let looked = std::fs::read_to_string(&calls).map_or(0, |c| c.lines().count() as u32);
         std::fs::remove_dir_all(&dir).unwrap();
-        (String::from_utf8_lossy(&out.stdout).contains("started"), looked)
+        (
+            String::from_utf8_lossy(&out.stdout).contains("started"),
+            looked,
+        )
     }
 
     #[test]
