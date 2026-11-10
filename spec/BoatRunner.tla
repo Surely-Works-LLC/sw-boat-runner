@@ -102,9 +102,7 @@ Want0 == Cardinality(Queued) - Supply
 Fresh == {m \in Machines : /\ IsEph(m) /\ mstate[m] = "Up" /\ runner[m] = "None"
                            /\ ~seen[m] /\ age[m] = 0}
 FreeKept ==
-    IF Has("slot")
-    THEN {m \in Machines : Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
-    ELSE {}
+    {m \in Machines : Has("slot") /\ Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
 \* A Starting ephemeral machine past its TTL is deleted this tick, so it is not pending.
 PendingBoxes ==
     Cardinality({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
