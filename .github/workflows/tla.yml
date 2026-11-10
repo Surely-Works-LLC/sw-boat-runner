@@ -86,6 +86,8 @@ jobs:
             expect: Invariant StartBudget is violated.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
@@ -102,6 +104,7 @@ jobs:
           CFG: ${{ matrix.cfg }}
           EDIT: ${{ matrix.edit }}
           EXPECT: ${{ matrix.expect }}
+          NAME: ${{ matrix.name }}
         run: |
           sed -e "$EDIT" "$CFG" > spec/Variant.cfg
           cat spec/Variant.cfg
@@ -112,7 +115,7 @@ jobs:
           set -e
           # The counts show in the run's annotations.
           stats=$(grep -E "distinct states found, [0-9]+ states left|^Finished in" tlc.log | tr '\n' ' ' || true)
-          echo "::notice title=TLC ${{ matrix.name }}::exit $status; $stats"
+          echo "::notice title=TLC $NAME::exit $status; $stats"
           if [ -z "$EXPECT" ]; then
             exit "$status"
           fi
