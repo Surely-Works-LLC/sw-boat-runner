@@ -1,0 +1,11 @@
+{
+  "now": 1000000,
+  "machines": [],
+  "runners": [],
+  "queued": [],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  }
+}

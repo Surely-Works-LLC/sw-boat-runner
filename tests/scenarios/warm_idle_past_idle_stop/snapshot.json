@@ -1,0 +1,44 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_k1",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 999500,
+      "job": null
+    },
+    {
+      "id": "bx_k2",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 990000,
+      "job": null
+    },
+    {
+      "id": "bx_k3",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 990000,
+      "job": null
+    },
+    {
+      "id": "bx_k4",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 990000,
+      "job": null
+    }
+  ],
+  "runners": [],
+  "queued": [],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  }
+}

@@ -1,0 +1,8 @@
+{"action":"fork","job":{"attempt":1,"id":1},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":2},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":3},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":4},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":5},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":6},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":7},"pool":"ci"}
+{"action":"fork","job":{"attempt":1,"id":8},"pool":"ci"}
