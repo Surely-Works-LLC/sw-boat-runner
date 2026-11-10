@@ -2,11 +2,10 @@
 (***************************************************************************)
 (* One sw-boat-runner pool: GitHub's queue and runners, boat's machines,  *)
 (* and the reconciler of docs/design.md as src/decide.rs and src/run.rs   *)
-(* implement it on branch integrate. Stop and Delete are decided from one *)
-(* snapshot and executed later, because run::execute does not look again; *)
-(* every other tool action reads the current state. The Fix* constants    *)
-(* switch on the fixes in spec/README.md. integrate f8c670c has every     *)
-(* fix up to FixLostCreate; the code does not do FixLostSpend.            *)
+(* implement it. Stop and Delete are decided from one snapshot and        *)
+(* executed later, because run::execute does not look again; every other  *)
+(* tool action reads the current state. The Fix* constants switch on the  *)
+(* fixes in spec/README.md. The code at 3da033f has all nine.             *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
