@@ -35,9 +35,10 @@ next tick tries again. Presets:
 | `pool` | `slot` | `min_up` always up | steady load, trusted code, lowest overhead |
 | `warm` | `slot, resume` | stopped after `idle_stop_s`; demand no stopped machine covers forks a kept one | load with quiet hours |
 | `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
-| `hybrid` | `slot, resume, fork` | stopped after `idle_stop_s` | bursts above the pool size |
+| `hybrid` | `slot, resume, fork` | `min_up` always up; a job their slots cannot take gets its own fork | bursts above `min_up` |
 
-`hybrid` is the default. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
+`hybrid` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
+only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
 `min_up` need `slot`, the only step that registers runners on kept machines.
 
 Every runner is a just-in-time runner: it is registered through GitHub's JIT config,

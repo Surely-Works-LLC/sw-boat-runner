@@ -123,9 +123,9 @@ A preset sets `placement`, the ways to find a runner for a queued job, tried in 
 | Preset | Placement | Idle machines |
 | - | - | - |
 | `pool` | `slot` | `min_up` stay up |
-| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job |
+| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job; when the stopped ones are not enough, new ones are forked from `snapshot`, up to `max_boxes` |
 | `fork` | `fork` | none; each job gets a new machine that is deleted afterwards |
-| `hybrid` | `slot, resume, fork` | like `warm`, and forks for bursts |
+| `hybrid` | `slot, resume, fork` | `min_up` stay up; a job their slots cannot take gets a new machine that is deleted afterwards |
 
 Use `fork` for untrusted code such as pull requests from forks.
 [docs/design.md](docs/design.md) has the full design.
