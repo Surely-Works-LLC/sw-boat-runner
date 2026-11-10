@@ -459,7 +459,7 @@ LostCreate ==
                           /\ FixForkKey \/ j \notin keys
                           /\ \E m \in FreeIds : Create(m, j, "Lost")
                           /\ keys' = IF FixForkKey THEN keys ELSE keys \cup {j}
-    /\ spent_today' = IF FixLostSpend THEN spent_today + Price ELSE spent_today
+    /\ IF FixLostSpend THEN Pay ELSE UNCHANGED spent_today
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
 
 \* boat answers 429, or 503 no_ready_machine or out_of_capacity: nothing starts,
