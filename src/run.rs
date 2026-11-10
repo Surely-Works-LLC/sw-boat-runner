@@ -1129,15 +1129,21 @@ mod tests {
         let fake = Fake::new(reply);
         let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
         assert_eq!(tick_loop.spent_cents, 500);
-        tick_loop.tick(NOW, crate::decide::decide).unwrap();
-        // Job 70 is queued and every start is quoted at 25 cents.
-        let reqs = requests(&fake);
+        // Job 70 is queued all day and every start is quoted at 25 cents.
+        for now in [NOW, DAY_S - 15] {
+            tick_loop.tick(now, crate::decide::decide).unwrap();
+            assert!(forks(&fake).is_empty(), "{:?}", requests(&fake));
+            assert_eq!(tick_loop.spent_cents, 500);
+        }
+        tick_loop.tick(DAY_S, crate::decide::decide).unwrap();
+        let forks = forks(&fake);
+        assert_eq!(forks.len(), 1);
         assert!(
-            !reqs.contains(&format!("POST {BOAT}/sandboxes")),
-            "{reqs:?}"
+            forks[0]
+                .body_text()
+                .contains(r#""sw-boat-runner-job":"70-1""#)
         );
-        assert!(!reqs.iter().any(|r| r.ends_with("/resume")), "{reqs:?}");
-        assert_eq!(tick_loop.spent_cents, 500);
+        assert_eq!(tick_loop.spent_cents, 25);
     }
 
     fn fork_twice_each(_: &Snapshot, p: &Pool) -> Vec<Action> {
