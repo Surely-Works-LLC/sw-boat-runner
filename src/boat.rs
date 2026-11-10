@@ -218,25 +218,17 @@ impl<'t> Client<'t> {
         })
     }
 
+    fn post(&self, path: &str, body: &Value) -> Result<(), Error> {
+        self.call("POST", path, Some(body), &[]).map(drop)
+    }
+
     pub(crate) fn resume(&self, id: &str) -> Result<(), Error> {
-        self.call(
-            "POST",
-            &format!("/sandboxes/{id}/resume"),
-            Some(&json!({})),
-            &[],
-        )
-        .map(drop)
+        self.post(&format!("/sandboxes/{id}/resume"), &json!({}))
     }
 
     /// Returns at once; 200 when already stopped, 202 while the stop runs.
     pub(crate) fn stop(&self, id: &str) -> Result<(), Error> {
-        self.call(
-            "POST",
-            &format!("/sandboxes/{id}/stop"),
-            Some(&json!({})),
-            &[],
-        )
-        .map(drop)
+        self.post(&format!("/sandboxes/{id}/stop"), &json!({}))
     }
 
     /// Permanently deletes the sandbox and its disk.
@@ -294,13 +286,7 @@ impl<'t> Client<'t> {
     /// command must never contain a secret.
     pub(crate) fn exec_detached(&self, id: &str, command: &str) -> Result<(), Error> {
         let body = json!({ "command": command, "detached": true });
-        self.call(
-            "POST",
-            &format!("/sandboxes/{id}/commands"),
-            Some(&body),
-            &[],
-        )
-        .map(drop)
+        self.post(&format!("/sandboxes/{id}/commands"), &body)
     }
 
     pub(crate) fn limits(&self) -> Result<Limits, Error> {
