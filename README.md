@@ -125,8 +125,11 @@ other models.
 
 ## Status
 
-The model, the property tests and the fake-transport tests pass. The daemon has not yet
-run against a production repository. [eval/](eval/) measures a repository's move from
+The model, the property tests and the fake-transport tests pass. In November 2026 a `fork`
+pool ran against a production repository: it forked machines up to `max_boxes`, each
+machine's runner took one job, and the tool deleted the machines and their runners
+afterwards. Machines forked from a snapshot keep the snapshot's systemd timers, so remove
+cleanup timers from the snapshot before you fork it. [eval/](eval/) measures a repository's move from
 `runs-on: boat` to persistent boat runners, which is the setup this tool automates.
 
 ## License
