@@ -1,4 +1,4 @@
-"""Compare GitHub Actions jobs before and after moving from boat per-job sandboxes
+"""Compare GitHub Actions jobs before and after moving from boat's per-job machines
 to persistent self-hosted runners. Reads `boat ci --json` output for start counts
 and samples the GitHub Actions API through `gh api` for queue and run times."""
 import argparse
