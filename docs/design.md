@@ -6,7 +6,8 @@ so jobs reuse machines instead of starting a new one per job.
 ## Why
 
 boat's managed `runs-on: boat` starts a fresh machine for every job. A start is a create,
-fork or resume. Each plan includes a number of starts per minute, hour and day, and
+fork or resume. Each plan [includes](https://docs.boat.dev/limits.md) a number of starts
+per minute, hour and day, from 200 a day on the $20 plan to 2,400 on the $2000 plan, and
 starts beyond that cost $0.03 to $0.07 each. A busy repository runs thousands of jobs
 a day, so the managed runner can cost more in starts than in machine time. See
 [eval/](../eval/) for a measured case.
@@ -56,8 +57,9 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 - `N > 0`: also allow paid starts while the cents spent on starts today, plus the price
   of this start, stay at or under N.
 
-`GET /limits` reports the next start's price but not how many included starts are left,
-so `decide` prices every start of a tick at the quote it was shown. After each accepted
+The daemon reads only `canStart` and `nextStartDollars` from `GET /limits`, not the
+starts left in each window, so `decide` prices every start of a tick at the quote it was
+shown. After each accepted
 start the daemon reads `GET /limits` again and makes no more starts that tick if the
 price changed. One account serves every pool, so each pool's cap is checked against the
 account-wide spend, including the starts that pools earlier in the file planned in the

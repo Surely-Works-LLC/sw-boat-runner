@@ -10,21 +10,21 @@ them when idle, and forks a fresh one only when a job needs it.
 
 ![boat starts per day against CI jobs per day: runs-on: boat grows one start per job, the warm preset stays near 100](bench/starts.svg)
 
-| Jobs a day | Setup | Starts | Paid starts | Queue p50 / p90 |
+| Jobs a day | Setup | Starts | Extra starts | Queue p50 / p90 |
 | - | - | - | - | - |
-| 962 | `runs-on: boat` | 962 | 0 | 8 s / 8 s |
+| 962 | `runs-on: boat` | 962 | 122 ($3.66) | 8 s / 8 s |
 | | `warm` | 84 | 0 | 18 s / 25 s |
-| 2,000 | `runs-on: boat` | 2,000 | 750 | 8 s / 8 s |
+| 2,000 | `runs-on: boat` | 2,000 | 1,160 ($56.00) | 8 s / 8 s |
 | | `warm` | 103 | 0 | 17 s / 24 s |
-| 4,772 | `runs-on: boat` | 4,772 | 3,522 | 8 s / 8 s |
+| 4,772 | `runs-on: boat` | 4,772 | 4,011 ($253.27) | 8 s / 8 s |
 | | `warm` | 118 | 0 | 17 s / 24 s |
 
-The numbers come from `cargo run --release --example bench`, which simulates a day of CI.
+The numbers come from `cargo run --release --example bench`, which simulates a day of CI
+on boat's $100 plan (840 [included starts](https://docs.boat.dev/limits.md) a day).
 `runs-on: boat` is mocked as one start per job; the daemon's real loop runs against a
-mocked boat and GitHub API. Under the plan's included starts, `runs-on: boat` is cheaper
-and starts jobs sooner. Past them, each of its jobs is a paid start. The included starts
-(1,250 a day) are an estimate from one bill, not boat's published number.
-[bench/](bench/) has the assumptions, the other presets and the cost columns.
+mocked boat and GitHub API. Under the included starts, `runs-on: boat` is cheaper and
+starts jobs sooner. Past them, its jobs are extra starts at $0.03 to $0.07 each.
+[bench/](bench/) has the assumptions, the other presets and the machine-time cost.
 
 ## Connect a repository
 

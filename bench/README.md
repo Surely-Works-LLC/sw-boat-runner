@@ -16,28 +16,29 @@ Four policies run through the daemon: `fork` (may pay for starts), `hybrid` with
 `min_up = 4`, `warm`, and `pool` with 16 machines. The first three allow 48 machines.
 `fork` makes a start per job, as `runs-on: boat` does, so the chart leaves it out. The 16
 `pool` machines make no start and cost $27.65 a day at any load; past about 2,000 jobs a
-day they are too few and jobs queue. By 2,000 jobs a day `hybrid` has used all 1,250
-included starts. With no paid starts allowed it then queues jobs: the p90 wait is 5.8 h at
-3,000, and 985 jobs never get a runner at 5,000. A job that never gets a runner counts in
+day they are too few and jobs queue. By 1,500 jobs a day `hybrid` has used all 840
+included starts. With no paid starts allowed it then queues jobs: the p90 wait is 4.2 h at
+2,000, and 1,779 jobs never get a runner at 5,000. A job that never gets a runner counts in
 the queue columns as waiting until the simulation ends, four hours after the day.
 
 ## Assumptions
 
-boat's documentation was not reachable when this was written, so the numbers about boat
-come from this repository:
-
 | | Value | Source |
 | - | - | - |
-| Included starts | 1,250 a day | estimated from the bill in [the eval](../eval/results/example-2026-11.md): 3,131 starts and $69.05 of extra starts on one day |
-| Extra start | $0.037 | the same bill: $70.79 for 1,915 extra starts |
-| `large` machine | $0.072 an hour | [docs/design.md](../docs/design.md#start-budget) |
-| Wait for a `runs-on: boat` machine | 8 s | the eval's median |
-| Resume within 10 min of a stop | not a start | docs/design.md |
+| Plan | $100: 30 / 210 / 840 starts included per minute / hour / day | [boat's limits](https://docs.boat.dev/limits.md) |
+| Extra start | $0.03 up to 1.5 times the included number, $0.05 up to 2 times, $0.07 up to 6 times (3 times per minute), then refused; the highest of the three windows applies | the same page |
+| `large` machine | $0.072 an hour | [boat's pricing](https://docs.boat.dev/pricing.md) |
+| `runs-on: boat` | one fresh machine per job, so one start per job | [boat's CI page](https://docs.boat.dev/ci.md) |
+| Resume within 10 min of a stop | not a start | boat's limits |
+| Wait for a `runs-on: boat` machine | 8 s | the median in [the eval](../eval/results/example-2026-11.md) |
 | Runner comes online | 10 s after it is registered | assumed |
 
-The per-minute and per-hour start limits are not modelled, and neither are faults: the
-mocked boat and GitHub answer every call, and boat lists a machine as soon as it is
-created. The TLA+ model and the tests in `src/run.rs` cover those.
+`runs-on: boat` is simulated with extra starts paid for; without them its jobs wait or fail
+at a full limit. boat counts starts over rolling windows. The bench counts them per clock
+minute, hour and day, which reproduces the daily bill of the worked example on boat's CI
+page. Faults are not modelled: the mocked boat and GitHub answer every call, and boat
+lists a machine as soon as it is created. The TLA+ model and the tests in `src/run.rs`
+cover those.
 
 Pushes arrive as a Poisson process, six times as often from 08:00 to 20:00 UTC as at
 night, and each queues 1 to 4 jobs. Run times are lognormal with a median of 110 s and a
