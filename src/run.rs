@@ -226,6 +226,12 @@ fn cents(dollars: Option<f64>) -> Cents {
     dollars.map_or(0, |d| (d * 100.0).round().max(0.0) as Cents)
 }
 
+/// Whether boat's limits actually let a start through: a null price means boat would
+/// refuse it even with `can_start` set.
+fn boat_can_start(limits: &boat::Limits) -> bool {
+    limits.can_start && limits.next_start_dollars.is_some()
+}
+
 /// Where the jit config of `slot` waits for the start command; deleted once read.
 fn jit_path(slot: u32) -> String {
     format!("/home/user/.sbr-jit-{slot}")
@@ -260,6 +266,20 @@ struct Starts {
     price: Cents,
 }
 
+/// `snap` restricted to what `pool` is first in line to serve, with `planned` added to
+/// today's spend (see `plan`).
+fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents) -> Snapshot {
+    let mut routed = snap.clone();
+    routed.queued.retain(|j| {
+        cfg.pools
+            .iter()
+            .find(|p| p.serves(&j.labels))
+            .is_some_and(|p| p.name == pool.name)
+    });
+    routed.limits.spent_today_cents = snap.limits.spent_today_cents.saturating_add(planned);
+    routed
+}
+
 /// The actions `decide` asks for across all pools, in file order. Each pool sees only the
 /// queued jobs it is the first in the file to serve, so two pools never fork for one job,
 /// and sees the spend of the starts earlier pools plan, so no pool overruns its cap.
@@ -271,14 +291,7 @@ pub fn plan<'c>(
     let mut out = Vec::new();
     let mut planned: Cents = 0;
     for pool in &cfg.pools {
-        let mut routed = snap.clone();
-        routed.queued.retain(|j| {
-            cfg.pools
-                .iter()
-                .find(|p| p.serves(&j.labels))
-                .is_some_and(|p| p.name == pool.name)
-        });
-        routed.limits.spent_today_cents = snap.limits.spent_today_cents.saturating_add(planned);
+        let routed = route(cfg, snap, pool, planned);
         let actions = decide(&routed, pool);
         let starts = actions
             .iter()
@@ -498,10 +511,7 @@ impl<'a> Loop<'a> {
         }));
 
         let limits = Limits {
-            // A null price means boat would refuse the start.
-            can_start: limits.can_start
-                && limits.next_start_dollars.is_some()
-                && now >= self.starts_blocked_until,
+            can_start: boat_can_start(&limits) && now >= self.starts_blocked_until,
             next_start_cents: cents(limits.next_start_dollars),
             spent_today_cents: self.spent_cents,
         };
@@ -677,9 +687,7 @@ impl<'a> Loop<'a> {
                 // `decide` priced every start at one quote; stop once the quote moves.
                 match self.boat.limits() {
                     Ok(l)
-                        if l.can_start
-                            && l.next_start_dollars.is_some()
-                            && cents(l.next_start_dollars) == starts.price => {}
+                        if boat_can_start(&l) && cents(l.next_start_dollars) == starts.price => {}
                     Ok(_) => starts.open = false,
                     Err(e) if e.is_fatal() => return Err(e.into()),
                     Err(e) => {
