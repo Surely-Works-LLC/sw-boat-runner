@@ -106,10 +106,11 @@ FreeKept ==
     THEN {m \in Machines : Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
     ELSE {}
 \* A Starting ephemeral machine past its TTL is deleted this tick, so it is not pending.
-Pending == Cardinality({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
+PendingBoxes ==
+    Cardinality({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
 \* decide's want after registers and pending, without its saturating steps: each
 \* step subtracts a non-negative amount, so the sign comes out the same.
-WantStart == Want0 - Cardinality(Fresh) - Cardinality(FreeKept) - Pending
+WantStart == Want0 - Cardinality(Fresh) - Cardinality(FreeKept) - PendingBoxes
 Short == MinUp - Cardinality({m \in Machines : Kept(m) /\ Live(m) /\ Vis(m)})
 
 \* Starts.take() with run::start re-reading the quote after every start, so the
