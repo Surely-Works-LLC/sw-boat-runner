@@ -142,7 +142,8 @@ struct World {
     now: u64,
     sandboxes: Vec<Sandbox>,
     runners: Vec<GhRunner>,
-    /// Every job, sorted by `created`; `arrived` of them are visible so far.
+    /// Every job, tick by tick as `workload` made them (not sorted by `created` within a
+    /// tick); `arrived` of them are visible so far.
     jobs: Vec<Job>,
     arrived: usize,
     next_id: u64,
@@ -187,11 +188,11 @@ impl World {
         {
             self.arrived += 1;
         }
-        // GitHub hands the oldest queued job to an idle online runner. A runner that
-        // finishes its job is gone: JIT runners are removed after one job.
+        // GitHub hands each queued job, in that order, to the idle online runner that came
+        // online first. A runner that finishes its job is gone: JIT runners take one job.
         self.runners
             .retain(|r| r.busy_until.is_none_or(|t| t > now));
-        for job in self.jobs[..self.arrived].iter_mut() {
+        for job in &mut self.jobs[..self.arrived] {
             if job.started.is_some() {
                 continue;
             }
@@ -345,7 +346,8 @@ impl World {
                     .collect();
                 (200, json!({ "runners": runners }))
             }
-            // One run per push; the daemon reads the first 100.
+            // One run per push, listed as queued while any of its jobs is, and none as in
+            // progress, so the daemon sees each run once. It reads the first 100.
             ("GET", ["runs", query]) => {
                 let mut pushes: Vec<u64> = if query.contains("status=queued") {
                     queued.map(|j| j.push).collect()
@@ -468,6 +470,8 @@ fn row(setup: &'static str, target: u64, jobs: &[Job], world: &World) -> Row {
 /// `runs-on: boat`: every job starts its own machine, which is gone when the job ends.
 fn managed(target: u64, jobs: &[Job]) -> Row {
     let mut jobs = jobs.to_vec();
+    // `advance` needs a clock that never goes back.
+    jobs.sort_by_key(|j| j.created);
     let mut world = World::default();
     for job in &mut jobs {
         world.advance(job.created);
@@ -660,7 +664,7 @@ fn main() {
     std::fs::write(dir.join("results.csv"), &table).expect("write results.csv");
     std::fs::write(dir.join("starts.svg"), svg(&rows)).expect("write starts.svg");
     print!("{table}");
-    // Checked here so a change that breaks the mock or the loop fails the bench.
+    // A change that breaks the mock or the loop shows up here as jobs that never ran.
     let by_setup: BTreeMap<&str, usize> = rows.iter().fold(BTreeMap::new(), |mut m, r| {
         *m.entry(r.setup).or_default() += r.unserved;
         m
