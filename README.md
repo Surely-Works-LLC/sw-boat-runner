@@ -113,18 +113,10 @@ workflow artifacts.
 
 ## Running the TLA+ models
 
-The `tla` workflow runs 15 TLC models on `main` when `spec/` changes; pull requests skip
-it, so run TLC locally before changing the spec. Four models must pass. The other eleven
-each turn one fix off and must still find its counterexample. To run one locally with
-Java 21 and `tla2tools.jar` v1.7.4:
-
-```sh
-java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
-  -config spec/BoatRunner.cfg spec/BoatRunner.tla
-```
-
-[spec/README.md](spec/README.md#running-tlc) and `.github/workflows/tla.yml` have the
-other models.
+`spec/BoatRunner.tla` is checked by 15 TLC models: 4 must pass, and the other 11 each
+turn one fix off and must still find its counterexample. The `tla` workflow runs them on
+`main` when `spec/` changes; pull requests skip it, so run TLC locally first.
+[spec/README.md](spec/README.md#running-tlc) has the command and the full model list.
 
 ## Status
 
