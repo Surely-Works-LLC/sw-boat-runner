@@ -99,7 +99,7 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 ## Fix flags
 
 Each `Fix*` constant switches on one fix for a violation below. The code at
-3da033f has all nine. The main models set all nine to TRUE, and
+ae2ef64 has all nine. The main models set all nine to TRUE, and
 CI also checks that each flag off still yields its counterexample, so a model
 change that hides one fails CI.
 
@@ -149,7 +149,7 @@ exit 0. The counterexample models must fail with the message given.
 | warm | `BoatRunner.cfg` | placement `slot, resume` | 4131 | 9 s |
 | fork | `BoatRunnerFork.cfg` | none | not in the run's annotations | job 5 min 18 s |
 
-Counts are from CI run 42712725121 at c54061d. GitHub shows only some jobs'
+Counts are from CI run 42712725121 at 04b628d. GitHub shows only some jobs'
 annotations; the rest are in the job logs.
 
 ## Known violations
@@ -338,7 +338,7 @@ is deleted. j1 is still queued, and the tool forks it again: `spent_today` is
 0, so the paid start passes, and boat has counted 2 paid starts against a
 budget of 1.
 
-Cause: before 3da033f, `run::start` added the price to `spent_cents` only on a
+Cause: before ae2ef64, `run::start` added the price to `spent_cents` only on a
 successful create, but boat counts the start of a machine it made under a lost
 answer.
 
@@ -367,31 +367,31 @@ picks one reading.
 - A free resume of a kept machine counts as a start, even when it costs nothing.
 - Drop requeues a job while GitHub marks it failed. The model requeues it.
 - The quote is re-read after each start.
-- Checked against 8c5f6d9: the restart seeds `spent_cents` with the
+- Checked against b4ea097: the restart seeds `spent_cents` with the
   largest pool cap (`FixCrashSpend`), a pool without resume deletes a Stopped
   kept machine with no Busy runner (`DeleteGuard`), and in a pool with resume and
   no fork the kept-fork loop also runs for demand within `max_boxes` and the
   budget (`ForkKeptGuard`). The model already matched all three.
 - The model's Stop exclusion (no Stop while any demand is unmet) is coarser
   than the code's, which compares per label.
-- Checked against e351752: a non-fatal runner-delete error skips
+- Checked against 483593a: a non-fatal runner-delete error skips
   the Stop or Delete (`RefuseUnregister`), Register marks every machine used
   (`FixRegSeen`), every fork gets a fresh UUID v4 key, so a crash orphans job
   forks as well as kept ones, and the restart wait covers both
   (`FixKeptInflight`). `CrashInFork`, `Land`, `Lost` and `inflight` are gone;
   `lag` models both the in-flight create and the listing lag.
-- Checked against f8c670c: `self.pending` keeps each created fork
+- Checked against 7111cdc: `self.pending` keeps each created fork
   until a listing shows it or `HTTP_TIMEOUT` plus one tick passes, and adds it
   to the snapshot as a Starting machine. That is the model's `Known`.
   `run::start` added the price only when boat answered Ok, so a lost create was
   not paid for, which is why `FixLostSpend` is separate. `run::execute` closes
   starts until `HTTP_TIMEOUT` plus one tick after a create that may have
-  applied (a691488). The model blocks starts while a `Lost` machine is
+  applied (78f3864). The model blocks starts while a `Lost` machine is
   unlisted, which assumes that wait outlasts the listing lag.
-- Checked against 3da033f: after a create that may have applied,
+- Checked against ae2ef64: after a create that may have applied,
   `run::execute` adds the quoted price to `spent_cents`, and
   a 4xx, 429 or 503 refusal adds nothing. That is `FixLostSpend`.
 
 ## Base code
 
-The model is checked against 3da033f. The spec does not touch Rust code.
+The model is checked against ae2ef64. The spec does not touch Rust code.

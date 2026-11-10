@@ -5,7 +5,7 @@
 (* implement it. Stop and Delete are decided from one snapshot and        *)
 (* executed later, because run::execute does not look again; every other  *)
 (* tool action reads the current state. The Fix* constants switch on the  *)
-(* fixes in spec/README.md. The code at 3da033f has all nine.             *)
+(* fixes in spec/README.md. The code at ae2ef64 has all nine.             *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
