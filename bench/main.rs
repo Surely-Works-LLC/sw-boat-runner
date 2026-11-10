@@ -552,40 +552,36 @@ fn svg(rows: &[Row]) -> String {
     let max = 5_000.0;
     let x = |v: f64| left + v / max * (W - left - right);
     let y = |v: f64| H - bottom - v / max * (H - top - bottom);
+    let x_end = x(max);
 
+    let (mut light, mut dark) = (String::new(), String::new());
+    for (i, (_, l, d)) in SERIES.iter().enumerate() {
+        write!(light, ".s{i}{{stroke:{l}}} .f{i}{{fill:{l}}} ").unwrap();
+        write!(dark, ".s{i}{{stroke:{d}}} .f{i}{{fill:{d}}} ").unwrap();
+    }
     let mut s = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title id="t">boat starts per day against CI jobs per day</title>
 <desc id="d">Simulated. runs-on: boat makes one start per job; the warm and hybrid presets stay far below the plan's included starts. bench/results.csv has the numbers.</desc>
 <style>
 .bg{{fill:#fcfcfb}} .ink{{fill:#0b0b0b}} .dim{{fill:#52514e}} .grid{{stroke:#e4e3df}} .ref{{stroke:#8a8983}}
+{light}
+@media (prefers-color-scheme: dark){{
+.bg{{fill:#1a1a19}} .ink{{fill:#f0efec}} .dim{{fill:#c3c2b7}} .grid{{stroke:#34332f}} .ref{{stroke:#8f8e86}}
+{dark}
+}}
+</style>
+<rect class="bg" width="{W}" height="{H}" rx="8"/>
+<text class="ink" x="{left}" y="28" font-size="15" font-weight="600">boat starts per day</text>
+<text class="dim" x="{left}" y="46" font-size="12">one simulated day per point; the daemon's real loop against a mocked boat and GitHub</text>
 "##
     );
-    for (i, (_, light, _)) in SERIES.iter().enumerate() {
-        write!(s, ".s{i}{{stroke:{light}}} .f{i}{{fill:{light}}} ").unwrap();
-    }
-    s.push_str(
-        "\n@media (prefers-color-scheme: dark){\n.bg{fill:#1a1a19} .ink{fill:#f0efec} \
-         .dim{fill:#c3c2b7} .grid{stroke:#34332f} .ref{stroke:#8f8e86}\n",
-    );
-    for (i, (_, _, dark)) in SERIES.iter().enumerate() {
-        write!(s, ".s{i}{{stroke:{dark}}} .f{i}{{fill:{dark}}} ").unwrap();
-    }
-    s.push_str("\n}\n</style>\n");
-    writeln!(s, r#"<rect class="bg" width="{W}" height="{H}" rx="8"/>"#).unwrap();
-    writeln!(
-        s,
-        r#"<text class="ink" x="{left}" y="28" font-size="15" font-weight="600">boat starts per day</text>
-<text class="dim" x="{left}" y="46" font-size="12">one simulated day per point; the daemon's real loop against a mocked boat and GitHub</text>"#
-    )
-    .unwrap();
     for v in (0..=5).map(|i| f64::from(i) * 1_000.0) {
         writeln!(
             s,
-            r#"<line class="grid" x1="{left}" x2="{x1}" y1="{y0}" y2="{y0}"/>
+            r#"<line class="grid" x1="{left}" x2="{x_end}" y1="{y0}" y2="{y0}"/>
 <text class="dim" x="{tx}" y="{ty}" font-size="11" text-anchor="end">{v}</text>
 <text class="dim" x="{xv}" y="{xy}" font-size="11" text-anchor="middle">{v}</text>"#,
-            x1 = x(max),
             y0 = y(v),
             tx = left - 8.0,
             ty = y(v) + 4.0,
@@ -594,28 +590,21 @@ fn svg(rows: &[Row]) -> String {
         )
         .unwrap();
     }
+    let included = y(INCLUDED_STARTS_PER_DAY as f64);
     writeln!(
         s,
-        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>"#,
+        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>
+<line class="ref" x1="{left}" x2="{x_end}" y1="{included}" y2="{included}" stroke-dasharray="4 4"/>
+<text class="dim" x="{x_end}" y="{ly}" font-size="11" text-anchor="end">included in the plan (about {INCLUDED_STARTS_PER_DAY} a day, estimated)</text>"#,
         mid = x(max / 2.0),
-        by = H - 10.0
-    )
-    .unwrap();
-    let included = INCLUDED_STARTS_PER_DAY as f64;
-    writeln!(
-        s,
-        r#"<line class="ref" x1="{left}" x2="{x1}" y1="{y0}" y2="{y0}" stroke-dasharray="4 4"/>
-<text class="dim" x="{lx}" y="{ly}" font-size="11" text-anchor="end">included in the plan (about {INCLUDED_STARTS_PER_DAY} a day, estimated)</text>"#,
-        x1 = x(max),
-        y0 = y(included),
-        lx = x(max),
-        ly = y(included) - 7.0,
+        by = H - 10.0,
+        ly = included - 7.0,
     )
     .unwrap();
     for (i, (name, _, _)) in SERIES.iter().enumerate() {
-        let points: Vec<(f64, f64)> = rows
+        let series: Vec<&Row> = rows.iter().filter(|r| r.setup == *name).collect();
+        let points: Vec<(f64, f64)> = series
             .iter()
-            .filter(|r| r.setup == *name)
             .map(|r| (x(r.jobs as f64), y(r.starts as f64)))
             .collect();
         let path: Vec<String> = points
@@ -635,8 +624,10 @@ fn svg(rows: &[Row]) -> String {
             )
             .unwrap();
         }
-        let last = rows.iter().rfind(|r| r.setup == *name).expect("series");
-        let (px, py) = points.last().expect("series");
+        let ((px, py), last) = (
+            points.last().expect("series"),
+            series.last().expect("series"),
+        );
         writeln!(
             s,
             r#"<text class="ink" x="{tx:.1}" y="{ty:.1}" font-size="12">{name}: {starts}</text>"#,
