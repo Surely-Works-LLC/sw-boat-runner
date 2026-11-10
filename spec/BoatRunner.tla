@@ -614,14 +614,15 @@ NoDoubleFork ==
     \A a, b \in Machines :
         (a # b /\ mstate[a] # "Gone" /\ mstate[b] # "Gone" /\ IsEph(a)) => job[a] # job[b]
 
+\* A runner takes a job only on a machine that has run none; ran is set only on
+\* job forks.
+FirstJob == \A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]
+
 \* 6
-EphemeralIsolation ==
-    [][Placement = {"fork"} =>
-         \A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]]_vars
+EphemeralIsolation == [][Placement = {"fork"} => FirstJob]_vars
 
 \* 6 for job forks in any placement; stronger than the design asks.
-ForkIsolation ==
-    [][\A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]]_vars
+ForkIsolation == [][FirstJob]_vars
 
 \* Liveness 4
 NoLeak ==
