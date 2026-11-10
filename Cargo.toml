@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "Self-hosted GitHub Actions runners on boat machines, reused across jobs"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Surely-Works-LLC/sw-boat-runner"
+readme = "README.md"
+keywords = ["github-actions", "self-hosted", "runner", "ci", "autoscaling"]
+categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [dependencies]
