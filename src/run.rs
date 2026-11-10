@@ -543,14 +543,13 @@ impl<'a> Loop<'a> {
         starts: &mut Starts,
     ) -> Result<(), Error> {
         match action {
-            Action::Unregister { runner } => match runner_ids.get(runner) {
-                Some(&id) => {
+            Action::Unregister { runner } => {
+                if let Some(&id) = runner_ids.get(runner) {
                     self.delete_runner(id)?;
                     runner_ids.remove(runner);
-                    Ok(())
                 }
-                None => Ok(()),
-            },
+                Ok(())
+            }
             Action::Delete { machine } => {
                 self.remove_runners(machine, runner_ids)?;
                 match self.boat.delete(machine) {
@@ -806,6 +805,7 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::{Fake, Reply, Sent, respond};
     use super::*;
+    use crate::decide::decide;
     use crate::model::{Placement, QueuedJob};
 
     const BOAT: &str = "https://boat.dev/api/v1";
@@ -834,6 +834,11 @@ mod tests {
                 paid_start_cents_per_day: 100,
             }],
         }
+    }
+
+    /// A loop whose restart wait is over by `NOW`.
+    fn started<'a>(cfg: &'a Config, fake: &'a Fake) -> Loop<'a> {
+        Loop::new(cfg, fake, "k".into(), "t".into(), STARTED)
     }
 
     fn reply(s: &Sent) -> Response {
@@ -1109,7 +1114,7 @@ mod tests {
                 reply(s)
             }
         });
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         tick_loop.tick(NOW, decide_starts).unwrap();
         tick_loop.tick(NOW + 30, decide_starts).unwrap();
         let reqs = requests(&fake);
@@ -1127,15 +1132,15 @@ mod tests {
         big.paid_start_cents_per_day = 500;
         cfg.pools.insert(0, big);
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         assert_eq!(tick_loop.spent_cents, 500);
         // Job 70 is queued all day and every start is quoted at 25 cents.
         for now in [NOW, DAY_S - 15] {
-            tick_loop.tick(now, crate::decide::decide).unwrap();
+            tick_loop.tick(now, decide).unwrap();
             assert!(forks(&fake).is_empty(), "{:?}", requests(&fake));
             assert_eq!(tick_loop.spent_cents, 500);
         }
-        tick_loop.tick(DAY_S, crate::decide::decide).unwrap();
+        tick_loop.tick(DAY_S, decide).unwrap();
         let forks = forks(&fake);
         assert_eq!(forks.len(), 1);
         assert!(
@@ -1171,7 +1176,7 @@ mod tests {
     fn forks_send_fresh_uuid_v4_keys() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         tick_loop.tick(NOW, fork_twice_each).unwrap();
         let forks = forks(&fake);
         let keys: HashSet<_> = forks
@@ -1233,7 +1238,7 @@ mod tests {
                 reply(s)
             }
         });
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         tick_loop.tick(NOW, stop_and_delete).unwrap();
         let reqs = requests(&fake);
         assert_eq!(
@@ -1280,11 +1285,11 @@ mod tests {
     fn a_fork_that_got_a_runner_never_gets_another() {
         let cfg = config();
         let fake = one_fork(&["provisioning", "idle"]);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
-        tick_loop.tick(NOW - 15, crate::decide::decide).unwrap();
-        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.tick(NOW - 15, decide).unwrap();
+        tick_loop.tick(NOW, decide).unwrap();
         assert_eq!(registers(&fake), 1);
-        tick_loop.tick(NOW + 15, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW + 15, decide).unwrap();
         assert_eq!(registers(&fake), 1);
         let reqs = requests(&fake);
         assert!(
@@ -1298,8 +1303,8 @@ mod tests {
     fn after_a_restart_an_up_fork_counts_as_used() {
         let cfg = config();
         let fake = one_fork(&["idle"]);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
-        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.tick(NOW, decide).unwrap();
         assert_eq!(registers(&fake), 0);
         let reqs = requests(&fake);
         assert!(
@@ -1389,12 +1394,12 @@ mod tests {
             |t| if t < 3 { "" } else { LISTED_55 },
             |t| if t < 3 { JOB_70 } else { JOBS_70_71 },
         );
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
-        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.tick(NOW, decide).unwrap();
         assert_eq!(forks(&fake).len(), 1);
-        tick_loop.tick(NOW + 15, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW + 15, decide).unwrap();
         assert_eq!(forks(&fake).len(), 1);
-        tick_loop.tick(NOW + 30, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW + 30, decide).unwrap();
         let forks = forks(&fake);
         assert_eq!(forks.len(), 2);
         assert!(
@@ -1409,7 +1414,7 @@ mod tests {
         let cfg = config();
         // Listed on the third tick only; boat dropped it by the fourth.
         let fake = lagging(|t| if t == 3 { LISTED_55 } else { "" }, |_| JOB_70);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         tick_loop.tick(NOW, fork_job_70).unwrap();
         let starting = [("bx_55555555".to_string(), MachineState::Starting)];
         assert_eq!(observed(&mut tick_loop, NOW + 15), starting);
@@ -1425,15 +1430,15 @@ mod tests {
         let mut cfg = config();
         cfg.pools[0].paid_start_cents_per_day = 0;
         let fake = lagging(|_| "", |_| JOB_70);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         let lag_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
-        tick_loop.tick(NOW, crate::decide::decide).unwrap();
-        tick_loop.tick(NOW + lag_s, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop.tick(NOW + lag_s, decide).unwrap();
         assert_eq!(forks(&fake).len(), 1);
         let pending: Vec<_> = tick_loop.pending.iter().map(|p| p.sent).collect();
         assert_eq!(pending, [NOW]);
         let expired = NOW + lag_s + 1;
-        tick_loop.tick(expired, crate::decide::decide).unwrap();
+        tick_loop.tick(expired, decide).unwrap();
         assert_eq!(forks(&fake).len(), 2);
         let pending: Vec<_> = tick_loop.pending.iter().map(|p| p.sent).collect();
         assert_eq!(pending, [expired]);
@@ -1448,7 +1453,7 @@ mod tests {
     fn forks_per_tick(tick_loop: &mut Loop, fake: &Fake, until_s: UnixSecs) -> Vec<usize> {
         (0..=until_s / 15)
             .map(|k| {
-                tick_loop.tick(NOW + 15 * k, crate::decide::decide).unwrap();
+                tick_loop.tick(NOW + 15 * k, decide).unwrap();
                 forks(fake).len()
             })
             .collect()
@@ -1460,7 +1465,7 @@ mod tests {
     fn a_create_without_an_answer_blocks_starts_until_it_would_be_listed() {
         let cfg = config();
         let fake = lagging_creates(|_| "", |_| JOB_70, first_create_lost, "0");
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         let wait_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
         let mut want = vec![1; (wait_s / 15) as usize];
         want.push(2);
@@ -1477,7 +1482,7 @@ mod tests {
             first_create_lost,
             "0",
         );
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         let until_s = HTTP_TIMEOUT.as_secs() + 2 * cfg.tick_s;
         let counts = forks_per_tick(&mut tick_loop, &fake, until_s);
         assert!(counts.iter().all(|&n| n == 1), "{counts:?}");
@@ -1495,7 +1500,7 @@ mod tests {
             first_create_lost,
             "0.30",
         );
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         // As on a new UTC day, past the restart's assumed spend.
         tick_loop.spent_cents = 0;
         let until_s = HTTP_TIMEOUT.as_secs() + 2 * cfg.tick_s;
@@ -1566,7 +1571,7 @@ mod tests {
                 reply(s)
             }
         });
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
+        let mut tick_loop = started(&cfg, &fake);
         let err = tick_loop.tick(NOW, |_, _| Vec::new()).unwrap_err();
         assert!(matches!(err, Error::Boat(boat::Error::BillingRequired)));
     }
