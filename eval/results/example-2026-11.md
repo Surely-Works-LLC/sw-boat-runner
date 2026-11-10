@@ -1,23 +1,26 @@
-# mjth-monorepo, November 2026
+# Example repository, November 2026
 
-Surely-Works-LLC/mjth-monorepo moved its `runs-on: boat` jobs to four persistent
-self-hosted runners (label `mjth-boat-pool`, names `boat-pool-*`) on always-on
+example-org/example-repo moved its `runs-on: boat` jobs to four persistent
+self-hosted runners (label `pool-a`, names `pool-*`) on always-on
 boat boxes. The change merged at 2026-11-05T21:52:45Z; the last `runs-on: boat`
 job was queued at 21:53Z.
+
+Repository, label, runner and workflow names are placeholders; times and counts
+are as measured.
 
 ## Method
 
 ```sh
-python3 -I eval/evals.py --repo Surely-Works-LLC/mjth-monorepo \
+python3 -I eval/evals.py --repo example-org/example-repo \
   --cutover 2026-11-05T21:52:45Z --boat-ci boat-ci-2026-11-09.json \
-  --persistent-label mjth-boat-pool --after-end 2026-11-09T19:00:00Z \
-  --workflow hg-next.yml --workflow rust-ci.yml --workflow next-release.yml \
-  --workflow go-tooling.yml --workflow terraform-ci.yml --workflow container-runtime.yml
+  --persistent-label pool-a --after-end 2026-11-09T19:00:00Z \
+  --workflow ci-old.yml --workflow ci.yml --workflow release.yml \
+  --workflow tooling.yml --workflow infra.yml --workflow containers.yml
 ```
 
-- Workflows: the ones whose jobs ran on boat (`boat ci` job names: Experimental
-  Rust POC, next-release, Go tooling, terraform-ci, container-runtime).
-  `hg-next.yml` was renamed `rust-ci.yml` on 2026-11-09 and `go-tooling.yml` was
+- Workflows: the ones whose jobs ran on boat (`boat ci` job names: CI,
+  release, tooling, infra, containers).
+  `ci-old.yml` was renamed `ci.yml` on 2026-11-09 and `tooling.yml` was
   deleted on 2026-11-07, so they are passed by file name.
 - Windows: before 2026-11-04T00:00Z to 2026-11-05T21:52:45Z; after
   2026-11-06T00:00Z to 2026-11-09T19:00Z.
@@ -29,8 +32,8 @@ python3 -I eval/evals.py --repo Surely-Works-LLC/mjth-monorepo \
 - "no runner" counts completed jobs that never got a runner; all of them here
   were cancelled while queued.
 - Runner kind comes from job labels: `boat-large` is a boat per-job sandbox,
-  `mjth-boat-pool` is a persistent runner, anything else (`mjth-release`,
-  `mjth-ci-short`) is "other" and not part of the comparison.
+  `pool-a` is a persistent runner, anything else (`other-a`,
+  `other-b`) is "other" and not part of the comparison.
 
 ## Results
 
@@ -44,10 +47,10 @@ python3 -I eval/evals.py --repo Surely-Works-LLC/mjth-monorepo \
 
 | persistent runner | jobs | last job started |
 |---|---|---|
-| boat-pool-958arusm-1 | 39 | 2026-11-09T16:32:09Z |
-| boat-pool-958arusm-2 | 11 | 2026-11-07T23:11:07Z |
-| boat-pool-k64zbt5a-1 | 36 | 2026-11-09T16:41:43Z |
-| boat-pool-k64zbt5a-2 | 11 | 2026-11-07T15:13:03Z |
+| pool-box1-1 | 39 | 2026-11-09T16:32:09Z |
+| pool-box1-2 | 11 | 2026-11-07T23:11:07Z |
+| pool-box2-1 | 36 | 2026-11-09T16:41:43Z |
+| pool-box2-2 | 11 | 2026-11-07T15:13:03Z |
 
 | day (persistent jobs) | jobs | queue p50 | queue p90 |
 |---|---|---|---|
@@ -89,8 +92,8 @@ What got worse:
   takes 5.6m and 27.8m. 82 of 179 pool jobs (46%) were cancelled before any
   runner picked them up, against 22 of 179 (12%) on boat. Long queues make it
   more likely that a newer push cancels a queued run.
-- Two of the four pool runners, `boat-pool-958arusm-2` and
-  `boat-pool-k64zbt5a-2`, are offline today; neither started a sampled job after
+- Two of the four pool runners, `pool-box1-2` and
+  `pool-box2-2`, are offline today; neither started a sampled job after
   2026-11-07. 2026-11-08, with only two runners taking work, has the worst
   queue (p50 21.4m, p90 46.0m). With all four up on 2026-11-06 and 2026-11-07
   the p50 was still 3 to 6 minutes, so four runners are too few for peak load.
@@ -101,9 +104,9 @@ What got worse:
 
 Caveats:
 - Sampled: 108 runs per window, and the per-day rows hold 16 to 41 jobs each.
-- Different traffic: Go tooling ran only in the before window, and the
-  workflows themselves changed between windows (`hg-next.yml` became
-  `rust-ci.yml`, release jobs moved).
+- Different traffic: tooling ran only in the before window, and the
+  workflows themselves changed between windows (`ci-old.yml` became
+  `ci.yml`, release jobs moved).
 - Machine time for always-on boxes is paid whether or not they run CI, and the
   dashboard does not split pool use from other use of those boxes. The saving
   shown here is the extra-starts line, not machine time.
