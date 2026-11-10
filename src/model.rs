@@ -16,7 +16,7 @@ pub struct Config {
     pub pools: Vec<Pool>,
 }
 
-fn default_tick_s() -> u64 {
+pub(crate) fn default_tick_s() -> u64 {
     15
 }
 

@@ -9,8 +9,6 @@ use serde::Deserialize;
 use crate::boat::MAX_TTL_S;
 use crate::model::{Cents, Config, Placement, Pool};
 
-// Mirrors the serde default on `model::Config::tick_s`, which this raw parse bypasses.
-const DEFAULT_TICK_S: u64 = 15;
 const MACHINE_TYPES: [&str; 4] = ["small", "default", "large", "xlarge"];
 
 #[derive(Debug)]
@@ -45,8 +43,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
             raw.repo
         )));
     }
-    let tick_s = raw.tick_s.unwrap_or(DEFAULT_TICK_S);
-    if tick_s == 0 {
+    if raw.tick_s == 0 {
         return Err(Error::Invalid("tick_s must be at least 1".into()));
     }
     if raw.pool.is_empty() {
@@ -68,7 +65,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     }
     Ok(Config {
         repo: raw.repo,
-        tick_s,
+        tick_s: raw.tick_s,
         pools,
     })
 }
@@ -77,7 +74,8 @@ pub fn parse(text: &str) -> Result<Config, Error> {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     repo: String,
-    tick_s: Option<u64>,
+    #[serde(default = "crate::model::default_tick_s")]
+    tick_s: u64,
     #[serde(default)]
     pool: Vec<RawPool>,
 }
