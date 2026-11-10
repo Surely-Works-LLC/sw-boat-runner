@@ -2,7 +2,7 @@
 
 `BoatRunner.tla` models one sw-boat-runner pool: GitHub's job queue and JIT
 runners, boat's machines, and the reconciler in `docs/design.md` as `src/decide.rs`
-and `src/run.rs` implement it on branch `integrate`. TLC checks it in CI (job `tla`).
+and `src/run.rs` implement it. TLC checks it in CI (job `tla`).
 
 ## What is modelled
 
@@ -97,8 +97,8 @@ stuck with work left still fails `NoStarvation` or `Settles`.
 
 ## Fix flags
 
-Each `Fix*` constant switches on one fix for a violation below. `integrate`
-3da033f has all nine; `FixLostSpend` is `src/run.rs:565`. The main models set all nine to TRUE, and
+Each `Fix*` constant switches on one fix for a violation below. The code at
+3da033f has all nine. The main models set all nine to TRUE, and
 CI also checks that each flag off still yields its counterexample, so a model
 change that hides one fails CI.
 
@@ -330,8 +330,7 @@ successful create, but boat counts the start of a machine it made under a lost
 answer.
 
 Fix: add the price on any create without a definite answer as well
-(`src/run.rs:565`). If boat
-made no machine, the tool under-spends by one start; it never over-spends.
+(`run::execute`). If boat made no machine, the tool under-spends by one start; it never over-spends.
 
 ## Design notes
 
@@ -355,20 +354,20 @@ picks one reading.
 - A free resume of a kept machine counts as a start, even when it costs nothing.
 - Drop requeues a job while GitHub marks it failed. The model requeues it.
 - The quote is re-read after each start.
-- Checked against `integrate` 8c5f6d9: the restart seeds `spent_cents` with the
+- Checked against 8c5f6d9: the restart seeds `spent_cents` with the
   largest pool cap (`FixCrashSpend`), a pool without resume deletes a Stopped
   kept machine with no Busy runner (`DeleteGuard`), and in a pool with resume and
   no fork the kept-fork loop also runs for demand within `max_boxes` and the
   budget (`ForkKeptGuard`). The model already matched all three.
 - The model's Stop exclusion (no Stop while any demand is unmet) is coarser
   than the code's, which compares per label.
-- Checked against `integrate` e351752: a non-fatal runner-delete error skips
+- Checked against e351752: a non-fatal runner-delete error skips
   the Stop or Delete (`RefuseUnregister`), Register marks every machine used
   (`FixRegSeen`), every fork gets a fresh UUID v4 key, so a crash orphans job
   forks as well as kept ones, and the restart wait covers both
   (`FixKeptInflight`). `CrashInFork`, `Land`, `Lost` and `inflight` are gone;
   `lag` models both the in-flight create and the listing lag.
-- Checked against `integrate` f8c670c: `self.pending` keeps each created fork
+- Checked against f8c670c: `self.pending` keeps each created fork
   until a listing shows it or `HTTP_TIMEOUT` plus one tick passes, and adds it
   to the snapshot as a Starting machine. That is the model's `Known`.
   `run::start` added the price only when boat answered Ok, so a lost create was
@@ -376,10 +375,10 @@ picks one reading.
   starts until `HTTP_TIMEOUT` plus one tick after a create that may have
   applied (a691488). The model blocks starts while a `Lost` machine is
   unlisted, which assumes that wait outlasts the listing lag.
-- Checked against `integrate` 3da033f: after a create that may have applied,
-  `run::execute` adds the quoted price to `spent_cents` (`src/run.rs:565`), and
+- Checked against 3da033f: after a create that may have applied,
+  `run::execute` adds the quoted price to `spent_cents`, and
   a 4xx, 429 or 503 refusal adds nothing. That is `FixLostSpend`.
 
 ## Base code
 
-The model is checked against `integrate` 3da033f. The spec does not touch Rust code.
+The model is checked against 3da033f. The spec does not touch Rust code.
