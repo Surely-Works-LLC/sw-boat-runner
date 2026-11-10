@@ -714,7 +714,17 @@ fn svg(rows: &[Row]) -> String {
     s
 }
 
+/// `bench <jobs per day> <pool fields>` runs one setup and prints its CSV row, writing no
+/// files. A literal `\n` in the fields separates lines.
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [target, pool] = args.as_slice() {
+        let target = target.parse().expect("jobs per day must be a number");
+        let jobs = workload(target, 7);
+        let row = daemon("custom", &pool.replace("\\n", "\n"), target, &jobs);
+        print!("{}", csv(std::slice::from_ref(&row)));
+        return;
+    }
     let mut rows = Vec::new();
     for target in LOADS {
         let jobs = workload(target, 7);

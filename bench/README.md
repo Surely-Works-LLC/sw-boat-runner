@@ -7,6 +7,17 @@ cargo run --release --example bench
 [main.rs](main.rs) simulates one day of CI at eight loads and counts boat starts. It
 writes [results.csv](results.csv) and [starts.svg](starts.svg), and takes about a minute.
 
+To try your own pool at one load, pass the jobs a day and the pool's fields; a `\n`
+separates lines. It prints the CSV header and one row, setup `custom`, and writes no
+files. The pool's labels and `machine_type = "large"` are fixed, so leave them out:
+
+```sh
+cargo run --release --example bench -- 2000 'preset = "warm"\nslots_per_box = 2\nmax_boxes = 12'
+```
+
+The mock runs every job at the same speed however many slots share its machine, so a
+higher `slots_per_box` looks better here than it will on a real machine.
+
 - `runs-on: boat` is mocked: every job starts one machine, waits 8 s for it, and the
   machine is gone when the job ends.
 - The daemon is real: `run::Loop` ticks every 15 s with `decide::decide`, and only the
