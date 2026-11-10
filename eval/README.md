@@ -1,10 +1,9 @@
 # Evals
 
-This is an offline analysis that shells out to `gh` and `boat`, not part of the daemon,
-so it stays a standard-library Python script outside the crate.
-
 `evals.py` compares GitHub Actions jobs before and after a repository moves from
-boat per-job sandboxes (`runs-on: boat`) to persistent self-hosted runners.
+boat's per-job machines (`runs-on: boat`) to persistent self-hosted runners. It is an
+offline analysis, not part of the daemon: a standard-library Python script that reads
+`boat ci --json` output and calls `gh api`.
 
 Per window and runner kind it reports jobs sampled, jobs that never got a
 runner, queue time (`started_at - created_at`) and run time (`completed_at -
@@ -34,7 +33,8 @@ python3 -I eval/evals.py --repo OWNER/REPO --cutover 2026-11-05T21:52:45Z \
 ## API budget
 
 `gh api` is called at most `--max-calls` times (default 250), counting cached
-reads, and the script stops if the core rate limit has under 1,500 calls left.
+reads, plus one retry per failed call. Before its first uncached call the script stops
+if the core rate limit has under 1,500 calls left.
 Responses are cached in `eval/.cache/` (gitignored), so a rerun with the same
 arguments makes no calls. Runs are listed per workflow with `created=` filters;
 when a window has more pages than the budget allows, evenly spaced pages are

@@ -5,7 +5,7 @@
 (* implement it. Stop and Delete are decided from one snapshot and        *)
 (* executed later, because run::execute does not look again; every other  *)
 (* tool action reads the current state. The Fix* constants switch on the  *)
-(* fixes in spec/README.md. The code at ae2ef64 has all nine.             *)
+(* fixes listed in spec/README.md; the code has all nine.                 *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -24,7 +24,7 @@ CONSTANTS
     FixCrashSpend,  \* a restart sets spent_today to the cap, not to 0
     FixRegSeen,     \* Register marks the machine as having had a runner
     FixCrashSeen,   \* after a restart an Up ephemeral machine counts as used
-    FixForkKey,     \* a job fork's Idempotency-Key changes once its machine is Gone
+    FixForkKey,     \* every fork request has a fresh Idempotency-Key
     FixStaleAct,    \* Stop and Delete first remove the machine's GitHub runner,
                     \* which GitHub refuses while it runs a job
     FixKeptInflight,\* after a restart the tool starts nothing until every fork
@@ -448,9 +448,9 @@ RefuseUnregister(m) ==
                    starts, spent_today, keys, ran>>
 
 \* A create times out, fails in transport or gets a 5xx, and boat made the
-\* machine anyway. run::start adds the price only on a definite answer, so
-\* without FixLostSpend the tool does not count the start boat counted. A lost
-\* create of a machine boat never made only delays the next start.
+\* machine anyway. Without FixLostSpend the tool adds the price only when boat
+\* answers, so it misses the start boat counted. A lost create of a machine
+\* boat never made only delays the next start.
 LostCreate ==
     /\ Fault
     /\ \/ ForkKeptGuard /\ \E m \in FreeIds : Create(m, NoJob, "Lost") /\ UNCHANGED keys
@@ -461,8 +461,8 @@ LostCreate ==
     /\ spent_today' = IF FixLostSpend THEN spent_today + Price ELSE spent_today
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
 
-\* boat answers 429 or 503: nothing starts, nothing is counted, and the tool
-\* tries again on a later tick.
+\* boat answers 429, or 503 no_ready_machine or out_of_capacity: nothing starts,
+\* nothing is counted, and the tool tries again after Retry-After.
 RefuseStart ==
     /\ Fault
     /\ CanResume \/ ForkKeptGuard \/ \E j \in Jobs : ForkGuard(j)
@@ -570,7 +570,7 @@ Fairness ==
 Spec == Init /\ [][Next]_vars /\ Fairness
 
 -----------------------------------------------------------------------------
-(* Properties, numbered as in docs/design.md. *)
+(* Properties, numbered as in docs/design.md#properties. *)
 
 TypeOK ==
     /\ mstate \in [Machines -> {"Starting", "Up", "Stopped", "Gone"}]
@@ -621,7 +621,7 @@ EphemeralIsolation ==
 ForkIsolation ==
     [][\A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]]_vars
 
-\* 7
+\* Liveness 4
 NoLeak ==
     \A m \in Machines :
         (IsEph(m) /\ Live(m) /\ (status[job[m]] = "Done" \/ PastTtl(m)))

@@ -34,7 +34,7 @@ jobs:
             edit: 's/^Placement = .*/Placement = {"slot", "resume"}/'
           - name: fork
             cfg: spec/BoatRunnerFork.cfg
-          # Each fix off must still produce its counterexample (spec/README.md).
+          # Each fix off must still produce its counterexample (spec/README.md#fix-flags).
           - name: crash-spend
             cfg: spec/BoatRunner.cfg
             edit: 's/^FixCrashSpend = TRUE/FixCrashSpend = FALSE/'
