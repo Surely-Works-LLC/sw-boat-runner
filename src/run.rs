@@ -27,7 +27,7 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         find_header(&self.headers, name)
     }
 }
@@ -50,10 +50,10 @@ pub trait Transport {
     ) -> Result<Response, NetworkError>;
 }
 
-pub struct Ureq(ureq::Agent);
+pub(crate) struct Ureq(ureq::Agent);
 
 impl Ureq {
-    pub fn new(timeout: Duration) -> Self {
+    pub(crate) fn new(timeout: Duration) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             // Both clients map every status themselves.
@@ -717,13 +717,13 @@ impl<'a> Loop<'a> {
 }
 
 #[cfg(test)]
-pub mod fake {
+pub(crate) mod fake {
     use std::cell::RefCell;
 
     use super::{NetworkError, Response, Transport, find_header};
 
     #[derive(Debug, Clone)]
-    pub struct Sent {
+    pub(crate) struct Sent {
         pub method: String,
         pub url: String,
         pub headers: Vec<(String, String)>,
@@ -731,38 +731,38 @@ pub mod fake {
     }
 
     impl Sent {
-        pub fn header(&self, name: &str) -> Option<&str> {
+        pub(crate) fn header(&self, name: &str) -> Option<&str> {
             find_header(&self.headers, name)
         }
 
-        pub fn body_text(&self) -> String {
+        pub(crate) fn body_text(&self) -> String {
             String::from_utf8_lossy(self.body.as_deref().unwrap_or_default()).into_owned()
         }
     }
 
     /// What the network gives back for one request.
-    pub type Reply = Result<Response, NetworkError>;
+    pub(crate) type Reply = Result<Response, NetworkError>;
 
     /// Answers every request with `reply` and records what was sent.
-    pub struct Fake {
+    pub(crate) struct Fake {
         reply: Box<dyn Fn(&Sent) -> Reply>,
         sent: RefCell<Vec<Sent>>,
     }
 
     impl Fake {
-        pub fn new(reply: impl Fn(&Sent) -> Response + 'static) -> Self {
+        pub(crate) fn new(reply: impl Fn(&Sent) -> Response + 'static) -> Self {
             Fake::failing(move |s| Ok(reply(s)))
         }
 
         /// Like `new`, but `reply` may fail as the network would.
-        pub fn failing(reply: impl Fn(&Sent) -> Reply + 'static) -> Self {
+        pub(crate) fn failing(reply: impl Fn(&Sent) -> Reply + 'static) -> Self {
             Fake {
                 reply: Box::new(reply),
                 sent: RefCell::new(Vec::new()),
             }
         }
 
-        pub fn sent(&self) -> Vec<Sent> {
+        pub(crate) fn sent(&self) -> Vec<Sent> {
             self.sent.borrow().clone()
         }
     }
@@ -790,7 +790,7 @@ pub mod fake {
         }
     }
 
-    pub fn respond(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+    pub(crate) fn respond(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
         Response {
             status,
             headers: headers

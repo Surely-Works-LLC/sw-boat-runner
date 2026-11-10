@@ -10,13 +10,13 @@ use serde_json::{Value, json};
 use crate::model::MachineState;
 use crate::run::{Response, Transport};
 
-pub const BASE: &str = "https://boat.dev/api/v1";
+pub(crate) const BASE: &str = "https://boat.dev/api/v1";
 /// Label every machine of a pool carries: `sw-boat-runner=<pool>`.
-pub const POOL_LABEL: &str = "sw-boat-runner";
+pub(crate) const POOL_LABEL: &str = "sw-boat-runner";
 /// Label of a forked machine: `sw-boat-runner-job=<job id>-<attempt>`.
-pub const JOB_LABEL: &str = "sw-boat-runner-job";
+pub(crate) const JOB_LABEL: &str = "sw-boat-runner-job";
 /// The longest `ttlSeconds` boat accepts. Expiry archives a machine; it does not delete it.
-pub const MAX_TTL_S: u64 = 2_592_000;
+pub(crate) const MAX_TTL_S: u64 = 2_592_000;
 
 /// `GET /sandboxes` pages of 200 (the documented maximum); a pool never gets near this.
 const PAGE_LIMIT: u32 = 200;
@@ -53,14 +53,14 @@ pub enum Error {
 
 impl Error {
     /// Errors that no later tick can fix.
-    pub fn is_fatal(&self) -> bool {
+    pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::BillingRequired | Error::Unauthorized { .. })
     }
 
     /// Failures without a definite answer, so boat may have done what was asked: a
     /// transport error or timeout, a 5xx that is not a refusal, or a 2xx whose body did
     /// not parse. A 4xx is a refusal.
-    pub fn may_have_applied(&self) -> bool {
+    pub(crate) fn may_have_applied(&self) -> bool {
         match self {
             Error::Network(_) => true,
             Error::Other { status, .. } => !(400..500).contains(status),
@@ -94,7 +94,7 @@ impl fmt::Display for Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct Sandbox {
+pub(crate) struct Sandbox {
     pub id: String,
     pub state: String,
     #[serde(default)]
@@ -103,7 +103,7 @@ pub struct Sandbox {
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Limits {
+pub(crate) struct Limits {
     pub can_start: bool,
     /// 0 inside every limit, `None` when boat would refuse the start.
     #[serde(default)]
@@ -114,7 +114,7 @@ pub struct Limits {
 /// `Stopped`; `cancelled` is a create or fork that got no machine, and `deleted` one that
 /// is still listed after a delete. An unknown state counts as `Starting`: it holds a
 /// `max_boxes` slot and draws no action until it settles.
-pub fn machine_state(state: &str) -> MachineState {
+pub(crate) fn machine_state(state: &str) -> MachineState {
     match state {
         "init" | "provisioning" | "provisioned" | "cloning" => MachineState::Starting,
         "ready" | "idle" | "running" => MachineState::Up,
@@ -126,7 +126,7 @@ pub fn machine_state(state: &str) -> MachineState {
 }
 
 /// `bx_` plus 8 characters of boat's id alphabet; never contains `-`.
-pub fn is_sandbox_id(s: &str) -> bool {
+pub(crate) fn is_sandbox_id(s: &str) -> bool {
     s.strip_prefix("bx_").is_some_and(|rest| {
         rest.len() == 8
             && rest
@@ -135,13 +135,13 @@ pub fn is_sandbox_id(s: &str) -> bool {
     })
 }
 
-pub struct Client<'t> {
+pub(crate) struct Client<'t> {
     t: &'t dyn Transport,
     key: String,
 }
 
 impl<'t> Client<'t> {
-    pub fn new(t: &'t dyn Transport, key: String) -> Self {
+    pub(crate) fn new(t: &'t dyn Transport, key: String) -> Self {
         Client { t, key }
     }
 
@@ -182,7 +182,7 @@ impl<'t> Client<'t> {
     }
 
     /// Every sandbox of `pool`, in any state, following `pageInfo.nextCursor`.
-    pub fn list(&self, pool: &str) -> Result<Vec<Sandbox>, Error> {
+    pub(crate) fn list(&self, pool: &str) -> Result<Vec<Sandbox>, Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
@@ -218,7 +218,7 @@ impl<'t> Client<'t> {
         })
     }
 
-    pub fn resume(&self, id: &str) -> Result<(), Error> {
+    pub(crate) fn resume(&self, id: &str) -> Result<(), Error> {
         self.call(
             "POST",
             &format!("/sandboxes/{id}/resume"),
@@ -229,7 +229,7 @@ impl<'t> Client<'t> {
     }
 
     /// Returns at once; 200 when already stopped, 202 while the stop runs.
-    pub fn stop(&self, id: &str) -> Result<(), Error> {
+    pub(crate) fn stop(&self, id: &str) -> Result<(), Error> {
         self.call(
             "POST",
             &format!("/sandboxes/{id}/stop"),
@@ -240,7 +240,7 @@ impl<'t> Client<'t> {
     }
 
     /// Permanently deletes the sandbox and its disk.
-    pub fn delete(&self, id: &str) -> Result<(), Error> {
+    pub(crate) fn delete(&self, id: &str) -> Result<(), Error> {
         self.call(
             "DELETE",
             &format!("/sandboxes/{id}"),
@@ -254,7 +254,7 @@ impl<'t> Client<'t> {
     /// for a repeat of the same key and body within 24 h, even a deleted one.
     /// `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv` keeps the account's logins and secrets
     /// out of the machine, because CI jobs run arbitrary code there.
-    pub fn create_from_snapshot(
+    pub(crate) fn create_from_snapshot(
         &self,
         snapshot: &str,
         machine_type: &str,
@@ -284,7 +284,7 @@ impl<'t> Client<'t> {
     }
 
     /// Writes a UTF-8 file under `/home/user` or `/tmp`; 200 means it is on disk.
-    pub fn write_file(&self, id: &str, path: &str, content: &str) -> Result<(), Error> {
+    pub(crate) fn write_file(&self, id: &str, path: &str, content: &str) -> Result<(), Error> {
         let body = json!({ "path": path, "content": content, "encoding": "utf8" });
         self.call("PUT", &format!("/sandboxes/{id}/files"), Some(&body), &[])
             .map(drop)
@@ -292,7 +292,7 @@ impl<'t> Client<'t> {
 
     /// Starts `command` in the background. boat keeps every command in its history, so the
     /// command must never contain a secret.
-    pub fn exec_detached(&self, id: &str, command: &str) -> Result<(), Error> {
+    pub(crate) fn exec_detached(&self, id: &str, command: &str) -> Result<(), Error> {
         let body = json!({ "command": command, "detached": true });
         self.call(
             "POST",
@@ -303,7 +303,7 @@ impl<'t> Client<'t> {
         .map(drop)
     }
 
-    pub fn limits(&self) -> Result<Limits, Error> {
+    pub(crate) fn limits(&self) -> Result<Limits, Error> {
         parse(self.call("GET", "/limits", None, &[])?)
     }
 }
@@ -318,7 +318,7 @@ fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, Error> {
 
 /// Maps a non-2xx response. A 429 always sends `Retry-After`; a 503 puts
 /// `retryAfterSeconds` in the body; `IP_RATE_LIMIT_EXCEEDED` uses `retryAfter`.
-pub fn map_error(resp: &Response) -> Error {
+pub(crate) fn map_error(resp: &Response) -> Error {
     let body: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
     let text = |key: &str| {
         body.get(key)

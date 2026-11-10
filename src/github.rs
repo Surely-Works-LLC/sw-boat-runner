@@ -10,12 +10,12 @@ use crate::boat;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
 use crate::run::Transport;
 
-pub const API: &str = "https://api.github.com";
+pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
-pub const PREFIX: &str = "sbr-";
+pub(crate) const PREFIX: &str = "sbr-";
 /// Requests stop for the rest of the rate-limit window once fewer than this many remain,
 /// so a human with the same token keeps some budget.
-pub const RATE_FLOOR: u64 = 200;
+pub(crate) const RATE_FLOOR: u64 = 200;
 const PER_PAGE: usize = 100;
 const MAX_PAGES: u32 = 10;
 
@@ -40,7 +40,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn is_fatal(&self) -> bool {
+    pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::Unauthorized { .. })
     }
 }
@@ -61,7 +61,7 @@ impl fmt::Display for Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct GhRunner {
+pub(crate) struct GhRunner {
     pub id: u64,
     pub name: String,
     /// `online` or `offline`.
@@ -71,16 +71,16 @@ pub struct GhRunner {
 
 /// A just-in-time runner config. It is a credential: no `Debug`, no `Display`, and the
 /// only way out is `expose`.
-pub struct JitConfig(String);
+pub(crate) struct JitConfig(String);
 
 impl JitConfig {
-    pub fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
 
 /// `sbr-<pool>-<machine id>-<slot>-<registered unix time>`.
-pub fn runner_name(pool: &str, machine: &str, slot: u32, registered_at: UnixSecs) -> String {
+pub(crate) fn runner_name(pool: &str, machine: &str, slot: u32, registered_at: UnixSecs) -> String {
     format!("{PREFIX}{pool}-{machine}-{slot}-{registered_at}")
 }
 
@@ -116,7 +116,7 @@ pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
 /// process has not seen online. After a restart a runner that went offline earlier is
 /// `Registered`, and `decide` unregisters it once `register_timeout_s` has passed since its
 /// `registered_at`.
-pub fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
+pub(crate) fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
     if busy {
         RunnerState::Busy
     } else if online {
@@ -134,7 +134,7 @@ struct Cached {
     used: bool,
 }
 
-pub struct Client<'t> {
+pub(crate) struct Client<'t> {
     t: &'t dyn Transport,
     token: String,
     repo: String,
@@ -147,7 +147,7 @@ pub struct Client<'t> {
 }
 
 impl<'t> Client<'t> {
-    pub fn new(t: &'t dyn Transport, token: String, repo: String) -> Self {
+    pub(crate) fn new(t: &'t dyn Transport, token: String, repo: String) -> Self {
         Client {
             t,
             token,
@@ -160,7 +160,7 @@ impl<'t> Client<'t> {
 
     /// Sets the clock and drops cached bodies the previous tick did not use, so the
     /// cache holds at most one tick's URLs.
-    pub fn begin_tick(&mut self, now: UnixSecs) {
+    pub(crate) fn begin_tick(&mut self, now: UnixSecs) {
         self.now = now;
         self.cache.retain(|_, c| c.used);
         for c in self.cache.values_mut() {
@@ -279,7 +279,7 @@ impl<'t> Client<'t> {
     }
 
     /// The repository's runners whose names start with `sbr-`.
-    pub fn runners(&mut self) -> Result<Vec<GhRunner>, Error> {
+    pub(crate) fn runners(&mut self) -> Result<Vec<GhRunner>, Error> {
         #[derive(Deserialize)]
         struct Page {
             runners: Vec<GhRunner>,
@@ -299,7 +299,7 @@ impl<'t> Client<'t> {
     }
 
     /// Registers an ephemeral runner (one job) in the default group 1.
-    pub fn generate_jitconfig(
+    pub(crate) fn generate_jitconfig(
         &mut self,
         name: &str,
         labels: &[String],
@@ -316,14 +316,14 @@ impl<'t> Client<'t> {
         Ok(JitConfig(out.encoded_jit_config))
     }
 
-    pub fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
+    pub(crate) fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
         self.request("DELETE", &format!("/actions/runners/{id}"), None)
             .map(drop)
     }
 
     /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
     /// in-progress run still queues its later jobs.
-    pub fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
+    pub(crate) fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
         #[derive(Deserialize)]
         struct Runs {
             workflow_runs: Vec<Run>,
