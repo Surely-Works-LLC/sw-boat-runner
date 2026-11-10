@@ -24,18 +24,25 @@ jobs:
 `snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
 describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section; the
 `GITHUB_TOKEN` Actions creates for the run cannot register runners. Optional inputs:
-`machine_type` (`default`), `max_boxes` (4) and `ref`, the sw-boat-runner commit to build
-(`main`; pin a commit for anything you rely on).
+
+| Input | Default | |
+| - | - | - |
+| `machine_type` | `default` | |
+| `max_boxes` | 4 | |
+| `pool` | `preset = "fork"` | More policy lines for the pool, such as `preset = "warm"`. |
+| `name` | none | Set it when one run calls the workflow more than once. The label is then `boat-<run id>-<attempt>-<name>`. |
+| `ref` | `main` | The sw-boat-runner commit to build. Pin one for anything you rely on. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never
-share a daemon. The `runners` job ends once every other job of the run is done and their
-machines are deleted.
+share a daemon. The `runners` job ends once every other job of the run is done, and then
+deletes the pool's machines and runners with `sw-boat-runner drain`.
 
 What this costs compared with a daemon that stays up:
 
-- The pool uses the `fork` preset, so every job is one start, as with `runs-on: boat`.
-  It gives each job a fresh machine from your snapshot with none of the account's
-  secrets. It does not save starts; a [daemon that stays up](../always-on/) does.
+- With the default `fork` preset every job is one start, as with `runs-on: boat`, on a
+  fresh machine from your snapshot with none of the account's secrets. `pool: preset =
+  "warm"` reuses machines among the jobs of one run. Nothing is kept between runs; a
+  [daemon that stays up](../always-on/) does that.
 - Jobs wait for the daemon to build and for its 90 s restart wait, about 3 minutes in
   all, and the `runners` job uses GitHub-hosted minutes for the whole run.
 - It makes only starts the plan includes. A job past them waits.

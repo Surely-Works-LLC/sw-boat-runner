@@ -34,7 +34,7 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
 
 | Where the daemon runs | You add | Saves starts |
 | - | - | - |
-| [Inside the workflow](examples/in-workflow/) | one job and two secrets | no: one start per job, each on a fresh machine from your snapshot |
+| [Inside the workflow](examples/in-workflow/) | one job and two secrets | within one run only; the default is a fresh machine per job |
 | [On a small boat machine](examples/always-on/) | one machine, about $13 a month | yes |
 | On any host you keep up | the steps below | yes |
 
@@ -80,6 +80,7 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    sw-boat-runner check policy.toml   # validate, print each pool with its preset applied
    sw-boat-runner plan policy.toml    # observe once, print the actions as JSON; changes nothing
    sw-boat-runner run policy.toml     # the loop
+   sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to stop using them
    ```
 
 6. Point jobs at the pool. A job goes to the first pool whose `labels` include all of

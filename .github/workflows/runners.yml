@@ -1,7 +1,7 @@
 name: runners
-# Reusable: runs sw-boat-runner for the length of the calling workflow run, with a `fork`
-# pool that only this run's jobs can use. examples/in-workflow/README.md has the caller's
-# side.
+# Reusable: runs sw-boat-runner for the length of the calling workflow run, with a pool
+# that only this run's jobs can use, and deletes the pool's machines at the end.
+# examples/in-workflow/README.md has the caller's side.
 on:
   workflow_call:
     inputs:
@@ -17,6 +17,18 @@ on:
         description: Most machines up or starting at once.
         default: 4
         type: number
+      pool:
+        description: >-
+          More lines for the pool's policy, such as a preset or min_up. The default gives
+          every job a fresh machine.
+        default: preset = "fork"
+        type: string
+      name:
+        description: >-
+          Lowercase letters and digits. Set it when one run calls this workflow more than
+          once; the pool's label then ends in -<name>.
+        default: ""
+        type: string
       ref:
         description: The sw-boat-runner commit, tag or branch to build.
         default: main
@@ -43,6 +55,8 @@ jobs:
       SNAPSHOT: ${{ inputs.snapshot }}
       MACHINE_TYPE: ${{ inputs.machine_type }}
       MAX_BOXES: ${{ inputs.max_boxes }}
+      POOL: ${{ inputs.pool }}
+      NAME: ${{ inputs.name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -55,35 +69,40 @@ jobs:
       # jobs and two runs never share a pool.
       - name: Policy
         run: |
+          id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${NAME:+-$NAME}"
           cat > policy.toml <<TOML
           repo = "$GITHUB_REPOSITORY"
 
           [[pool]]
-          name = "run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
-          labels = ["self-hosted", "boat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"]
+          name = "run_$(echo "$id" | tr - _)"
+          labels = ["self-hosted", "boat-$id"]
           machine_type = "$MACHINE_TYPE"
           snapshot = "$SNAPSHOT"
-          preset = "fork"
           max_boxes = $MAX_BOXES
+          $POOL
           TOML
           target/release/sw-boat-runner check policy.toml
-      - name: Run the daemon until the run's other jobs are done and their machines are deleted
+      - name: Run the daemon until the run's other jobs are done
         run: |
           target/release/sw-boat-runner run policy.toml &
           daemon=$!
           jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
-          # This job is the one that is never completed. A job behind `needs` is listed
-          # only once it is queued, so the run must look finished twice in a row.
+          # Every job but the daemons themselves. A job behind `needs` is listed only once
+          # it is queued, so the run must look finished twice in a row.
+          open='[.jobs[] | select(.status != "completed" and (.name | endswith("daemon") | not))] | length'
           idle=0
           while [ "$idle" -lt 2 ]; do
             kill -0 "$daemon"
             sleep 30
-            open=$(gh api "$jobs" --jq '[.jobs[] | select(.status != "completed")] | length')
-            if [ "$open" -le 1 ]; then idle=$((idle + 1)); else idle=0; fi
-          done
-          # `plan` prints nothing once there is no machine or runner left to clean up.
-          while actions=$(target/release/sw-boat-runner plan policy.toml) && [ -n "$actions" ]; do
-            kill -0 "$daemon"
-            sleep 15
+            if [ "$(gh api "$jobs" --jq "$open")" -eq 0 ]; then idle=$((idle + 1)); else idle=0; fi
           done
           kill "$daemon"
+      - name: Delete the pool's machines and runners
+        if: always()
+        run: |
+          [ -f policy.toml ] || exit 0
+          for _ in $(seq 20); do
+            if target/release/sw-boat-runner drain policy.toml; then exit 0; fi
+            sleep 15
+          done
+          exit 1

@@ -183,6 +183,46 @@ fn snapshot(
     tick_loop.observe(now).map(|(snapshot, _)| snapshot)
 }
 
+/// Deletes every machine and runner of the policy's pools, for taking a pool out of use.
+/// A machine whose runner is running a job is left alone. Returns the machines still
+/// there, so a caller can repeat it until it returns 0.
+pub fn drain(cfg: &Config) -> Result<usize, Error> {
+    let (boat_key, token) = credentials()?;
+    drain_with(cfg, &Ureq::new(HTTP_TIMEOUT), boat_key, token, unix_now())
+}
+
+fn drain_with(
+    cfg: &Config,
+    t: &dyn Transport,
+    boat_key: String,
+    token: String,
+    now: UnixSecs,
+) -> Result<usize, Error> {
+    let mut tick_loop = Loop::new(cfg, t, boat_key, token, now);
+    tick_loop.tick(now, delete_everything)?;
+    tick_loop.gh.begin_tick(now);
+    let (after, _) = tick_loop.observe(now)?;
+    Ok(live(&after.machines).count())
+}
+
+fn live(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
+    machines.iter().filter(|m| m.state != MachineState::Gone)
+}
+
+/// `drain`'s stand-in for `decide`.
+fn delete_everything(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
+    let runners = snap.runners.iter().filter(|r| r.pool == pool.name);
+    let machines = live(&snap.machines).filter(|m| m.pool == pool.name);
+    runners
+        .map(|r| Action::Unregister {
+            runner: r.name.clone(),
+        })
+        .chain(machines.map(|m| Action::Delete {
+            machine: m.id.clone(),
+        }))
+        .collect()
+}
+
 fn credentials() -> Result<(String, String), Error> {
     Ok((env("BOAT_API_KEY")?, env("GITHUB_TOKEN")?))
 }
@@ -1276,6 +1316,29 @@ mod tests {
                 format!("DELETE {GH}/runners/12"),
                 format!("DELETE {BOAT}/sandboxes/bx_44444444"),
                 format!("DELETE {GH}/runners/11"),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_deletes_the_pools_runners_and_machines() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        // The fake lists the same three machines afterwards.
+        let left = drain_with(&cfg, &fake, "k".into(), "t".into(), NOW).unwrap();
+        assert_eq!(left, 3);
+        let writes: Vec<String> = requests(&fake)
+            .into_iter()
+            .filter(|r| !r.starts_with("GET"))
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                format!("DELETE {GH}/runners/11"),
+                format!("DELETE {GH}/runners/12"),
+                format!("DELETE {BOAT}/sandboxes/bx_22222222"),
+                format!("DELETE {BOAT}/sandboxes/bx_33333333"),
+                format!("DELETE {BOAT}/sandboxes/bx_44444444"),
             ]
         );
     }
