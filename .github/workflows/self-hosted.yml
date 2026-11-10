@@ -8,9 +8,12 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+# Both jobs run only for main. The runner is registered on the repository, so while the
+# daemon runs it also serves any other queued job that asks for its per-run label, such as
+# one from a pull request that edits a workflow: examples/in-workflow/README.md#pull-requests.
 jobs:
   runners:
-    if: vars.BOAT_SNAPSHOT != ''
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     uses: ./.github/workflows/runners.yml
     with:
       snapshot: ${{ vars.BOAT_SNAPSHOT }}
@@ -19,9 +22,11 @@ jobs:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
       RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
   test:
-    if: vars.BOAT_SNAPSHOT != ''
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: [self-hosted, "boat-${{ github.run_id }}-${{ github.run_attempt }}"]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - run: cargo test --locked
