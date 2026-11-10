@@ -686,8 +686,7 @@ impl<'a> Loop<'a> {
                 self.spent_cents = self.spent_cents.saturating_add(starts.price);
                 // `decide` priced every start at one quote; stop once the quote moves.
                 match self.boat.limits() {
-                    Ok(l)
-                        if boat_can_start(&l) && cents(l.next_start_dollars) == starts.price => {}
+                    Ok(l) if boat_can_start(&l) && cents(l.next_start_dollars) == starts.price => {}
                     Ok(_) => starts.open = false,
                     Err(e) if e.is_fatal() => return Err(e.into()),
                     Err(e) => {
