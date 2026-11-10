@@ -148,8 +148,7 @@ impl From<github::Error> for Error {
 }
 
 pub fn run(cfg: &Config, decide: fn(&Snapshot, &Pool) -> Vec<Action>) -> Result<(), Error> {
-    let boat_key = env("BOAT_API_KEY")?;
-    let token = env("GITHUB_TOKEN")?;
+    let (boat_key, token) = credentials()?;
     let transport = Ureq::new(HTTP_TIMEOUT);
     let mut tick_loop = Loop::new(cfg, &transport, boat_key, token, unix_now());
     let period = Duration::from_secs(cfg.tick_s.max(1));
@@ -158,6 +157,31 @@ pub fn run(cfg: &Config, decide: fn(&Snapshot, &Pool) -> Vec<Action>) -> Result<
         tick_loop.tick(unix_now(), decide)?;
         std::thread::sleep(period.saturating_sub(started.elapsed()));
     }
+}
+
+/// One observe with `run`'s credentials and no writes, for `plan` without a snapshot file.
+pub fn observe_once(cfg: &Config) -> Result<Snapshot, Error> {
+    let (boat_key, token) = credentials()?;
+    snapshot(cfg, &Ureq::new(HTTP_TIMEOUT), boat_key, token, unix_now())
+}
+
+fn snapshot(
+    cfg: &Config,
+    t: &dyn Transport,
+    boat_key: String,
+    token: String,
+    now: UnixSecs,
+) -> Result<Snapshot, Error> {
+    // Started a request timeout ago, so the snapshot shows the starts `run` makes once its
+    // restart wait is over.
+    let since = now.saturating_sub(HTTP_TIMEOUT.as_secs());
+    let mut tick_loop = Loop::new(cfg, t, boat_key, token, since);
+    tick_loop.gh.begin_tick(now);
+    tick_loop.observe(now).map(|(snapshot, _)| snapshot)
+}
+
+fn credentials() -> Result<(String, String), Error> {
+    Ok((env("BOAT_API_KEY")?, env("GITHUB_TOKEN")?))
 }
 
 fn env(name: &'static str) -> Result<String, Error> {
@@ -986,6 +1010,27 @@ mod tests {
         assert_eq!(tick_loop.spent_cents, 0);
     }
 
+    /// `plan` without a snapshot file observes as `run` does and sends nothing else, even
+    /// when the plan has every kind of action.
+    #[test]
+    fn a_live_plan_only_reads() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let snap = snapshot(&cfg, &fake, "boat_k".into(), "gh_t".into(), NOW).unwrap();
+        assert_eq!(plan(&cfg, &snap, decide_all).len(), 6);
+        assert_eq!(
+            requests(&fake),
+            [
+                format!("GET {BOAT}/sandboxes?label=sw-boat-runner%3Dci&limit=200"),
+                format!("GET {GH}/runners?per_page=100&page=1"),
+                format!("GET {GH}/runs?status=queued&per_page=100"),
+                format!("GET {GH}/runs/5/jobs?per_page=100"),
+                format!("GET {GH}/runs?status=in_progress&per_page=100"),
+                format!("GET {BOAT}/limits"),
+            ]
+        );
+    }
+
     fn decide_starts(s: &Snapshot, _: &Pool) -> Vec<Action> {
         if s.now > NOW {
             assert!(!s.limits.can_start, "starts stay closed until Retry-After");
@@ -1313,18 +1358,26 @@ mod tests {
         assert!(observed(&mut tick_loop, NOW + 45).is_empty());
     }
 
+    /// boat never lists the fork for job 70. For the request timeout and a tick it counts as
+    /// Starting, so job 70 gets no second fork. Then the loop drops it with a warning and
+    /// forks job 70 again.
     #[test]
-    fn a_pending_fork_expires_after_the_request_timeout_and_a_tick() {
-        let cfg = config();
+    fn a_fork_boat_never_lists_is_dropped_after_its_window() {
+        let mut cfg = config();
+        cfg.pools[0].paid_start_cents_per_day = 0;
         let fake = lagging(|_| "", |_| JOB_70);
         let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), STARTED);
-        tick_loop.tick(NOW, fork_job_70).unwrap();
         let lag_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
-        assert_eq!(
-            observed(&mut tick_loop, NOW + lag_s),
-            [("bx_55555555".to_string(), MachineState::Starting)]
-        );
-        assert!(observed(&mut tick_loop, NOW + lag_s + 1).is_empty());
+        tick_loop.tick(NOW, crate::decide::decide).unwrap();
+        tick_loop.tick(NOW + lag_s, crate::decide::decide).unwrap();
+        assert_eq!(forks(&fake).len(), 1);
+        let pending: Vec<_> = tick_loop.pending.iter().map(|p| p.sent).collect();
+        assert_eq!(pending, [NOW]);
+        let expired = NOW + lag_s + 1;
+        tick_loop.tick(expired, crate::decide::decide).unwrap();
+        assert_eq!(forks(&fake).len(), 2);
+        let pending: Vec<_> = tick_loop.pending.iter().map(|p| p.sent).collect();
+        assert_eq!(pending, [expired]);
     }
 
     /// The first create times out after boat may have accepted it.

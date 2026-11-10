@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted GitHub Actions runners on boat machines, reused across jobs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Surely-Works-LLC/sw-boat-runner"
 publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-ureq = { version = "3", features = ["json"] }
+ureq = "3"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]

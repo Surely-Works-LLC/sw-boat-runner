@@ -12,7 +12,7 @@ use model::Placement;
 
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
-       sw-boat-runner plan <policy.toml> <snapshot.json>
+       sw-boat-runner plan <policy.toml> [snapshot.json]
        sw-boat-runner run <policy.toml>";
 
 fn main() -> ExitCode {
@@ -20,7 +20,10 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["check", policy] => with_policy(policy, cmd_check),
-        ["plan", policy, snapshot] => with_policy(policy, |cfg| cmd_plan(cfg, Path::new(snapshot))),
+        ["plan", policy] => with_policy(policy, |cfg| cmd_plan(cfg, None)),
+        ["plan", policy, snapshot] => {
+            with_policy(policy, |cfg| cmd_plan(cfg, Some(Path::new(snapshot))))
+        }
         ["run", policy] => with_policy(policy, cmd_run),
         _ => {
             eprintln!("{USAGE}");
@@ -70,24 +73,40 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The actions `run` would take on this snapshot, one JSON object per line with its pool.
-fn cmd_plan(cfg: &model::Config, snapshot: &Path) -> ExitCode {
-    let snap: model::Snapshot = match std::fs::read_to_string(snapshot)
-        .map_err(|e| e.to_string())
-        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
-    {
+/// The actions `run` would take, one JSON object per line with its pool. Without a
+/// snapshot file it observes boat and GitHub once, as `run` does, and changes nothing.
+fn cmd_plan(cfg: &model::Config, snapshot: Option<&Path>) -> ExitCode {
+    let snap = match snapshot {
+        Some(path) => read_snapshot(path).map_err(|e| format!("{}: {e}", path.display())),
+        None => run::observe_once(cfg).map_err(|e| format!("observe: {e}")),
+    };
+    let snap = match snap {
         Ok(snap) => snap,
         Err(e) => {
-            eprintln!("{}: {e}", snapshot.display());
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
+    eprintln!(
+        "snapshot machines {} runners {} queued {} can_start {} next_start {}c spent_today {}c",
+        snap.machines.len(),
+        snap.runners.len(),
+        snap.queued.len(),
+        snap.limits.can_start,
+        snap.limits.next_start_cents,
+        snap.limits.spent_today_cents,
+    );
     for (pool, action) in run::plan(cfg, &snap, decide::decide) {
         let mut line = serde_json::to_value(&action).expect("an Action always serializes");
         line["pool"] = serde_json::Value::from(pool.name.as_str());
         println!("{line}");
     }
     ExitCode::SUCCESS
+}
+
+fn read_snapshot(path: &Path) -> Result<model::Snapshot, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
 fn cmd_run(cfg: &model::Config) -> ExitCode {
