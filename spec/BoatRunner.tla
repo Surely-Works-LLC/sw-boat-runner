@@ -71,7 +71,6 @@ vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
 -----------------------------------------------------------------------------
 (* What decide derives from one snapshot. *)
 
-Count(S) == Cardinality(S)
 Has(step) == step \in Placement
 
 (* boat lists a created machine some time after the create returns.        *)
@@ -88,16 +87,17 @@ Live(m) == mstate[m] \in {"Starting", "Up"}
 IsEph(m) == job[m] # NoJob
 Kept(m) == job[m] = NoJob /\ mstate[m] # "Gone"
 PastTtl(m) == IsEph(m) /\ age[m] = 2
-Boxes == Count({m \in Machines : Live(m)})
-ToolBoxes == Count({m \in Machines : Live(m) /\ Vis(m)})
+Boxes == Cardinality({m \in Machines : Live(m)})
+ToolBoxes == Cardinality({m \in Machines : Live(m) /\ Vis(m)})
 Queued == {j \in Jobs : status[j] = "Queued"}
-UpKept == Count({m \in Machines : Kept(m) /\ mstate[m] = "Up"})
+UpKept == Cardinality({m \in Machines : Kept(m) /\ mstate[m] = "Up"})
 StoppedKept == {m \in Machines : Kept(m) /\ mstate[m] = "Stopped"}
 
 \* Expired is GitHub's Registered past register_timeout_s: decide unregisters it,
 \* so it is not supply. A runner on a machine that is not Up is unregistered too.
-Supply == Count({m \in Machines : mstate[m] = "Up" /\ runner[m] \in {"Registered", "Idle"}})
-Want0 == Count(Queued) - Supply
+Supply ==
+    Cardinality({m \in Machines : mstate[m] = "Up" /\ runner[m] \in {"Registered", "Idle"}})
+Want0 == Cardinality(Queued) - Supply
 
 Fresh == {m \in Machines : /\ IsEph(m) /\ mstate[m] = "Up" /\ runner[m] = "None"
                            /\ ~seen[m] /\ age[m] = 0}
@@ -106,11 +106,11 @@ FreeKept ==
     THEN {m \in Machines : Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
     ELSE {}
 \* A Starting ephemeral machine past its TTL is deleted this tick, so it is not pending.
-Pending == Count({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
+Pending == Cardinality({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
 \* decide's want after registers and pending, without its saturating steps: each
 \* step subtracts a non-negative amount, so the sign comes out the same.
-WantStart == Want0 - Count(Fresh) - Count(FreeKept) - Pending
-Short == MinUp - Count({m \in Machines : Kept(m) /\ Live(m) /\ Vis(m)})
+WantStart == Want0 - Cardinality(Fresh) - Cardinality(FreeKept) - Pending
+Short == MinUp - Cardinality({m \in Machines : Kept(m) /\ Live(m) /\ Vis(m)})
 
 \* Starts.take() with run::start re-reading the quote after every start, so the
 \* price is the one for the next start.
@@ -205,7 +205,7 @@ StopGuard(m) ==
     /\ mstate[m] = "Up"
     /\ runner[m] \notin {"Busy", "Registered", "Expired"}
     /\ idle[m]
-    /\ UpKept - Count({n \in Machines : plan[n] = "Stop"}) > MinUp
+    /\ UpKept - Cardinality({n \in Machines : plan[n] = "Stop"}) > MinUp
     /\ WantStart <= 0
     /\ ~RegisterPick(m)
 
