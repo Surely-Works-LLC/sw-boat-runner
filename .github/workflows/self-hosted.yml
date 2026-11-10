@@ -1,54 +1,26 @@
 name: self-hosted
-# Runs this repository's tests on a boat machine that sw-boat-runner forks for the job.
-# The daemon runs in the `daemon` job for as long as the `test` job needs it, so no
-# always-on host is involved. examples/self-hosted/README.md has the setup.
+# Runs this repository's tests on a boat machine that sw-boat-runner forks for the job,
+# through the reusable `runners` workflow. Both jobs are skipped until the repository
+# variable BOAT_SNAPSHOT is set; examples/in-workflow/README.md has the setup.
 on:
   push:
     branches: [main]
   workflow_dispatch:
-# The pool is shared, so one run at a time.
-concurrency:
-  group: self-hosted
 permissions:
   contents: read
 jobs:
-  daemon:
+  runners:
     if: vars.BOAT_SNAPSHOT != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
+    uses: ./.github/workflows/runners.yml
+    with:
+      snapshot: ${{ vars.BOAT_SNAPSHOT }}
+      ref: ${{ github.sha }}
+    secrets:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
-      # Not the token Actions creates for the run: that one cannot register runners.
-      GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
-      GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
-      SNAPSHOT: ${{ vars.BOAT_SNAPSHOT }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo build --locked --release
-      - name: Policy
-        run: |
-          sed "s/BOAT_SNAPSHOT/$SNAPSHOT/" examples/self-hosted/policy.toml > policy.toml
-          target/release/sw-boat-runner check policy.toml
-      - name: Run the daemon until the test job is done and its machine is deleted
-        run: |
-          target/release/sw-boat-runner run policy.toml &
-          daemon=$!
-          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs"
-          until [ "$(gh api "$jobs" --jq '.jobs[] | select(.name == "test") | .status')" = completed ]; do
-            kill -0 "$daemon"
-            sleep 15
-          done
-          # `plan` prints nothing once there is no machine or runner left to clean up.
-          while actions=$(target/release/sw-boat-runner plan policy.toml) && [ -n "$actions" ]; do
-            kill -0 "$daemon"
-            sleep 15
-          done
-          kill "$daemon"
+      RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
   test:
     if: vars.BOAT_SNAPSHOT != ''
-    runs-on: [self-hosted, sw-boat-runner]
+    runs-on: [self-hosted, "boat-${{ github.run_id }}-${{ github.run_attempt }}"]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

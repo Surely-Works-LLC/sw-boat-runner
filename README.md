@@ -28,8 +28,15 @@ starts jobs sooner. Past them, its jobs are extra starts at $0.03 to $0.07 each.
 
 ## Connect a repository
 
-The daemon is one process for one repository. It keeps no database, so it runs on any
-host that stays up and can be restarted at any time.
+The daemon is one process for one repository. It keeps no database and can be restarted
+at any time. Something has to run it, because a runner must be registered before a job
+can use it; changing `runs-on` alone is not enough. There are three ways:
+
+| Where the daemon runs | You add | Saves starts |
+| - | - | - |
+| [Inside the workflow](examples/in-workflow/) | one job and two secrets | no: one start per job, each on a fresh machine from your snapshot |
+| [On a small boat machine](examples/always-on/) | one machine, about $13 a month | yes |
+| On any host you keep up | the steps below | yes |
 
 1. Install it:
 
@@ -86,9 +93,8 @@ The daemon creates machines with `noEnv`, so boat adds none of the account's sec
 labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
 ignores every other machine and runner. To update the runner, rebuild the snapshot.
 
-[examples/self-hosted/](examples/self-hosted/) is a complete setup: this repository's
-[`self-hosted` workflow](.github/workflows/self-hosted.yml) has the daemon fork a machine
-for its own tests.
+This repository runs its own tests through the first option, in its
+[`self-hosted` workflow](.github/workflows/self-hosted.yml).
 
 ## Policy
 

@@ -1,0 +1,89 @@
+name: runners
+# Reusable: runs sw-boat-runner for the length of the calling workflow run, with a `fork`
+# pool that only this run's jobs can use. examples/in-workflow/README.md has the caller's
+# side.
+on:
+  workflow_call:
+    inputs:
+      snapshot:
+        description: The boat snapshot machines start from.
+        required: true
+        type: string
+      machine_type:
+        description: small, default, large or xlarge.
+        default: default
+        type: string
+      max_boxes:
+        description: Most machines up or starting at once.
+        default: 4
+        type: number
+      ref:
+        description: The sw-boat-runner commit, tag or branch to build.
+        default: main
+        type: string
+    secrets:
+      BOAT_API_KEY:
+        required: true
+      RUNNER_ADMIN_TOKEN:
+        description: >-
+          A fine-grained token for the calling repository with Administration read and
+          write and Actions read. The token Actions creates for the run cannot register
+          runners.
+        required: true
+permissions:
+  contents: read
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
+      GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      SNAPSHOT: ${{ inputs.snapshot }}
+      MACHINE_TYPE: ${{ inputs.machine_type }}
+      MAX_BOXES: ${{ inputs.max_boxes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Surely-Works-LLC/sw-boat-runner
+          ref: ${{ inputs.ref }}
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release
+      # The pool's label names this run and attempt, so no other run's daemon sees its
+      # jobs and two runs never share a pool.
+      - name: Policy
+        run: |
+          cat > policy.toml <<TOML
+          repo = "$GITHUB_REPOSITORY"
+
+          [[pool]]
+          name = "run_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          labels = ["self-hosted", "boat-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"]
+          machine_type = "$MACHINE_TYPE"
+          snapshot = "$SNAPSHOT"
+          preset = "fork"
+          max_boxes = $MAX_BOXES
+          TOML
+          target/release/sw-boat-runner check policy.toml
+      - name: Run the daemon until the run's other jobs are done and their machines are deleted
+        run: |
+          target/release/sw-boat-runner run policy.toml &
+          daemon=$!
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          # This job is the one that is never completed. A job behind `needs` is listed
+          # only once it is queued, so the run must look finished twice in a row.
+          idle=0
+          while [ "$idle" -lt 2 ]; do
+            kill -0 "$daemon"
+            sleep 30
+            open=$(gh api "$jobs" --jq '[.jobs[] | select(.status != "completed")] | length')
+            if [ "$open" -le 1 ]; then idle=$((idle + 1)); else idle=0; fi
+          done
+          # `plan` prints nothing once there is no machine or runner left to clean up.
+          while actions=$(target/release/sw-boat-runner plan policy.toml) && [ -n "$actions" ]; do
+            kill -0 "$daemon"
+            sleep 15
+          done
+          kill "$daemon"
