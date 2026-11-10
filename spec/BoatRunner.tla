@@ -125,7 +125,6 @@ LostOnes == \E m \in Machines : lag[m] = "Lost"
 StartOK == /\ BudgetOK /\ ToolBoxes < BoxCap
            /\ ~(FixKeptInflight /\ Orphans) /\ ~(FixLostCreate /\ LostOnes)
 Pay == spent_today' = spent_today + Price
-Paid == IF starts > Included THEN starts - Included ELSE 0
 
 FreeIds == {m \in Machines : mstate[m] = "Gone" /\ runner[m] = "None"}
 
@@ -605,8 +604,9 @@ OneJobPerRunner ==
 \* 3
 MaxBoxes == Boxes <= BoxCap
 
-\* 4: boat's own count of paid starts, against the cap, across restarts.
-StartBudget == Paid <= PaidBudget
+\* 4: boat's own count of starts, past the included ones, against the cap,
+\* across restarts.
+StartBudget == starts <= Included + PaidBudget
 
 \* 5: at most one live fork per job; a key reused after its machine is Gone is
 \* allowed. Ephemeral machines are never stopped, so not Gone means live.
