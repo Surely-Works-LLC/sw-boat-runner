@@ -26,9 +26,10 @@ const DEFAULT_RETRY_S: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// boat refused to start a machine (429, or 503 `no_ready_machine`/`out_of_capacity`).
-    /// The start is not counted; try again after `retry_after_s`.
-    RefusedStart {
+    /// boat refused the call for now: a 429 (a start limit, a rate limit), or a 503
+    /// `no_ready_machine`/`out_of_capacity`. A refused start is not counted; try again
+    /// after `retry_after_s`.
+    Refused {
         code: String,
         retry_after_s: u64,
     },
@@ -72,12 +73,12 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::RefusedStart {
+            Error::Refused {
                 code,
                 retry_after_s,
             } => write!(
                 f,
-                "boat refused the start ({code}), retry in {retry_after_s}s"
+                "boat refused the call ({code}), retry in {retry_after_s}s"
             ),
             Error::Conflict { code } => write!(f, "boat conflict ({code})"),
             Error::BillingRequired => write!(f, "boat billing required"),
@@ -321,11 +322,11 @@ pub(crate) fn map_error(resp: &Response) -> Error {
         .or_else(|| body.get("retryAfter").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_RETRY_S);
     match resp.status {
-        429 => Error::RefusedStart {
+        429 => Error::Refused {
             code,
             retry_after_s,
         },
-        503 if code == "no_ready_machine" || code == "out_of_capacity" => Error::RefusedStart {
+        503 if code == "no_ready_machine" || code == "out_of_capacity" => Error::Refused {
             code,
             retry_after_s,
         },
@@ -367,7 +368,7 @@ mod tests {
     fn maps_errors() {
         assert_eq!(
             err(429, &[("Retry-After", "30")], r#"{"code":"limit_reached"}"#),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "limit_reached".into(),
                 retry_after_s: 30
             }
@@ -378,14 +379,14 @@ mod tests {
                 &[],
                 r#"{"ok":false,"code":"no_ready_machine","retryAfterSeconds":5}"#
             ),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "no_ready_machine".into(),
                 retry_after_s: 5
             }
         );
         assert_eq!(
             err(503, &[], r#"{"error":{"code":"out_of_capacity"}}"#),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "out_of_capacity".into(),
                 retry_after_s: DEFAULT_RETRY_S
             }

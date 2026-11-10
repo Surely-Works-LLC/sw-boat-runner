@@ -705,7 +705,7 @@ impl<'a> Loop<'a> {
                 }
                 Ok(())
             }
-            Err(e @ boat::Error::RefusedStart { retry_after_s, .. }) => {
+            Err(e @ boat::Error::Refused { retry_after_s, .. }) => {
                 self.starts_blocked_until = now.saturating_add(retry_after_s);
                 starts.open = false;
                 Err(e.into())

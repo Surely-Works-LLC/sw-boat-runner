@@ -277,7 +277,7 @@ struct StartBudget {
 
 impl StartBudget {
     fn take(&mut self) -> bool {
-        // Every start this tick is priced at `next_start_cents`; boat reports no more.
+        // Every start this tick is priced at `next_start_cents`, the one quote the snapshot has.
         let price = u64::from(self.limits.next_start_cents);
         let spent = u64::from(self.limits.spent_today_cents) + (self.taken + 1) * price;
         let affordable = price == 0 || spent <= u64::from(self.cap);
