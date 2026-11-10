@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" height="430" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title id="t">boat starts per day against CI jobs per day</title>
+<desc id="d">Simulated. runs-on: boat makes one start per job; the warm and hybrid presets stay far below the plan's included starts. bench/results.csv has the numbers.</desc>
+<style>
+.bg{fill:#fcfcfb} .ink{fill:#0b0b0b} .dim{fill:#52514e} .grid{stroke:#e4e3df} .ref{stroke:#8a8983}
+.s0{stroke:#2a78d6} .f0{fill:#2a78d6} .s1{stroke:#eb6834} .f1{fill:#eb6834} .s2{stroke:#1baf7a} .f2{fill:#1baf7a} 
+@media (prefers-color-scheme: dark){
+.bg{fill:#1a1a19} .ink{fill:#f0efec} .dim{fill:#c3c2b7} .grid{stroke:#34332f} .ref{stroke:#8f8e86}
+.s0{stroke:#3987e5} .f0{fill:#3987e5} .s1{stroke:#d95926} .f1{fill:#d95926} .s2{stroke:#199e70} .f2{fill:#199e70} 
+}
+</style>
+<rect class="bg" width="760" height="430" rx="8"/>
+<text class="ink" x="64" y="28" font-size="15" font-weight="600">boat starts per day</text>
+<text class="dim" x="64" y="46" font-size="12">one simulated day per point; the daemon's real loop against a mocked boat and GitHub</text>
+<line class="grid" x1="64" x2="610" y1="382" y2="382"/>
+<text class="dim" x="56" y="386" font-size="11" text-anchor="end">0</text>
+<text class="dim" x="64" y="400" font-size="11" text-anchor="middle">0</text>
+<line class="grid" x1="64" x2="610" y1="318.4" y2="318.4"/>
+<text class="dim" x="56" y="322.4" font-size="11" text-anchor="end">1000</text>
+<text class="dim" x="173.2" y="400" font-size="11" text-anchor="middle">1000</text>
+<line class="grid" x1="64" x2="610" y1="254.8" y2="254.8"/>
+<text class="dim" x="56" y="258.8" font-size="11" text-anchor="end">2000</text>
+<text class="dim" x="282.4" y="400" font-size="11" text-anchor="middle">2000</text>
+<line class="grid" x1="64" x2="610" y1="191.20000000000002" y2="191.20000000000002"/>
+<text class="dim" x="56" y="195.20000000000002" font-size="11" text-anchor="end">3000</text>
+<text class="dim" x="391.59999999999997" y="400" font-size="11" text-anchor="middle">3000</text>
+<line class="grid" x1="64" x2="610" y1="127.6" y2="127.6"/>
+<text class="dim" x="56" y="131.6" font-size="11" text-anchor="end">4000</text>
+<text class="dim" x="500.8" y="400" font-size="11" text-anchor="middle">4000</text>
+<line class="grid" x1="64" x2="610" y1="64" y2="64"/>
+<text class="dim" x="56" y="68" font-size="11" text-anchor="end">5000</text>
+<text class="dim" x="610" y="400" font-size="11" text-anchor="middle">5000</text>
+<text class="dim" x="337" y="420" font-size="12" text-anchor="middle">CI jobs per day</text>
+<line class="ref" x1="64" x2="610" y1="302.5" y2="302.5" stroke-dasharray="4 4"/>
+<text class="dim" x="610" y="295.5" font-size="11" text-anchor="end">included in the plan (about 1250 a day, estimated)</text>
+<polyline class="s0" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,375.1 88.5,367.8 115.7,351.9 169.1,320.8 231.9,284.2 282.4,254.8 384.8,195.1 585.1,78.5"/>
+<circle class="f0" cx="75.8" cy="375.1" r="3"/>
+<circle class="f0" cx="88.5" cy="367.8" r="3"/>
+<circle class="f0" cx="115.7" cy="351.9" r="3"/>
+<circle class="f0" cx="169.1" cy="320.8" r="3"/>
+<circle class="f0" cx="231.9" cy="284.2" r="3"/>
+<circle class="f0" cx="282.4" cy="254.8" r="3"/>
+<circle class="f0" cx="384.8" cy="195.1" r="3"/>
+<circle class="f0" cx="585.1" cy="78.5" r="3"/>
+<text class="ink" x="595.1" y="82.5" font-size="12">runs-on: boat: 4772</text>
+<polyline class="s1" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,379.7 88.5,378.7 115.7,378.4 169.1,376.7 231.9,376.0 282.4,375.6 384.8,374.6 585.1,374.4"/>
+<circle class="f1" cx="75.8" cy="379.7" r="3"/>
+<circle class="f1" cx="88.5" cy="378.7" r="3"/>
+<circle class="f1" cx="115.7" cy="378.4" r="3"/>
+<circle class="f1" cx="169.1" cy="376.7" r="3"/>
+<circle class="f1" cx="231.9" cy="376.0" r="3"/>
+<circle class="f1" cx="282.4" cy="375.6" r="3"/>
+<circle class="f1" cx="384.8" cy="374.6" r="3"/>
+<circle class="f1" cx="585.1" cy="374.4" r="3"/>
+<text class="ink" x="595.1" y="378.4" font-size="12">warm: 119</text>
+<polyline class="s2" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,381.2 88.5,379.2 115.7,372.7 169.1,355.9 231.9,327.4 282.4,302.7 384.8,302.5 585.1,302.5"/>
+<circle class="f2" cx="75.8" cy="381.2" r="3"/>
+<circle class="f2" cx="88.5" cy="379.2" r="3"/>
+<circle class="f2" cx="115.7" cy="372.7" r="3"/>
+<circle class="f2" cx="169.1" cy="355.9" r="3"/>
+<circle class="f2" cx="231.9" cy="327.4" r="3"/>
+<circle class="f2" cx="282.4" cy="302.7" r="3"/>
+<circle class="f2" cx="384.8" cy="302.5" r="3"/>
+<circle class="f2" cx="585.1" cy="302.5" r="3"/>
+<text class="ink" x="595.1" y="306.5" font-size="12">hybrid: 1250</text>
+</svg>

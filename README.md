@@ -1,30 +1,44 @@
 # sw-boat-runner
 
 A daemon that runs self-hosted GitHub Actions runners on [boat](https://boat.dev)
-machines for one repository. boat's managed `runs-on: boat` starts a machine for every
-job, and starts past the plan's allowance cost money. This tool keeps machines up
-between jobs, stops them when idle, and forks a fresh one only when a job needs it.
+machines for one repository, and reuses the machines across jobs.
+
+We love boat and keep using it. Its managed `runs-on: boat` is the simplest way to run
+CI there, but it starts a machine for every job, and a busy repository runs more jobs in
+a day than its plan includes starts. This daemon keeps machines up between jobs, stops
+them when idle, and forks a fresh one only when a job needs it.
 
 Every 15 seconds it lists the pool's boat machines, the repository's runners and its
-queued jobs. It then decides what to do and does it. Each runner is a just-in-time
-runner that takes one job and exits. [docs/design.md](docs/design.md) has the full
-design.
+queued jobs, decides what to do, and does it. Each runner is a just-in-time runner that
+takes one job and exits. [docs/design.md](docs/design.md) has the full design.
 
-## Safety properties
+## Starts per day
 
-[spec/BoatRunner.tla](spec/BoatRunner.tla) models the loop together with boat, GitHub,
-crashes, timeouts and listing lag. TLC checks these safety properties in CI:
+![boat starts per day against CI jobs per day: runs-on: boat grows one start per job, the warm preset stays near 100](bench/starts.svg)
 
-- `NoBusyStop`: no machine is stopped or deleted while its runner runs a job.
-- `OneJobPerRunner`: a runner takes at most one job.
-- `MaxBoxes`: a pool never has more than `max_boxes` live machines.
-- `StartBudget`: paid starts stay within the daily cap, across restarts.
-- `NoDoubleFork`: no two live machines for the same job.
-- `EphemeralIsolation`: in a fork pool, a job runs on a machine that has run no other job.
+`cargo run --release --example bench` simulates a day of CI at eight loads. `runs-on: boat`
+is mocked as one start per job. The daemon is not mocked: its tick loop and `decide` run
+against a mocked boat and GitHub API. [bench/](bench/) has the assumptions and
+[bench/results.csv](bench/results.csv) every number.
 
-It also checks liveness: forks are cleaned up, queued jobs get a runner when a start is
-possible, idle machines stop, and the loop settles once jobs stop arriving.
-[spec/README.md](spec/README.md) lists what the model leaves out and the bugs it found.
+| Jobs a day | Setup | Starts | Paid starts | Starts + machine time | Queue p50 / p90 |
+| - | - | - | - | - | - |
+| 962 | `runs-on: boat` | 962 | 0 | $0 + $4.82 | 8 s / 8 s |
+| | `warm` | 84 | 0 | $0 + $14.15 | 18 s / 26 s |
+| 2,000 | `runs-on: boat` | 2,000 | 750 | $27.75 + $10.15 | 8 s / 8 s |
+| | `warm` | 101 | 0 | $0 + $22.63 | 17 s / 24 s |
+| 4,772 | `runs-on: boat` | 4,772 | 3,522 | $130.31 + $24.90 | 8 s / 8 s |
+| | `warm` | 119 | 0 | $0 + $43.13 | 17 s / 24 s |
+
+Under the plan's included starts, `runs-on: boat` is cheaper and starts jobs sooner: the
+daemon's machines idle for `idle_stop_s` before they stop. Past it, every job on
+`runs-on: boat` is a paid start, while `warm` stays near 100 starts a day. `hybrid` forks
+for bursts, so its starts grow with load until the included ones run out. It then makes
+no paid start, because `paid_start_cents_per_day` defaults to 0, and jobs wait.
+
+The included starts (1,250 a day) and the start price ($0.037) are estimates read off
+one bill in [eval/results/](eval/results/example-2026-11.md), not boat's published
+numbers, and the dollar columns depend on them. The start counts do not.
 
 ## Presets
 
@@ -111,21 +125,29 @@ sw-boat-runner run policy.toml                   # the loop
 Build with `cargo build --release`. CI uploads Linux x86_64 and macOS arm64 binaries as
 workflow artifacts.
 
-## Running the TLA+ models
+## Verification
 
-`spec/BoatRunner.tla` is checked by 15 TLC models: 4 must pass, and the other 11 each
-turn one fix off and must still find its counterexample. The `tla` workflow runs them on
-`main` when `spec/` changes; pull requests skip it, so run TLC locally first.
-[spec/README.md](spec/README.md#running-tlc) has the command and the full model list.
+[spec/BoatRunner.tla](spec/BoatRunner.tla) models the loop together with boat, GitHub,
+crashes, timeouts and listing lag. TLC checks that no machine is stopped while its runner
+runs a job, a pool never exceeds `max_boxes`, paid starts stay within the daily cap across
+restarts, no job gets two machines, and a `fork` pool never runs two jobs on one machine,
+plus liveness: queued jobs get a runner and idle machines stop. The `tla` workflow runs
+the models on `main` when `spec/` changes. [spec/README.md](spec/README.md) lists what the
+model leaves out, the bugs it found, and [how to run TLC](spec/README.md#running-tlc).
+
+Property tests check `decide` against the same safety properties, and the loop is tested
+against a fake transport.
 
 ## Status
 
-The model, the property tests and the fake-transport tests pass. In November 2026 a `fork`
-pool ran against a production repository: it forked machines up to `max_boxes`, each
-machine's runner took one job, and the tool deleted the machines and their runners
-afterwards. Machines forked from a snapshot keep the snapshot's systemd timers, so remove
-cleanup timers from the snapshot before you fork it. [eval/](eval/) measures a repository's move from
-`runs-on: boat` to persistent boat runners, which is the setup this tool automates.
+In November 2026 a `fork` pool ran against a production repository: it forked machines up
+to `max_boxes`, each machine's runner took one job, and the daemon deleted the machines
+and their runners afterwards. Machines forked from a snapshot keep the snapshot's systemd
+timers, so remove cleanup timers from the snapshot before you fork it.
+
+This repository has a [dogfood workflow](dogfood/) that runs its own tests on a machine
+the daemon forks for the job. [eval/](eval/) measures a repository's move from
+`runs-on: boat` to persistent boat runners, which is the setup this daemon automates.
 
 ## License
 

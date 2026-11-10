@@ -1,14 +1,8 @@
-mod boat;
-mod decide;
-mod github;
-mod model;
-mod policy;
-mod run;
-
 use std::path::Path;
 use std::process::ExitCode;
 
-use model::Placement;
+use sw_boat_runner::model::{self, Placement};
+use sw_boat_runner::{decide, policy, run};
 
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
