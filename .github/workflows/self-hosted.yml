@@ -11,9 +11,12 @@ concurrency:
   group: self-hosted
 permissions:
   contents: read
+# Both jobs run only for main. The runner is registered on the repository, so while the
+# daemon runs it also serves any other queued job that asks for its labels, such as one
+# from a pull request that edits a workflow: examples/self-hosted/README.md#pull-requests.
 jobs:
   daemon:
-    if: vars.BOAT_SNAPSHOT != ''
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -24,6 +27,8 @@ jobs:
       SNAPSHOT: ${{ vars.BOAT_SNAPSHOT }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked --release
@@ -47,9 +52,11 @@ jobs:
           done
           kill "$daemon"
   test:
-    if: vars.BOAT_SNAPSHOT != ''
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: [self-hosted, sw-boat-runner]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - run: cargo test --locked

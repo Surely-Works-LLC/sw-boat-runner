@@ -23,3 +23,12 @@ it is set up:
   creates for each run cannot be given Administration, so it cannot register runners.
 
 CI validates the policy on every pull request with `sw-boat-runner check`.
+
+## Pull requests
+
+The runner is registered on the repository, so while the daemon runs it serves any queued
+job that asks for `[self-hosted, sw-boat-runner]`, not only this workflow's `test` job. A
+pull request can add such a job to any workflow, a fork's included once its run is
+approved. The machine is forked for that one job and deleted after it, and the job gets
+none of the daemon's secrets, but it does run that pull request's code on a boat machine.
+Approve fork pull request runs only after reading their workflow changes.
