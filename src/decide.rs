@@ -174,7 +174,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         .sum();
     want = want.saturating_sub(pending);
 
-    let mut starts = Starts {
+    let mut starts = StartBudget {
         limits: snap.limits,
         cap: pool.paid_start_cents_per_day,
         boxes: machines
@@ -296,7 +296,7 @@ fn runners_on<'a>(snap: &'a Snapshot, machine: &'a str) -> impl Iterator<Item = 
 }
 
 /// docs/design.md#start-budget and `max_boxes`, counting the starts already taken this tick.
-struct Starts {
+struct StartBudget {
     limits: Limits,
     cap: Cents,
     boxes: usize,
@@ -304,7 +304,7 @@ struct Starts {
     taken: u64,
 }
 
-impl Starts {
+impl StartBudget {
     fn take(&mut self) -> bool {
         // Every start this tick is priced at `next_start_cents`; boat reports no more.
         let price = u64::from(self.limits.next_start_cents);
@@ -339,7 +339,7 @@ mod tests {
         JobKey { id, attempt: 1 }
     }
 
-    /// Up for two hours and idle all that time.
+    /// In `state` for two hours and idle all that time.
     fn machine(id: &str, state: MachineState) -> Machine {
         Machine {
             id: id.into(),
@@ -603,12 +603,7 @@ mod tests {
             last_busy: NOW - 10,
             ..forked("m1", 1, Ms::Up)
         };
-        assert_eq!(
-            decide(&snap(vec![used], vec![], &[]), &p),
-            [Action::Delete {
-                machine: "m1".into()
-            }]
-        );
+        assert_eq!(decide(&snap(vec![used], vec![], &[]), &p), [delete("m1")]);
     }
 
     #[test]

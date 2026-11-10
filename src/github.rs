@@ -112,10 +112,9 @@ pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
 }
 
 /// GitHub reports only `online`/`offline` and `busy`, so "never came online" is what this
-/// process has not seen online: busy → `Busy`; online → `Idle`; offline after this process
-/// saw it online → `Offline`; any other offline runner → `Registered`. After a restart a
-/// runner that went offline earlier is `Registered`, and `decide` unregisters it once
-/// `register_timeout_s` has passed since its `registered_at`.
+/// process has not seen online. After a restart a runner that went offline earlier is
+/// `Registered`, and `decide` unregisters it once `register_timeout_s` has passed since its
+/// `registered_at`.
 pub fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
     if busy {
         RunnerState::Busy
@@ -208,7 +207,7 @@ impl<'t> Client<'t> {
 
         let num = |name: &str| resp.header(name).and_then(|v| v.trim().parse::<u64>().ok());
         let remaining = num("x-ratelimit-remaining");
-        let reset = num("x-ratelimit-reset").unwrap_or(self.now + 60);
+        let reset = num("x-ratelimit-reset").unwrap_or(self.now.saturating_add(60));
         if let Some(r) = remaining.filter(|&r| r < RATE_FLOOR) {
             self.limited = Some((r, reset));
         }
@@ -235,7 +234,7 @@ impl<'t> Client<'t> {
                 Ok(resp.body)
             }
             403 | 429 if remaining == Some(0) || resp.header("retry-after").is_some() => {
-                let reset = num("retry-after").map_or(reset, |s| self.now + s);
+                let reset = num("retry-after").map_or(reset, |s| self.now.saturating_add(s));
                 self.limited = Some((0, reset));
                 Err(Error::RateLimited {
                     remaining: 0,

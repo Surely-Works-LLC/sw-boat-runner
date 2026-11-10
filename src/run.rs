@@ -106,7 +106,7 @@ pub enum Error {
     MissingEnv(&'static str),
     Boat(boat::Error),
     GitHub(github::Error),
-    /// A start after boat refused one, or after the price moved, in the same tick.
+    /// A start after starts closed for this tick.
     StartsClosed,
     /// An action naming a pool or machine the snapshot does not have.
     Invalid(String),
@@ -619,8 +619,8 @@ impl<'a> Loop<'a> {
     }
 
     fn pool(&self, name: &str) -> Result<&'a Pool, Error> {
-        let cfg: &'a Config = self.cfg;
-        cfg.pools
+        self.cfg
+            .pools
             .iter()
             .find(|p| p.name == name)
             .ok_or_else(|| Error::Invalid(format!("unknown pool {name}")))
@@ -706,17 +706,10 @@ impl<'a> Loop<'a> {
                 }
                 Ok(())
             }
-            Err(boat::Error::RefusedStart {
-                code,
-                retry_after_s,
-            }) => {
-                self.starts_blocked_until = now + retry_after_s;
+            Err(e @ boat::Error::RefusedStart { retry_after_s, .. }) => {
+                self.starts_blocked_until = now.saturating_add(retry_after_s);
                 starts.open = false;
-                Err(boat::Error::RefusedStart {
-                    code,
-                    retry_after_s,
-                }
-                .into())
+                Err(e.into())
             }
             Err(e) => Err(e.into()),
         }
@@ -970,12 +963,7 @@ mod tests {
         let mut tick_loop = Loop::new(&cfg, &fake, "boat_k".into(), "gh_t".into(), STARTED);
         tick_loop.tick(NOW, decide_all).unwrap();
 
-        let register = [
-            format!("POST {GH}/runners/generate-jitconfig"),
-            format!("PUT {BOAT}/sandboxes/bx_22222222/files"),
-            format!("POST {BOAT}/sandboxes/bx_22222222/commands"),
-        ];
-        let mut expected = vec![
+        let expected = [
             format!("GET {BOAT}/sandboxes?label=sw-boat-runner%3Dci&limit=200"),
             format!("GET {GH}/runners?per_page=100&page=1"),
             format!("GET {GH}/runs?status=queued&per_page=100"),
@@ -988,14 +976,14 @@ mod tests {
             // Stop deletes the machine's runner first.
             format!("DELETE {GH}/runners/11"),
             format!("POST {BOAT}/sandboxes/bx_22222222/stop"),
-        ];
-        expected.extend(register.clone());
-        expected.extend([
+            format!("POST {GH}/runners/generate-jitconfig"),
+            format!("PUT {BOAT}/sandboxes/bx_22222222/files"),
+            format!("POST {BOAT}/sandboxes/bx_22222222/commands"),
             format!("POST {BOAT}/sandboxes/bx_33333333/resume"),
             format!("GET {BOAT}/limits"),
             format!("POST {BOAT}/sandboxes"),
             format!("GET {BOAT}/limits"),
-        ]);
+        ];
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
