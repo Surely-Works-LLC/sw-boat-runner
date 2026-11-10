@@ -1,3 +1,4 @@
 /target
-/eval/.cache
 /spec/states
+/spec/Variant.cfg
+/tla2tools.jar
