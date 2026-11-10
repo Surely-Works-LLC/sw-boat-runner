@@ -23,8 +23,9 @@ in [docs/design.md](../docs/design.md). The spec does not read Rust code.
   pending.
 - The budget. `spent_today` is the daemon's in-memory spend. Each start adds the quoted
   price, re-read after every start. With `FixForkKey` off, a fork with a reused key adds
-  it although boat starts nothing. A start needs a price of 0 or `spent_today + price <= PaidBudget`, and
-  fewer than `max_boxes` live machines.
+  it although boat starts nothing. A start needs a price of 0 or
+  `spent_today + price <= PaidBudget`, and fewer than `max_boxes` live machines that the
+  daemon can see.
 - boat's listing lag. boat lists a created machine some time after the create returns.
   Until then the machine is `Hidden` from the snapshot, or `Known` if the daemon
   remembers creating it (`FixListLag`). A create whose answer is lost while boat makes
@@ -79,9 +80,9 @@ work left fails `NoStarvation` or `Settles`.
 Each `Fix*` constant turns on one rule from
 [docs/design.md](../docs/design.md#observed-state). The code has all nine, and the main
 models set all nine to TRUE. With a flag FALSE, TLC finds a counterexample, and the `tla`
-workflow checks that it still does. TLC reproduces each trace on demand.
+workflow checks that it still does.
 
-`FixCrashSpend` (model crash-spend, breaks `StartBudget`). `spent_today` lives only in
+`FixCrashSpend` (crash-spend, `StartBudget`). `spent_today` lives only in
 memory, so a restarted daemon starts from 0 and can pay for more starts than the cap
 allows. Fix: after a restart, count the largest pool cap as spent until 00:00 UTC.
 
@@ -122,9 +123,8 @@ lists the machine if it exists.
 
 `FixLostSpend` (lost-spend, `StartBudget`). boat counts the start of a machine it made
 under a lost answer, and without the fix the daemon adds the price only when boat
-answers with a machine. Fix: a create with
-no definite answer also adds its price to `spent_today`. If boat made no machine, the
-daemon under-spends by one start.
+answers with a machine. Fix: a create with no definite answer also adds its price to
+`spent_today`. If boat made no machine, the daemon counts one start too many.
 
 ## Running TLC
 
