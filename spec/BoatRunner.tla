@@ -82,7 +82,6 @@ Has(step) == step \in Placement
 (* the machine boots; an Up machine missing from it would add only a       *)
 (* delay, since the daemon registers runners on listed machines alone.     *)
 Vis(m) == lag[m] \in {"Listed", "Known"}
-Grows == Has("resume") /\ ~Has("fork")
 Live(m) == mstate[m] \in {"Starting", "Up"}
 IsEph(m) == job[m] # NoJob
 Kept(m) == job[m] = NoJob /\ mstate[m] # "Gone"
@@ -179,7 +178,7 @@ CanResume == \E m \in Machines : ResumeGuard(m)
 ForkKeptGuard ==
     /\ Observed
     /\ NoPlan
-    /\ Short > 0 \/ (Grows /\ WantStart > 0)
+    /\ Short > 0 \/ (Has("resume") /\ ~Has("fork") /\ WantStart > 0)
     /\ ~CanResume
     /\ StartOK
     /\ FreeIds # {}
