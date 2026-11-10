@@ -56,7 +56,7 @@ VARIABLES
     jobOn,        \* GitHub: the machine running the job
     seen,         \* daemon memory: last_busy >= since on an ephemeral machine
     idle,         \* daemon memory: idle_stop_s since last_busy and min_up_s since since
-    age,          \* now - since: 0, 1 past register_timeout_s, 2 past fork_ttl_s
+    age,          \* now - since: 0, RegTimeout or ForkTtl
     plan,         \* daemon: a Stop or Delete decided this tick and not yet executed
     starts,       \* boat: counted starts today
     spent_today,  \* daemon memory: Limits.spent_today_cents, in start prices
@@ -68,10 +68,12 @@ VARIABLES
 vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
           starts, spent_today, keys, ran, lag, faults>>
 
+RegTimeout == 1   \* age past register_timeout_s
+ForkTtl == 2      \* age past fork_ttl_s
+
 -----------------------------------------------------------------------------
 (* What decide derives from one snapshot. *)
 
-Count(S) == Cardinality(S)
 Has(step) == step \in Placement
 
 (* boat lists a created machine some time after the create returns.        *)
@@ -83,34 +85,33 @@ Has(step) == step \in Placement
 (* the machine boots; an Up machine missing from it would add only a       *)
 (* delay, since the daemon registers runners on listed machines alone.     *)
 Vis(m) == lag[m] \in {"Listed", "Known"}
-Grows == Has("resume") /\ ~Has("fork")
 Live(m) == mstate[m] \in {"Starting", "Up"}
 IsEph(m) == job[m] # NoJob
 Kept(m) == job[m] = NoJob /\ mstate[m] # "Gone"
-PastTtl(m) == IsEph(m) /\ age[m] = 2
-Boxes == Count({m \in Machines : Live(m)})
-ToolBoxes == Count({m \in Machines : Live(m) /\ Vis(m)})
+PastTtl(m) == IsEph(m) /\ age[m] = ForkTtl
+Boxes == Cardinality({m \in Machines : Live(m)})
+ToolBoxes == Cardinality({m \in Machines : Live(m) /\ Vis(m)})
 Queued == {j \in Jobs : status[j] = "Queued"}
-UpKept == Count({m \in Machines : Kept(m) /\ mstate[m] = "Up"})
+UpKept == Cardinality({m \in Machines : Kept(m) /\ mstate[m] = "Up"})
 StoppedKept == {m \in Machines : Kept(m) /\ mstate[m] = "Stopped"}
 
 \* Expired is GitHub's Registered past register_timeout_s: decide unregisters it,
 \* so it is not supply. A runner on a machine that is not Up is unregistered too.
-Supply == Count({m \in Machines : mstate[m] = "Up" /\ runner[m] \in {"Registered", "Idle"}})
-Want0 == Count(Queued) - Supply
+Supply ==
+    Cardinality({m \in Machines : mstate[m] = "Up" /\ runner[m] \in {"Registered", "Idle"}})
+Want0 == Cardinality(Queued) - Supply
 
 Fresh == {m \in Machines : /\ IsEph(m) /\ mstate[m] = "Up" /\ runner[m] = "None"
                            /\ ~seen[m] /\ age[m] = 0}
 FreeKept ==
-    IF Has("slot")
-    THEN {m \in Machines : Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
-    ELSE {}
+    {m \in Machines : Has("slot") /\ Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
 \* A Starting ephemeral machine past its TTL is deleted this tick, so it is not pending.
-Pending == Count({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
+PendingBoxes ==
+    Cardinality({m \in Machines : mstate[m] = "Starting" /\ Vis(m) /\ ~PastTtl(m)})
 \* decide's want after registers and pending, without its saturating steps: each
 \* step subtracts a non-negative amount, so the sign comes out the same.
-WantStart == Want0 - Count(Fresh) - Count(FreeKept) - Pending
-Short == MinUp - Count({m \in Machines : Kept(m) /\ Live(m) /\ Vis(m)})
+WantStart == Want0 - Cardinality(Fresh) - Cardinality(FreeKept) - PendingBoxes
+Short == MinUp - Cardinality({m \in Machines : Kept(m) /\ Live(m) /\ Vis(m)})
 
 \* Starts.take() with run::start re-reading the quote after every start, so the
 \* price is the one for the next start.
@@ -124,14 +125,13 @@ LostOnes == \E m \in Machines : lag[m] = "Lost"
 StartOK == /\ BudgetOK /\ ToolBoxes < BoxCap
            /\ ~(FixKeptInflight /\ Orphans) /\ ~(FixLostCreate /\ LostOnes)
 Pay == spent_today' = spent_today + Price
-Paid == IF starts > Included THEN starts - Included ELSE 0
 
 FreeIds == {m \in Machines : mstate[m] = "Gone" /\ runner[m] = "None"}
 
 Finished(m) ==
     \/ /\ mstate[m] = "Up"
        /\ runner[m] \in {"None", "Offline"}
-       /\ seen[m] \/ age[m] >= 1
+       /\ seen[m] \/ age[m] >= RegTimeout
     \/ mstate[m] = "Stopped"
 
 \* run::observe sets last_busy for every machine with a Busy or Registered runner
@@ -180,7 +180,7 @@ CanResume == \E m \in Machines : ResumeGuard(m)
 ForkKeptGuard ==
     /\ Observed
     /\ NoPlan
-    /\ Short > 0 \/ (Grows /\ WantStart > 0)
+    /\ Short > 0 \/ (Has("resume") /\ ~Has("fork") /\ WantStart > 0)
     /\ ~CanResume
     /\ StartOK
     /\ FreeIds # {}
@@ -205,7 +205,7 @@ StopGuard(m) ==
     /\ mstate[m] = "Up"
     /\ runner[m] \notin {"Busy", "Registered", "Expired"}
     /\ idle[m]
-    /\ UpKept - Count({n \in Machines : plan[n] = "Stop"}) > MinUp
+    /\ UpKept - Cardinality({n \in Machines : plan[n] = "Stop"}) > MinUp
     /\ WantStart <= 0
     /\ ~RegisterPick(m)
 
@@ -382,7 +382,7 @@ TickAge(m) ==
     /\ IsEph(m)
     /\ Live(m)
     /\ Vis(m)
-    /\ age[m] < 2
+    /\ age[m] < ForkTtl
     /\ ~(m \in Fresh /\ Want0 > 0)
     /\ age' = [age EXCEPT ![m] = @ + 1]
     /\ UNCHANGED <<lag, mstate, job, keep, runner, status, jobOn, seen, idle, plan,
@@ -458,7 +458,7 @@ LostCreate ==
                           /\ FixForkKey \/ j \notin keys
                           /\ \E m \in FreeIds : Create(m, j, "Lost")
                           /\ keys' = IF FixForkKey THEN keys ELSE keys \cup {j}
-    /\ spent_today' = IF FixLostSpend THEN spent_today + Price ELSE spent_today
+    /\ IF FixLostSpend THEN Pay ELSE UNCHANGED spent_today
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
 
 \* boat answers 429, or 503 no_ready_machine or out_of_capacity: nothing starts,
@@ -582,7 +582,7 @@ TypeOK ==
     /\ jobOn \in [Jobs -> Machines \cup {NoMachine}]
     /\ seen \in [Machines -> BOOLEAN]
     /\ idle \in [Machines -> BOOLEAN]
-    /\ age \in [Machines -> 0..2]
+    /\ age \in [Machines -> 0..ForkTtl]
     /\ plan \in [Machines -> {"None", "Stop", "Delete"}]
     /\ starts \in Nat
     /\ spent_today \in Nat
@@ -604,8 +604,9 @@ OneJobPerRunner ==
 \* 3
 MaxBoxes == Boxes <= BoxCap
 
-\* 4: boat's own count of paid starts, against the cap, across restarts.
-StartBudget == Paid <= PaidBudget
+\* 4: boat's own count of starts, past the included ones, against the cap,
+\* across restarts.
+StartBudget == starts <= Included + PaidBudget
 
 \* 5: at most one live fork per job; a key reused after its machine is Gone is
 \* allowed. Ephemeral machines are never stopped, so not Gone means live.
@@ -613,14 +614,15 @@ NoDoubleFork ==
     \A a, b \in Machines :
         (a # b /\ mstate[a] # "Gone" /\ mstate[b] # "Gone" /\ IsEph(a)) => job[a] # job[b]
 
+\* A runner takes a job only on a machine that has run none; ran is set only on
+\* job forks.
+FirstJob == \A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]
+
 \* 6
-EphemeralIsolation ==
-    [][Placement = {"fork"} =>
-         \A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]]_vars
+EphemeralIsolation == [][Placement = {"fork"} => FirstJob]_vars
 
 \* 6 for job forks in any placement; stronger than the design asks.
-ForkIsolation ==
-    [][\A m \in Machines : (runner[m] # "Busy" /\ runner'[m] = "Busy") => ~ran[m]]_vars
+ForkIsolation == [][FirstJob]_vars
 
 \* Liveness 4
 NoLeak ==

@@ -1,0 +1,5 @@
+{"action":"unregister","pool":"ci","runner":"sbr-ci-bx_f1-0-999000"}
+{"action":"delete","machine":"bx_f1","pool":"ci"}
+{"action":"delete","machine":"bx_f2","pool":"ci"}
+{"action":"delete","machine":"bx_f5","pool":"ci"}
+{"action":"register","machine":"bx_f4","pool":"ci","slot":0}

@@ -1,0 +1,3 @@
+{"action":"register","machine":"bx_k1","pool":"ci","slot":0}
+{"action":"register","machine":"bx_k1","pool":"ci","slot":1}
+{"action":"fork","job":null,"pool":"ci"}

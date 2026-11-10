@@ -1,0 +1,116 @@
+name: runners
+# Reusable: runs sw-boat-runner for the length of the calling workflow run, with a pool
+# that only this run's jobs can use, and deletes the pool's machines at the end.
+# examples/in-workflow/README.md has the caller's side.
+on:
+  workflow_call:
+    inputs:
+      snapshot:
+        description: The boat snapshot machines start from.
+        required: true
+        type: string
+      machine_type:
+        description: small, default, large or xlarge.
+        default: default
+        type: string
+      max_boxes:
+        description: Most machines up or starting at once.
+        default: 4
+        type: number
+      pool:
+        description: >-
+          More lines for the pool's policy, such as a preset or min_up. The default gives
+          every job a fresh machine.
+        default: preset = "fork"
+        type: string
+      name:
+        description: >-
+          Lowercase letters and digits. Set it when one run calls this workflow more than
+          once; the pool's label then ends in -<name>.
+        default: ""
+        type: string
+      ref:
+        description: The sw-boat-runner commit, tag or branch to build.
+        default: main
+        type: string
+    secrets:
+      BOAT_API_KEY:
+        required: true
+      RUNNER_ADMIN_TOKEN:
+        description: >-
+          A fine-grained token for the calling repository with Administration read and
+          write and Actions read. The token Actions creates for the run cannot register
+          runners.
+        required: true
+permissions: {}
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    # Checkout is the only use of the run's own token. The daemon and `gh` use the secrets,
+    # which only the steps that call them get, not the build.
+    permissions:
+      contents: read
+    env:
+      SNAPSHOT: ${{ inputs.snapshot }}
+      MACHINE_TYPE: ${{ inputs.machine_type }}
+      MAX_BOXES: ${{ inputs.max_boxes }}
+      POOL: ${{ inputs.pool }}
+      NAME: ${{ inputs.name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Surely-Works-LLC/sw-boat-runner
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release
+      # The pool's label names this run and attempt, so no other run's daemon sees its
+      # jobs and two runs never share a pool.
+      - name: Policy
+        run: |
+          id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${NAME:+-$NAME}"
+          cat > policy.toml <<TOML
+          repo = "$GITHUB_REPOSITORY"
+
+          [[pool]]
+          name = "run_$(echo "$id" | tr - _)"
+          labels = ["self-hosted", "boat-$id"]
+          machine_type = "$MACHINE_TYPE"
+          snapshot = "$SNAPSHOT"
+          max_boxes = $MAX_BOXES
+          $POOL
+          TOML
+          target/release/sw-boat-runner check policy.toml
+      - name: Run the daemon until the run's other jobs are done
+        env:
+          BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          target/release/sw-boat-runner run policy.toml &
+          daemon=$!
+          jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
+          # Every job but the daemons themselves. A job behind `needs` is listed only once
+          # it is queued, so the run must look finished twice in a row.
+          open='[.jobs[] | select(.status != "completed" and (.name | endswith("daemon") | not))] | length'
+          idle=0
+          while [ "$idle" -lt 2 ]; do
+            kill -0 "$daemon"
+            sleep 30
+            if [ "$(gh api "$jobs" --jq "$open")" -eq 0 ]; then idle=$((idle + 1)); else idle=0; fi
+          done
+          kill "$daemon"
+      - name: Delete the pool's machines and runners
+        if: always()
+        env:
+          BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          [ -f policy.toml ] || exit 0
+          for _ in $(seq 20); do
+            if target/release/sw-boat-runner drain policy.toml; then exit 0; fi
+            sleep 15
+          done
+          exit 1

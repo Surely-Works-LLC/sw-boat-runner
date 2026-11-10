@@ -1,0 +1,73 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_k1",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 990000,
+      "job": null
+    },
+    {
+      "id": "bx_k2",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 990000,
+      "job": null
+    }
+  ],
+  "runners": [
+    {
+      "name": "sbr-ci-bx_k1-0-999900",
+      "pool": "ci",
+      "machine": "bx_k1",
+      "slot": 0,
+      "registered_at": 999900,
+      "state": "registered"
+    },
+    {
+      "name": "sbr-ci-bx_k1-1-999000",
+      "pool": "ci",
+      "machine": "bx_k1",
+      "slot": 1,
+      "registered_at": 999000,
+      "state": "busy"
+    },
+    {
+      "name": "sbr-ci-bx_k2-0-999000",
+      "pool": "ci",
+      "machine": "bx_k2",
+      "slot": 0,
+      "registered_at": 999000,
+      "state": "busy"
+    },
+    {
+      "name": "sbr-ci-bx_k2-1-999000",
+      "pool": "ci",
+      "machine": "bx_k2",
+      "slot": 1,
+      "registered_at": 999000,
+      "state": "busy"
+    }
+  ],
+  "queued": [
+    {
+      "key": {
+        "id": 1,
+        "attempt": 1
+      },
+      "labels": [
+        "self-hosted",
+        "Linux",
+        "pool-a"
+      ]
+    }
+  ],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  }
+}

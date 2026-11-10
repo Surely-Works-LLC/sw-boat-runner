@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" height="430" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title id="t">boat starts per day against CI jobs per day</title>
-<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the plan's included starts. bench/results.csv has the numbers.</desc>
+<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the $100 plan's included starts. bench/results.csv has the numbers.</desc>
 <style>
 .bg{fill:#fcfcfb} .ink{fill:#0b0b0b} .dim{fill:#52514e} .grid{stroke:#e4e3df} .ref{stroke:#8a8983}
 .s0{stroke:#2a78d6} .f0{fill:#2a78d6} .s1{stroke:#eb6834} .f1{fill:#eb6834} .s2{stroke:#1baf7a} .f2{fill:#1baf7a} 
@@ -31,8 +31,14 @@
 <text class="dim" x="56" y="68" font-size="11" text-anchor="end">5000</text>
 <text class="dim" x="610" y="400" font-size="11" text-anchor="middle">5000</text>
 <text class="dim" x="337" y="420" font-size="12" text-anchor="middle">CI jobs per day</text>
-<line class="ref" x1="64" x2="610" y1="302.5" y2="302.5" stroke-dasharray="4 4"/>
-<text class="dim" x="610" y="295.5" font-size="11" text-anchor="end">included in the plan (about 1250 a day, estimated)</text>
+<line class="ref" x1="64" x2="610" y1="369.3" y2="369.3" stroke-dasharray="4 4"/>
+<text class="dim" x="610" y="363.3" font-size="11" text-anchor="end">$20 plan includes 200 a day</text>
+<line class="ref" x1="64" x2="610" y1="275.2" y2="275.2" stroke-dasharray="4 4"/>
+<text class="dim" x="610" y="269.2" font-size="11" text-anchor="end">$500 plan includes 1680 a day</text>
+<line class="ref" x1="64" x2="610" y1="229.4" y2="229.4" stroke-dasharray="4 4"/>
+<text class="dim" x="610" y="223.4" font-size="11" text-anchor="end">$2000 plan includes 2400 a day</text>
+<line class="ref" x1="64" x2="610" y1="328.6" y2="328.6" stroke-dasharray="4 4"/>
+<text class="dim" x="610" y="322.6" font-size="11" text-anchor="end">$100 plan includes 840 a day (simulated)</text>
 <polyline class="s0" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,375.1 88.5,367.8 115.7,351.9 169.1,320.8 231.9,284.2 282.4,254.8 384.8,195.1 585.1,78.5"/>
 <circle class="f0" cx="75.8" cy="375.1" r="3"/>
 <circle class="f0" cx="88.5" cy="367.8" r="3"/>
@@ -53,14 +59,14 @@
 <circle class="f1" cx="384.8" cy="374.9" r="3"/>
 <circle class="f1" cx="585.1" cy="374.5" r="3"/>
 <text class="ink" x="595.1" y="378.5" font-size="12">warm: 118</text>
-<polyline class="s2" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,381.4 88.5,379.1 115.7,373.9 169.1,355.9 231.9,326.5 282.4,302.5 384.8,302.5 585.1,302.5"/>
+<polyline class="s2" fill="none" stroke-width="2" stroke-linejoin="round" points="75.8,381.4 88.5,379.1 115.7,373.9 169.1,355.9 231.9,328.6 282.4,328.6 384.8,328.6 585.1,328.6"/>
 <circle class="f2" cx="75.8" cy="381.4" r="3"/>
 <circle class="f2" cx="88.5" cy="379.1" r="3"/>
 <circle class="f2" cx="115.7" cy="373.9" r="3"/>
 <circle class="f2" cx="169.1" cy="355.9" r="3"/>
-<circle class="f2" cx="231.9" cy="326.5" r="3"/>
-<circle class="f2" cx="282.4" cy="302.5" r="3"/>
-<circle class="f2" cx="384.8" cy="302.5" r="3"/>
-<circle class="f2" cx="585.1" cy="302.5" r="3"/>
-<text class="ink" x="595.1" y="306.5" font-size="12">hybrid: 1250</text>
+<circle class="f2" cx="231.9" cy="328.6" r="3"/>
+<circle class="f2" cx="282.4" cy="328.6" r="3"/>
+<circle class="f2" cx="384.8" cy="328.6" r="3"/>
+<circle class="f2" cx="585.1" cy="328.6" r="3"/>
+<text class="ink" x="595.1" y="332.6" font-size="12">hybrid: 840</text>
 </svg>

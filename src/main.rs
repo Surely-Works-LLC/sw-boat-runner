@@ -7,7 +7,8 @@ use sw_boat_runner::{decide, policy, run};
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
        sw-boat-runner plan <policy.toml> [snapshot.json]
-       sw-boat-runner run <policy.toml>";
+       sw-boat-runner run <policy.toml>
+       sw-boat-runner drain <policy.toml>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
             with_policy(policy, |cfg| cmd_plan(cfg, Some(Path::new(snapshot))))
         }
         ["run", policy] => with_policy(policy, cmd_run),
+        ["drain", policy] => with_policy(policy, cmd_drain),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -101,6 +103,21 @@ fn cmd_plan(cfg: &model::Config, snapshot: Option<&Path>) -> ExitCode {
 fn read_snapshot(path: &Path) -> Result<model::Snapshot, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Fails while a machine is left, so a script can repeat it until the pools are empty.
+fn cmd_drain(cfg: &model::Config) -> ExitCode {
+    match run::drain(cfg) {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(left) => {
+            eprintln!("drain: {left} machines left");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("drain: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_run(cfg: &model::Config) -> ExitCode {

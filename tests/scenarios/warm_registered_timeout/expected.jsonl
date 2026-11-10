@@ -1,0 +1,2 @@
+{"action":"unregister","pool":"ci","runner":"sbr-ci-bx_k1-0-999600"}
+{"action":"register","machine":"bx_k1","pool":"ci","slot":0}

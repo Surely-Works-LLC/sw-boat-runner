@@ -14,18 +14,26 @@ use sw_boat_runner::{decide, github, policy};
 
 const TICK_S: u64 = 15;
 const DAY_S: u64 = 86_400;
-/// The measured day starts here; the daemon starts an hour earlier, so its restart
-/// rules have run out by then.
+/// The measured day starts here. The simulation starts an hour earlier, so the daemon's
+/// restart rules have run out by then.
 const DAY_START: u64 = 20_000 * DAY_S;
+const SIM_START: u64 = DAY_START - 3_600;
 /// Jobs created during the day get this long after it to finish.
 const DRAIN_S: u64 = 4 * 3_600;
 
-/// Starts a day the plan includes. boat's docs were not reachable when this was
-/// written; 1,250 is read off the bill in eval/results/example-2026-11.md.
-const INCLUDED_STARTS_PER_DAY: u64 = 1_250;
-/// $70.79 for 1,915 extra starts on the same bill.
-const START_CENTS: f64 = 3.7;
-/// A `large` machine, from docs/design.md.
+/// The $100 plan's included starts per minute, hour and day
+/// (https://docs.boat.dev/limits.md), as (window seconds, included, most with extra starts).
+/// boat's windows roll; these are counted per clock minute, hour and day, which gives the
+/// daily bill of the worked example on https://docs.boat.dev/ci.md.
+const START_WINDOWS: [(u64, u64, u64); 3] = [
+    (60, 30, 3 * 30),
+    (3_600, 210, 6 * 210),
+    (DAY_S, 840, 6 * 840),
+];
+const INCLUDED_STARTS_PER_DAY: u64 = 840;
+/// Included starts a day on the other plans, for the chart.
+const OTHER_PLANS: [(&str, u64); 3] = [("$20", 200), ("$500", 1_680), ("$2000", 2_400)];
+/// A `large` machine, from https://docs.boat.dev/pricing.md.
 const MACHINE_CENTS_PER_HOUR: f64 = 7.2;
 /// boat's median wait for a `runs-on: boat` job, from the same eval.
 const BOOT_S: u64 = 8;
@@ -78,14 +86,14 @@ struct Job {
     started: Option<u64>,
 }
 
-/// One day of jobs plus the hour before it. Pushes arrive as a Poisson process, six
+/// The measured day of jobs and the hour before it. Pushes arrive as a Poisson process, six
 /// times as often from 08:00 to 20:00 UTC as at night, and each queues 1 to 4 jobs.
 /// Run times are lognormal with a median of 110 s and a p90 of 10 min, as in the eval.
 fn workload(jobs_per_day: u64, seed: u64) -> Vec<Job> {
     let mut rng = Rng(seed);
     let mut jobs = Vec::new();
     let mut push = 0;
-    for t in (DAY_START - 3_600..DAY_START + DAY_S).step_by(TICK_S as usize) {
+    for t in (SIM_START..DAY_START + DAY_S).step_by(TICK_S as usize) {
         let hour = t % DAY_S / 3_600;
         let weight = if (8..20).contains(&hour) { 6.0 } else { 1.0 };
         // The weights sum to 84 over a day, and a push holds 2.5 jobs on average.
@@ -147,10 +155,12 @@ struct World {
     jobs: Vec<Job>,
     arrived: usize,
     next_id: u64,
-    starts_today: u64,
+    /// Starts so far in the current clock minute, hour and day, in `START_WINDOWS` order.
+    window_starts: [u64; 3],
     /// Counted over the measured day only.
     starts: u64,
     paid_starts: u64,
+    start_cents: u64,
     machine_s: u64,
 }
 
@@ -168,8 +178,10 @@ impl World {
                 .count();
             self.machine_s += running as u64 * (now - self.now);
         }
-        if now / DAY_S != self.now / DAY_S {
-            self.starts_today = 0;
+        for (count, (window, ..)) in self.window_starts.iter_mut().zip(START_WINDOWS) {
+            if now / window != self.now / window {
+                *count = 0;
+            }
         }
         self.now = now;
         for s in &mut self.sandboxes {
@@ -211,13 +223,45 @@ impl World {
             .retain(|r| r.busy_until.is_none_or(|t| t > now));
     }
 
-    fn count_start(&mut self) {
-        let paid = self.starts_today >= INCLUDED_STARTS_PER_DAY;
-        self.starts_today += 1;
+    /// What boat charges for a start made now, in cents: nothing inside every window's
+    /// included starts, else the highest bracket among the windows (3 cents up to 1.5
+    /// times the included number, 5 up to 2 times, 7 up to the most). `None` when a
+    /// window is at its most and boat would refuse.
+    fn next_start_cents(&self) -> Option<u64> {
+        let mut cents = 0;
+        for (count, (_, included, most)) in self.window_starts.iter().zip(START_WINDOWS) {
+            let n = count + 1;
+            cents = cents.max(match n {
+                _ if n <= included => 0,
+                _ if 2 * n <= 3 * included => 3,
+                _ if n <= 2 * included => 5,
+                _ if n <= most => 7,
+                _ => return None,
+            });
+        }
+        Some(cents)
+    }
+
+    /// Makes a start if boat allows one.
+    fn count_start(&mut self) -> bool {
+        let Some(cents) = self.next_start_cents() else {
+            return false;
+        };
+        self.window_starts.iter_mut().for_each(|count| *count += 1);
         if self.in_day() {
             self.starts += 1;
-            self.paid_starts += u64::from(paid);
+            self.paid_starts += u64::from(cents > 0);
+            self.start_cents += cents;
         }
+        true
+    }
+
+    /// boat's answer to a start it will not make.
+    fn refusal() -> (u16, Value) {
+        (
+            429,
+            json!({ "code": "rate_limited", "retryAfterSeconds": 60 }),
+        )
     }
 
     /// A fresh id in boat's format, which `github::parse_runner_name` checks.
@@ -242,12 +286,16 @@ impl World {
         let parts: Vec<&str> = path.split(['/', '?']).collect();
         match (method, parts.as_slice()) {
             ("GET", ["limits"]) => {
-                let price = if self.starts_today < INCLUDED_STARTS_PER_DAY {
-                    0.0
-                } else {
-                    START_CENTS / 100.0
-                };
-                (200, json!({ "canStart": true, "nextStartDollars": price }))
+                let price = self.next_start_cents().map(|c| c as f64 / 100.0);
+                let [minute, hour, day] = std::array::from_fn(|i| {
+                    let left = START_WINDOWS[i].1.saturating_sub(self.window_starts[i]);
+                    json!({ "remaining": left })
+                });
+                (
+                    200,
+                    json!({ "canStart": true, "nextStartDollars": price,
+                            "starts": { "minute": minute, "hour": hour, "day": day } }),
+                )
             }
             ("GET", ["sandboxes", _]) => {
                 let list: Vec<Value> = self
@@ -269,7 +317,9 @@ impl World {
                 )
             }
             ("POST", ["sandboxes"]) => {
-                self.count_start();
+                if !self.count_start() {
+                    return Self::refusal();
+                }
                 let id = self.new_id();
                 self.sandboxes.push(Sandbox {
                     id: id.clone(),
@@ -284,8 +334,8 @@ impl World {
                 let Some(State::Archived { at }) = self.sandbox(id).map(|s| s.state) else {
                     return (409, json!({ "code": "invalid_state" }));
                 };
-                if now - at >= KEEP_S {
-                    self.count_start();
+                if now - at >= KEEP_S && !self.count_start() {
+                    return Self::refusal();
                 }
                 let until = now + BOOT_S;
                 self.sandbox(id).expect("found above").state = State::Booting { until };
@@ -355,7 +405,8 @@ impl World {
                 } else {
                     Vec::new()
                 };
-                pushes.sort_unstable();
+                // GitHub lists the newest runs first.
+                pushes.sort_unstable_by(|a, b| b.cmp(a));
                 pushes.dedup();
                 pushes.truncate(100);
                 let runs: Vec<Value> = pushes.iter().map(|p| json!({ "id": p })).collect();
@@ -437,6 +488,7 @@ struct Row {
     unserved: usize,
     starts: u64,
     paid_starts: u64,
+    start_cents: u64,
     machine_hours: f64,
     queue_p50: u64,
     queue_p90: u64,
@@ -465,6 +517,7 @@ fn row(setup: &'static str, target: u64, jobs: &[Job], world: &World) -> Row {
         unserved: day.iter().filter(|j| j.started.is_none()).count(),
         starts: world.starts,
         paid_starts: world.paid_starts,
+        start_cents: world.start_cents,
         machine_hours: world.machine_s as f64 / 3_600.0,
         queue_p50: percentile(&queue, 50),
         queue_p90: percentile(&queue, 90),
@@ -477,7 +530,10 @@ fn managed(target: u64, jobs: &[Job]) -> Row {
     let mut world = World::default();
     for job in &mut jobs {
         world.advance(job.created);
-        world.count_start();
+        // With extra starts on, a job past the most boat allows fails and is not retried.
+        if !world.count_start() {
+            continue;
+        }
         job.started = Some(job.created + BOOT_S);
         if world.in_day() {
             // Cut off at midnight, as the daemon's machine time is.
@@ -495,7 +551,7 @@ fn daemon(setup: &'static str, pool: &str, target: u64, jobs: &[Job]) -> Row {
          machine_type = \"large\"\nsnapshot = \"snap\"\n{pool}\n"
     );
     let cfg = policy::parse(&text).expect("bench policy");
-    let start = DAY_START - 3_600;
+    let start = SIM_START;
     let mock = Mock(RefCell::new(World {
         now: start,
         jobs: jobs.to_vec(),
@@ -512,7 +568,7 @@ fn daemon(setup: &'static str, pool: &str, target: u64, jobs: &[Job]) -> Row {
 
 fn dollars(r: &Row) -> (f64, f64) {
     (
-        r.paid_starts as f64 * START_CENTS / 100.0,
+        r.start_cents as f64 / 100.0,
         r.machine_hours * MACHINE_CENTS_PER_HOUR / 100.0,
     )
 }
@@ -566,7 +622,7 @@ fn svg(rows: &[Row]) -> String {
     let mut s = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title id="t">boat starts per day against CI jobs per day</title>
-<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the plan's included starts. bench/results.csv has the numbers.</desc>
+<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the $100 plan's included starts. bench/results.csv has the numbers.</desc>
 <style>
 .bg{{fill:#fcfcfb}} .ink{{fill:#0b0b0b}} .dim{{fill:#52514e}} .grid{{stroke:#e4e3df}} .ref{{stroke:#8a8983}}
 {light}
@@ -594,17 +650,30 @@ fn svg(rows: &[Row]) -> String {
         )
         .unwrap();
     }
-    let included = y(INCLUDED_STARTS_PER_DAY as f64);
     writeln!(
         s,
-        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>
-<line class="ref" x1="{left}" x2="{x_end}" y1="{included}" y2="{included}" stroke-dasharray="4 4"/>
-<text class="dim" x="{x_end}" y="{ly}" font-size="11" text-anchor="end">included in the plan (about {INCLUDED_STARTS_PER_DAY} a day, estimated)</text>"#,
+        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>"#,
         mid = x(max / 2.0),
         by = H - 10.0,
-        ly = included - 7.0,
     )
     .unwrap();
+    // Each plan's included starts a day; the simulated plan is spelled out.
+    let simulated = ("$100", INCLUDED_STARTS_PER_DAY);
+    for (plan, included) in OTHER_PLANS.into_iter().chain([simulated]) {
+        let note = if plan == simulated.0 {
+            " (simulated)"
+        } else {
+            ""
+        };
+        writeln!(
+            s,
+            r#"<line class="ref" x1="{left}" x2="{x_end}" y1="{y0}" y2="{y0}" stroke-dasharray="4 4"/>
+<text class="dim" x="{x_end}" y="{ly}" font-size="11" text-anchor="end">{plan} plan includes {included} a day{note}</text>"#,
+            y0 = y(included as f64),
+            ly = y(included as f64) - 6.0,
+        )
+        .unwrap();
+    }
     for (i, (name, _, _)) in SERIES.iter().enumerate() {
         let series: Vec<&Row> = rows.iter().filter(|r| r.setup == *name).collect();
         let points: Vec<(f64, f64)> = series
@@ -645,7 +714,17 @@ fn svg(rows: &[Row]) -> String {
     s
 }
 
+/// `bench <jobs per day> <pool fields>` runs one setup and prints its CSV row, writing no
+/// files. A literal `\n` in the fields separates lines.
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [target, pool] = args.as_slice() {
+        let target = target.parse().expect("jobs per day must be a number");
+        let jobs = workload(target, 7);
+        let row = daemon("custom", &pool.replace("\\n", "\n"), target, &jobs);
+        print!("{}", csv(std::slice::from_ref(&row)));
+        return;
+    }
     let mut rows = Vec::new();
     for target in LOADS {
         let jobs = workload(target, 7);

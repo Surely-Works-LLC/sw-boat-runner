@@ -50,6 +50,9 @@ in [docs/design.md](../docs/design.md). The spec does not read Rust code.
 - Stopping is folded into Stopped. HTTP errors other than a refused start, a lost
   create and a failed runner delete are not modelled. A lost create of a machine boat
   never made behaves like a refused start with a longer wait.
+- A stopped machine keeps its disk. The daemon's delete of a machine whose disk boat
+  removed, and its cap on free starts per tick, are not modelled: the model makes one
+  start per step.
 - The listing lag is shorter than the `FixListLag` memory, the lost-create wait
   (`HTTP_TIMEOUT` plus one tick) and the restart wait. A lag in GitHub's runner list is
   not modelled.

@@ -1,0 +1,11 @@
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "Linux", "pool-a"]
+machine_type = "xlarge"
+snapshot = "snap-1"
+preset = "warm"
+slots_per_box = 2
+min_up = 2
+max_boxes = 4

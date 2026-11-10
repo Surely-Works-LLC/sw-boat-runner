@@ -1,0 +1,57 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_b1",
+      "pool": "big",
+      "state": "up",
+      "since": 999000,
+      "last_busy": 999000,
+      "job": null
+    }
+  ],
+  "runners": [],
+  "queued": [
+    {
+      "key": {
+        "id": 1,
+        "attempt": 1
+      },
+      "labels": [
+        "self-hosted",
+        "Linux",
+        "pool-a"
+      ]
+    },
+    {
+      "key": {
+        "id": 2,
+        "attempt": 1
+      },
+      "labels": [
+        "self-hosted",
+        "linux",
+        "pool-a",
+        "BIG"
+      ]
+    },
+    {
+      "key": {
+        "id": 3,
+        "attempt": 1
+      },
+      "labels": [
+        "self-hosted",
+        "Linux",
+        "pool-a",
+        "big"
+      ]
+    }
+  ],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0,
+    "free_starts_left": 1
+  }
+}

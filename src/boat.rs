@@ -26,9 +26,10 @@ const DEFAULT_RETRY_S: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// boat refused to start a machine (429, or 503 `no_ready_machine`/`out_of_capacity`).
-    /// The start is not counted; try again after `retry_after_s`.
-    RefusedStart {
+    /// boat refused the call for now: a 429 (a start limit, a rate limit), or a 503
+    /// `no_ready_machine`/`out_of_capacity`. A refused start is not counted; try again
+    /// after `retry_after_s`.
+    Refused {
         code: String,
         retry_after_s: u64,
     },
@@ -72,12 +73,12 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::RefusedStart {
+            Error::Refused {
                 code,
                 retry_after_s,
             } => write!(
                 f,
-                "boat refused the start ({code}), retry in {retry_after_s}s"
+                "boat refused the call ({code}), retry in {retry_after_s}s"
             ),
             Error::Conflict { code } => write!(f, "boat conflict ({code})"),
             Error::BillingRequired => write!(f, "boat billing required"),
@@ -108,6 +109,9 @@ pub(crate) struct Limits {
     /// 0 inside every limit, `None` when boat would refuse the start.
     #[serde(default)]
     pub next_start_dollars: Option<f64>,
+    /// The fewest starts left among boat's minute, hour and day windows, if it sent them.
+    #[serde(skip)]
+    pub starts_left: Option<u64>,
 }
 
 /// boat state → model state. boat's `archived` is a stop with the disk kept, so it maps to
@@ -290,7 +294,19 @@ impl<'t> Client<'t> {
     }
 
     pub(crate) fn limits(&self) -> Result<Limits, Error> {
-        parse(self.call("GET", "/limits", None, &[])?)
+        let body = self.call("GET", "/limits", None, &[])?;
+        let starts_left = ["minute", "hour", "day"]
+            .iter()
+            .filter_map(|window| {
+                body.pointer(&format!("/starts/{window}/remaining"))?
+                    .as_u64()
+            })
+            .min();
+        let limits: Limits = parse(body)?;
+        Ok(Limits {
+            starts_left,
+            ..limits
+        })
     }
 }
 
@@ -321,11 +337,11 @@ pub(crate) fn map_error(resp: &Response) -> Error {
         .or_else(|| body.get("retryAfter").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_RETRY_S);
     match resp.status {
-        429 => Error::RefusedStart {
+        429 => Error::Refused {
             code,
             retry_after_s,
         },
-        503 if code == "no_ready_machine" || code == "out_of_capacity" => Error::RefusedStart {
+        503 if code == "no_ready_machine" || code == "out_of_capacity" => Error::Refused {
             code,
             retry_after_s,
         },
@@ -367,7 +383,7 @@ mod tests {
     fn maps_errors() {
         assert_eq!(
             err(429, &[("Retry-After", "30")], r#"{"code":"limit_reached"}"#),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "limit_reached".into(),
                 retry_after_s: 30
             }
@@ -378,14 +394,14 @@ mod tests {
                 &[],
                 r#"{"ok":false,"code":"no_ready_machine","retryAfterSeconds":5}"#
             ),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "no_ready_machine".into(),
                 retry_after_s: 5
             }
         );
         assert_eq!(
             err(503, &[], r#"{"error":{"code":"out_of_capacity"}}"#),
-            Error::RefusedStart {
+            Error::Refused {
                 code: "out_of_capacity".into(),
                 retry_after_s: DEFAULT_RETRY_S
             }
@@ -545,10 +561,27 @@ mod tests {
     }
 
     #[test]
+    fn limits_report_the_fewest_starts_left() {
+        let fake = Fake::new(|_| {
+            respond(
+                200,
+                &[],
+                r#"{"canStart":true,"nextStartDollars":0,"starts":{"unlimited":false,
+                    "minute":{"limit":10,"used":3,"remaining":7},
+                    "hour":{"limit":50,"used":46,"remaining":4},
+                    "day":{"limit":150,"used":47,"remaining":103}}}"#,
+            )
+        });
+        let limits = Client::new(&fake, "k".into()).limits().unwrap();
+        assert_eq!(limits.starts_left, Some(4));
+    }
+
+    #[test]
     fn limits_null_price() {
         let fake = Fake::new(|_| respond(200, &[], r#"{"canStart":true,"nextStartDollars":null}"#));
         let limits = Client::new(&fake, "k".into()).limits().unwrap();
         assert!(limits.can_start);
         assert_eq!(limits.next_start_dollars, None);
+        assert_eq!(limits.starts_left, None);
     }
 }

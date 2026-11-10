@@ -14,6 +14,9 @@ use crate::model::{
 };
 
 const DAY_S: u64 = 86_400;
+/// boat's 409 code for a resume of a machine whose disk it has deleted, which it may do
+/// once the machine has been stopped for 14 days.
+const DISK_EXPIRED: &str = "snapshot_data_expired";
 /// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
 /// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -180,6 +183,46 @@ fn snapshot(
     tick_loop.observe(now).map(|(snapshot, _)| snapshot)
 }
 
+/// Deletes every machine and runner of the policy's pools, for taking a pool out of use.
+/// A machine whose runner is running a job is left alone. Returns the machines still
+/// there, so a caller can repeat it until it returns 0.
+pub fn drain(cfg: &Config) -> Result<usize, Error> {
+    let (boat_key, token) = credentials()?;
+    drain_with(cfg, &Ureq::new(HTTP_TIMEOUT), boat_key, token, unix_now())
+}
+
+fn drain_with(
+    cfg: &Config,
+    t: &dyn Transport,
+    boat_key: String,
+    token: String,
+    now: UnixSecs,
+) -> Result<usize, Error> {
+    let mut tick_loop = Loop::new(cfg, t, boat_key, token, now);
+    tick_loop.tick(now, delete_everything)?;
+    tick_loop.gh.begin_tick(now);
+    let (after, _) = tick_loop.observe(now)?;
+    Ok(live(&after.machines).count())
+}
+
+fn live(machines: &[Machine]) -> impl Iterator<Item = &Machine> {
+    machines.iter().filter(|m| m.state != MachineState::Gone)
+}
+
+/// `drain`'s stand-in for `decide`.
+fn delete_everything(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
+    let runners = snap.runners.iter().filter(|r| r.pool == pool.name);
+    let machines = live(&snap.machines).filter(|m| m.pool == pool.name);
+    runners
+        .map(|r| Action::Unregister {
+            runner: r.name.clone(),
+        })
+        .chain(machines.map(|m| Action::Delete {
+            machine: m.id.clone(),
+        }))
+        .collect()
+}
+
 fn credentials() -> Result<(String, String), Error> {
     Ok((env("BOAT_API_KEY")?, env("GITHUB_TOKEN")?))
 }
@@ -241,21 +284,23 @@ fn jit_path(slot: u32) -> String {
 /// mount that copies the snapshot in lazily, then swaps the real disk in once the copy
 /// is done, and every file there gets a new device and inode. A job that runs across the
 /// swap sees its files change identity, so the runner starts only after it. The wait
-/// gives up after 300 tries 2 s apart; `decide` then unregisters the runner that never
-/// came online. Without `findmnt` it does not wait.
+/// gives up after 300 tries 2 s apart and deletes the jit config at `$f`; `decide` then
+/// unregisters the runner that never came online. Without `findmnt` it does not wait.
 const WAIT_FOR_HOME: &str = "n=0; \
      while findmnt -no FSTYPE -T /home/user 2>/dev/null | grep -q '^fuse'; do \
-     n=$((n+1)); [ \"$n\" -lt 300 ] || exit 1; sleep 2; done";
+     n=$((n+1)); [ \"$n\" -lt 300 ] || { rm -f \"$f\"; exit 1; }; sleep 2; done";
 
 /// Starts slot `slot`'s runner from the snapshot's `/home/user/actions-runner`, in its own
 /// directory because a runner keeps its state files next to `run.sh`. boat stores every
 /// command for 90 days and offers no stdin or env on commands, so the jit config travels
 /// as a file the command reads into `ACTIONS_RUNNER_INPUT_JITCONFIG` and then deletes. The
-/// `[b]in` pattern keeps `pkill` from matching this shell's own command line.
+/// `[b]in` pattern keeps `pkill` from matching this shell's own command line. boat's file
+/// write takes no mode, so once home is mounted the command makes the file owner-only; a
+/// refused chmod does not fail the start.
 fn start_command(slot: u32) -> String {
     let f = jit_path(slot);
     format!(
-        "set -eu; {WAIT_FOR_HOME}; d=/home/user/sbr/{slot}; f={f}; \
+        "set -eu; f={f}; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; d=/home/user/sbr/{slot}; \
          pkill -f \"/home/user/sbr/{slot}/[b]in/Runner\" || true; \
          if [ ! -x \"$d/run.sh\" ]; then mkdir -p /home/user/sbr; cp -a /home/user/actions-runner \"$d\"; fi; \
          cd \"$d\"; rm -f .runner .credentials .credentials_rsaparams; \
@@ -278,7 +323,7 @@ struct Starts {
 
 /// `snap` restricted to what `pool` is first in line to serve, with `planned` added to
 /// today's spend (see `plan`).
-fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents) -> Snapshot {
+fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents, starts: u32) -> Snapshot {
     let mut routed = snap.clone();
     routed.queued.retain(|j| {
         cfg.pools
@@ -287,6 +332,10 @@ fn route(cfg: &Config, snap: &Snapshot, pool: &Pool, planned: Cents) -> Snapshot
             .is_some_and(|p| p.name == pool.name)
     });
     routed.limits.spent_today_cents = snap.limits.spent_today_cents.saturating_add(planned);
+    routed.limits.free_starts_left = snap
+        .limits
+        .free_starts_left
+        .map(|left| left.saturating_sub(starts));
     routed
 }
 
@@ -300,8 +349,9 @@ pub fn plan<'c>(
 ) -> Vec<(&'c Pool, Action)> {
     let mut out = Vec::new();
     let mut planned: Cents = 0;
+    let mut planned_starts: u32 = 0;
     for pool in &cfg.pools {
-        let routed = route(cfg, snap, pool, planned);
+        let routed = route(cfg, snap, pool, planned, planned_starts);
         let actions = decide(&routed, pool);
         let starts = actions
             .iter()
@@ -309,6 +359,7 @@ pub fn plan<'c>(
             .count();
         let starts = Cents::try_from(starts).unwrap_or(Cents::MAX);
         planned = planned.saturating_add(starts.saturating_mul(snap.limits.next_start_cents));
+        planned_starts = planned_starts.saturating_add(starts);
         out.extend(actions.into_iter().map(|a| (pool, a)));
     }
     out
@@ -524,6 +575,10 @@ impl<'a> Loop<'a> {
             can_start: boat_can_start(&limits) && now >= self.starts_blocked_until,
             next_start_cents: cents(limits.next_start_dollars),
             spent_today_cents: self.spent_cents,
+            free_starts_left: limits
+                .starts_left
+                .filter(|_| cents(limits.next_start_dollars) == 0)
+                .map(|left| u32::try_from(left).unwrap_or(u32::MAX)),
         };
         let snapshot = Snapshot {
             now,
@@ -566,7 +621,22 @@ impl<'a> Loop<'a> {
                 machine,
                 slot,
             } => self.register(now, pool, machine, *slot),
-            Action::Resume { machine } => self.start(now, starts, |b| b.resume(machine)),
+            Action::Resume { machine } => {
+                let result = self.start(now, starts, |b| b.resume(machine));
+                // boat deleted the disk of a machine that stayed stopped too long. It can
+                // never resume, so delete it; the pool then forks a new one if it needs to.
+                if matches!(&result, Err(Error::Boat(boat::Error::Conflict { code }))
+                    if code == DISK_EXPIRED)
+                {
+                    eprintln!("warn: {machine} lost its disk; deleting it");
+                    self.remove_runners(machine, runner_ids)?;
+                    return match self.boat.delete(machine) {
+                        Err(boat::Error::NotFound) => Ok(()),
+                        r => r.map_err(Error::from),
+                    };
+                }
+                result
+            }
             Action::Fork { pool, job } => {
                 let p = self.pool(pool)?;
                 let mut labels = BTreeMap::from([(boat::POOL_LABEL.to_string(), p.name.clone())]);
@@ -705,7 +775,7 @@ impl<'a> Loop<'a> {
                 }
                 Ok(())
             }
-            Err(e @ boat::Error::RefusedStart { retry_after_s, .. }) => {
+            Err(e @ boat::Error::Refused { retry_after_s, .. }) => {
                 self.starts_blocked_until = now.saturating_add(retry_after_s);
                 starts.open = false;
                 Err(e.into())
@@ -925,7 +995,8 @@ mod tests {
                 can_start: true,
                 next_start_cents: 25,
                 // A fresh process assumes every pool's cap is spent.
-                spent_today_cents: 100
+                spent_today_cents: 100,
+                free_starts_left: None,
             }
         );
         let m = |id: &str| id.to_string();
@@ -1021,8 +1092,9 @@ mod tests {
     }
 
     /// Runs `WAIT_FOR_HOME` with a fake `findmnt` that reports FUSE for the first `fuse`
-    /// calls, and returns whether the script went on and how often it looked.
-    fn wait_for_home(fuse: u32) -> (bool, u32) {
+    /// calls, and returns whether the script went on, how often it looked, and whether
+    /// the jit config file at `$f` is still there.
+    fn wait_for_home(fuse: u32) -> (bool, u32, bool) {
         let dir = std::env::temp_dir().join(format!("sbr-wait-{}-{fuse}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = |name: &str, body: &str| {
@@ -1035,6 +1107,8 @@ mod tests {
                 .unwrap();
         };
         let calls = dir.join("calls");
+        let jit = dir.join("jit");
+        std::fs::write(&jit, "JITSECRET").unwrap();
         script(
             "findmnt",
             &format!(
@@ -1049,23 +1123,29 @@ mod tests {
             .arg("-c")
             .arg(format!("{WAIT_FOR_HOME}; echo started"))
             .env("PATH", path)
+            .env("f", &jit)
             .output()
             .unwrap();
         let looked = std::fs::read_to_string(&calls).map_or(0, |c| c.lines().count() as u32);
+        let kept = jit.exists();
         std::fs::remove_dir_all(&dir).unwrap();
         (
             String::from_utf8_lossy(&out.stdout).contains("started"),
             looked,
+            kept,
         )
     }
 
     #[test]
     fn runner_waits_for_home_to_leave_fuse() {
-        assert_eq!(wait_for_home(0), (true, 1));
-        assert_eq!(wait_for_home(3), (true, 4));
-        // A mount that never settles stops the start instead of running a job on it.
-        assert_eq!(wait_for_home(u32::MAX), (false, 300));
-        assert!(start_command(1).starts_with(&format!("set -eu; {WAIT_FOR_HOME}; ")));
+        assert_eq!(wait_for_home(0), (true, 1, true));
+        assert_eq!(wait_for_home(3), (true, 4, true));
+        // A mount that never settles stops the start instead of running a job on it, and
+        // leaves no jit config behind.
+        assert_eq!(wait_for_home(u32::MAX), (false, 300, false));
+        assert!(start_command(1).starts_with(&format!(
+            "set -eu; f=/home/user/.sbr-jit-1; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; "
+        )));
     }
 
     /// `plan` without a snapshot file observes as `run` does and sends nothing else, even
@@ -1247,6 +1327,55 @@ mod tests {
                 format!("DELETE {GH}/runners/12"),
                 format!("DELETE {BOAT}/sandboxes/bx_44444444"),
                 format!("DELETE {GH}/runners/11"),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_deletes_the_pools_runners_and_machines() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        // The fake lists the same three machines afterwards.
+        let left = drain_with(&cfg, &fake, "k".into(), "t".into(), NOW).unwrap();
+        assert_eq!(left, 3);
+        let writes: Vec<String> = requests(&fake)
+            .into_iter()
+            .filter(|r| !r.starts_with("GET"))
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                format!("DELETE {GH}/runners/11"),
+                format!("DELETE {GH}/runners/12"),
+                format!("DELETE {BOAT}/sandboxes/bx_22222222"),
+                format!("DELETE {BOAT}/sandboxes/bx_33333333"),
+                format!("DELETE {BOAT}/sandboxes/bx_44444444"),
+            ]
+        );
+    }
+
+    fn resume_stopped(_: &Snapshot, _: &Pool) -> Vec<Action> {
+        vec![Action::Resume {
+            machine: "bx_33333333".into(),
+        }]
+    }
+
+    #[test]
+    fn a_stopped_machine_whose_disk_boat_deleted_is_deleted() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.url.ends_with("/resume") {
+                respond(409, &[], r#"{"code":"snapshot_data_expired"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        started(&cfg, &fake).tick(NOW, resume_stopped).unwrap();
+        assert_eq!(
+            requests(&fake)[6..],
+            [
+                format!("POST {BOAT}/sandboxes/bx_33333333/resume"),
+                format!("DELETE {BOAT}/sandboxes/bx_33333333"),
             ]
         );
     }
@@ -1549,16 +1678,26 @@ mod tests {
                 can_start: true,
                 next_start_cents: 25,
                 spent_today_cents: 10,
+                free_starts_left: None,
             },
         };
-        let planned: Vec<_> = plan(&cfg, &snap, fork_each_job)
-            .into_iter()
-            .map(|(p, a)| match a {
-                Action::Fork { job: Some(j), .. } => (p.name.as_str(), j.id),
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(planned, [("ci", 1), ("b", 2)]);
+        let forks = |snap: &Snapshot, decide| -> Vec<(String, u64)> {
+            plan(&cfg, snap, decide)
+                .into_iter()
+                .map(|(p, a)| match a {
+                    Action::Fork { job: Some(j), .. } => (p.name.clone(), j.id),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let both = [("ci".to_string(), 1), ("b".to_string(), 2)];
+        assert_eq!(forks(&snap, fork_each_job), both);
+
+        // The pools share boat's free starts: the second sees what the first took.
+        let mut free = snap.clone();
+        free.limits.next_start_cents = 0;
+        free.limits.free_starts_left = Some(1);
+        assert_eq!(forks(&free, decide), both[..1]);
     }
 
     #[test]

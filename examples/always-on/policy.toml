@@ -1,0 +1,10 @@
+# One pool that keeps machines between jobs and stops them after 30 idle minutes.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "large"]
+machine_type = "large"
+snapshot = "snap-1"
+preset = "warm"
+max_boxes = 8

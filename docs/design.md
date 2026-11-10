@@ -6,7 +6,8 @@ so jobs reuse machines instead of starting a new one per job.
 ## Why
 
 boat's managed `runs-on: boat` starts a fresh machine for every job. A start is a create,
-fork or resume. Each plan includes a number of starts per minute, hour and day, and
+fork or resume. Each plan [includes](https://docs.boat.dev/limits.md) a number of starts
+per minute, hour and day, from 200 a day on the $20 plan to 2,400 on the $2000 plan, and
 starts beyond that cost $0.03 to $0.07 each. A busy repository runs thousands of jobs
 a day, so the managed runner can cost more in starts than in machine time. See
 [eval/](../eval/) for a measured case.
@@ -34,9 +35,10 @@ next tick tries again. Presets:
 | `pool` | `slot` | `min_up` always up | steady load, trusted code, lowest overhead |
 | `warm` | `slot, resume` | stopped after `idle_stop_s`; demand no stopped machine covers forks a kept one | load with quiet hours |
 | `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
-| `hybrid` | `slot, resume, fork` | stopped after `idle_stop_s` | bursts above the pool size |
+| `hybrid` | `slot, resume, fork` | `min_up` always up; a job their slots cannot take gets its own fork | bursts above `min_up` |
 
-`hybrid` is the default. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
+`hybrid` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
+only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
 `min_up` need `slot`, the only step that registers runners on kept machines.
 
 Every runner is a just-in-time runner: it is registered through GitHub's JIT config,
@@ -56,8 +58,10 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 - `N > 0`: also allow paid starts while the cents spent on starts today, plus the price
   of this start, stay at or under N.
 
-`GET /limits` reports the next start's price but not how many included starts are left,
-so `decide` prices every start of a tick at the quote it was shown. After each accepted
+`GET /limits` quotes one price, for the next start, so `decide` prices every start of a
+tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
+boat's minute, hour and day windows, because the price past them is not known until the
+next tick. After each accepted
 start the daemon reads `GET /limits` again and makes no more starts that tick if the
 price changed. One account serves every pool, so each pool's cap is checked against the
 account-wide spend, including the starts that pools earlier in the file planned in the
@@ -91,6 +95,9 @@ carries the label `sw-boat-runner-job=<job id>-<attempt>`, which `decide` matche
 at most one fork per job. A kept machine is forked with no job label to bring the pool up
 to `min_up`, or, in a pool with `resume` and no `fork`, for demand that no stopped machine
 covers. A kept machine gets boat's longest TTL, 30 days, after which boat archives it.
+boat may delete the disk of a machine that has been stopped for 14 days. A `Resume` of one
+fails with `409 snapshot_data_expired`; the daemon then deletes the machine, and the pool
+forks a new one if it still needs it.
 
 Every fork request's `Idempotency-Key` is a fresh UUID v4. boat answers a key it saw in
 the last 24 h with its first machine, even a deleted one, so a reused key would hand a

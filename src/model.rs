@@ -121,6 +121,9 @@ pub struct Limits {
     pub next_start_cents: Cents,
     /// Cents paid for starts since 00:00 UTC, by this process's count.
     pub spent_today_cents: Cents,
+    /// Starts left at a price of 0, when boat reported them; `None` means not known.
+    #[serde(default)]
+    pub free_starts_left: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

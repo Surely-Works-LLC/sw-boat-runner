@@ -1,0 +1,3 @@
+{"action":"fork","job":{"attempt":1,"id":1},"pool":"ci"}
+{"action":"register","machine":"bx_b1","pool":"big","slot":0}
+{"action":"register","machine":"bx_b1","pool":"big","slot":1}

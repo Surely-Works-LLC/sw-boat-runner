@@ -10,26 +10,33 @@ them when idle, and forks a fresh one only when a job needs it.
 
 ![boat starts per day against CI jobs per day: runs-on: boat grows one start per job, the warm preset stays near 100](bench/starts.svg)
 
-| Jobs a day | Setup | Starts | Paid starts | Queue p50 / p90 |
+| Jobs a day | Setup | Starts | Extra starts | Queue p50 / p90 |
 | - | - | - | - | - |
-| 962 | `runs-on: boat` | 962 | 0 | 8 s / 8 s |
+| 962 | `runs-on: boat` | 962 | 122 ($3.66) | 8 s / 8 s |
 | | `warm` | 84 | 0 | 18 s / 25 s |
-| 2,000 | `runs-on: boat` | 2,000 | 750 | 8 s / 8 s |
+| 2,000 | `runs-on: boat` | 2,000 | 1,160 ($56.00) | 8 s / 8 s |
 | | `warm` | 103 | 0 | 17 s / 24 s |
-| 4,772 | `runs-on: boat` | 4,772 | 3,522 | 8 s / 8 s |
+| 4,772 | `runs-on: boat` | 4,772 | 4,011 ($253.27) | 8 s / 8 s |
 | | `warm` | 118 | 0 | 17 s / 24 s |
 
-The numbers come from `cargo run --release --example bench`, which simulates a day of CI.
+The numbers come from `cargo run --release --example bench`, which simulates a day of CI
+on boat's $100 plan (840 [included starts](https://docs.boat.dev/limits.md) a day).
 `runs-on: boat` is mocked as one start per job; the daemon's real loop runs against a
-mocked boat and GitHub API. Under the plan's included starts, `runs-on: boat` is cheaper
-and starts jobs sooner. Past them, each of its jobs is a paid start. The included starts
-(1,250 a day) are an estimate from one bill, not boat's published number.
-[bench/](bench/) has the assumptions, the other presets and the cost columns.
+mocked boat and GitHub API. Under the included starts, `runs-on: boat` is cheaper and
+starts jobs sooner. Past them, its jobs are extra starts at $0.03 to $0.07 each.
+[bench/](bench/) has the assumptions, the other presets and the machine-time cost.
 
 ## Connect a repository
 
-The daemon is one process for one repository. It keeps no database, so it runs on any
-host that stays up and can be restarted at any time.
+The daemon is one process for one repository. It keeps no database and can be restarted
+at any time. Something has to run it, because a runner must be registered before a job
+can use it; changing `runs-on` alone is not enough. There are three ways:
+
+| Where the daemon runs | You add | Saves starts |
+| - | - | - |
+| [Inside the workflow](examples/in-workflow/) | one job and two secrets | within one run only; the default is a fresh machine per job |
+| [On a small boat machine](examples/always-on/) | one machine, about $13 a month | yes |
+| On any host you keep up | the steps below | yes |
 
 1. Install it:
 
@@ -73,22 +80,29 @@ host that stays up and can be restarted at any time.
    sw-boat-runner check policy.toml   # validate, print each pool with its preset applied
    sw-boat-runner plan policy.toml    # observe once, print the actions as JSON; changes nothing
    sw-boat-runner run policy.toml     # the loop
+   sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to stop using them
    ```
 
+   `plan policy.toml snapshot.json` plans for a saved snapshot instead, with no
+   credentials; [tests/scenarios](tests/scenarios/) has snapshots to start from.
+
 6. Point jobs at the pool. A job goes to the first pool whose `labels` include all of
-   its `runs-on` labels:
+   its `runs-on` labels, compared without case, even when a later pool has a free slot,
+   so list the pool with more labels first:
 
    ```yaml
    runs-on: [self-hosted, large]
    ```
 
+   Runners you registered yourself with the same labels keep taking these jobs. Remove
+   them once the pool runs.
+
 The daemon creates machines with `noEnv`, so boat adds none of the account's secrets. It
 labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
 ignores every other machine and runner. To update the runner, rebuild the snapshot.
 
-[examples/self-hosted/](examples/self-hosted/) is a complete setup: this repository's
-[`self-hosted` workflow](.github/workflows/self-hosted.yml) has the daemon fork a machine
-for its own tests.
+This repository runs its own tests through the first option, in its
+[`self-hosted` workflow](.github/workflows/self-hosted.yml).
 
 ## Policy
 
@@ -107,7 +121,7 @@ for its own tests.
 | `slots_per_box` | 1 | Runners per kept machine. |
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
-| `register_timeout_s` | 300 | How long a registered runner may take to come online. Keep it above the time boat takes to copy the snapshot to a new machine's disk. |
+| `register_timeout_s` | 300 | How long a registered runner may take to come online. Keep it above the time boat takes to copy the snapshot to a new machine's disk: the runner waits up to 10 minutes for that copy before it starts. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only starts the plan includes. |
 
@@ -116,9 +130,9 @@ A preset sets `placement`, the ways to find a runner for a queued job, tried in 
 | Preset | Placement | Idle machines |
 | - | - | - |
 | `pool` | `slot` | `min_up` stay up |
-| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job |
+| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job; when the stopped ones are not enough, new ones are forked from `snapshot`, up to `max_boxes` |
 | `fork` | `fork` | none; each job gets a new machine that is deleted afterwards |
-| `hybrid` | `slot, resume, fork` | like `warm`, and forks for bursts |
+| `hybrid` | `slot, resume, fork` | `min_up` stay up; a job their slots cannot take gets a new machine that is deleted afterwards |
 
 Use `fork` for untrusted code such as pull requests from forks.
 [docs/design.md](docs/design.md) has the full design.
