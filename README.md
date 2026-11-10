@@ -83,12 +83,19 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to stop using them
    ```
 
+   `plan policy.toml snapshot.json` plans for a saved snapshot instead, with no
+   credentials; [tests/scenarios](tests/scenarios/) has snapshots to start from.
+
 6. Point jobs at the pool. A job goes to the first pool whose `labels` include all of
-   its `runs-on` labels:
+   its `runs-on` labels, compared without case, even when a later pool has a free slot,
+   so list the pool with more labels first:
 
    ```yaml
    runs-on: [self-hosted, large]
    ```
+
+   Runners you registered yourself with the same labels keep taking these jobs. Remove
+   them once the pool runs.
 
 The daemon creates machines with `noEnv`, so boat adds none of the account's secrets. It
 labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
@@ -114,7 +121,7 @@ This repository runs its own tests through the first option, in its
 | `slots_per_box` | 1 | Runners per kept machine. |
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
-| `register_timeout_s` | 300 | How long a registered runner may take to come online. Keep it above the time boat takes to copy the snapshot to a new machine's disk. |
+| `register_timeout_s` | 300 | How long a registered runner may take to come online. Keep it above the time boat takes to copy the snapshot to a new machine's disk: the runner waits up to 10 minutes for that copy before it starts. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only starts the plan includes. |
 
