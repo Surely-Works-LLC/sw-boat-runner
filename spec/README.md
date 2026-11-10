@@ -2,7 +2,8 @@
 
 `BoatRunner.tla` models one sw-boat-runner pool: GitHub's job queue and JIT
 runners, boat's machines, and the reconciler in `docs/design.md` as `src/decide.rs`
-and `src/run.rs` implement it. TLC checks it in CI (job `tla`).
+and `src/run.rs` implement it. TLC checks it locally (see [Running TLC](#running-tlc))
+and in the `tla` workflow on main.
 
 ## What is modelled
 
@@ -116,7 +117,19 @@ change that hides one fails CI.
 
 ## Running TLC
 
-CI runs, for each model, from the repository root:
+Run TLC locally before changing the spec. It needs Java 21, as in CI, and
+`tla2tools.jar` v1.7.4. From the repository root:
+
+```sh
+curl -fsSL -o tla2tools.jar \
+  https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  tla2tools.jar" \
+  | shasum -a 256 -c -
+java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
+  -config spec/BoatRunner.cfg spec/BoatRunner.tla
+```
+
+For another model, write its edited config and check that instead:
 
 ```sh
 sed -e "$EDIT" spec/BoatRunner.cfg > spec/Variant.cfg
@@ -124,9 +137,9 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
   -config spec/Variant.cfg spec/BoatRunner.tla
 ```
 
-with `tla2tools.jar` v1.7.4 (sha256
-`936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88`). The matrix in
-`.github/workflows/ci.yml` lists each model's sed edit. The passing models must
+The `tla` workflow (`.github/workflows/tla.yml`) runs every model on a push to
+`main` that changes `spec/` or the workflow, and on manual dispatch; pull
+requests do not run it. Its matrix lists each model's base config and sed edit. The passing models must
 exit 0. The counterexample models must fail with the message given.
 
 | Model | Base | Change | Distinct states | TLC time |
