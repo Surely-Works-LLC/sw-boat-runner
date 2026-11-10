@@ -91,6 +91,9 @@ and keep logins and tokens out of it: a job can read any file in the snapshot. T
 creates machines with `noEnv`, so boat adds none of the account's secrets.
 For each slot the tool copies that directory to `/home/user/sbr/<slot>`, writes the JIT
 config to a file, and starts `run.sh`. Rebuild the snapshot to update the runner.
+A new machine's `/home/user` is a FUSE mount until boat finishes copying the snapshot
+to disk, and every file there then gets a new device and inode, so the runner starts
+only once the mount is gone. Keep `register_timeout_s` above that copy time.
 
 The tool labels its machines `sw-boat-runner=<pool>` and names its runners
 `sbr-<pool>-...`. It ignores other machines and runners.
