@@ -7,8 +7,9 @@ offline analysis, not part of the daemon: a standard-library Python script that 
 
 Per window and runner kind it reports jobs sampled, jobs that never got a
 runner, queue time (`started_at - created_at`) and run time (`completed_at -
-started_at`) at p50 and p90, and boat starts per day; then jobs per persistent
-runner and persistent queue time per day.
+started_at`) at p50 and p90, and the window's boat starts per day. One more row gives
+wait and run time from the `boat ci` log itself. Two further tables give jobs per
+persistent runner and persistent queue time per day.
 
 ## Reproduce
 
@@ -26,15 +27,17 @@ python3 -I eval/evals.py --repo OWNER/REPO --cutover 2026-11-05T21:52:45Z \
   that were deleted or never reached the default branch; the workflows listing
   omits them. Without it, the names in the boat jobs are used.
 - Windows: before is 00:00Z the day before cutover to cutover; after is 00:00Z
-  the day after cutover to `--after-end` (default: now, truncated to the hour).
+  the day after cutover to now, truncated to the hour. `--before-start`,
+  `--after-start` and `--after-end` override the defaults.
 - `--boat-labels` sets the per-job labels (default `boat,boat-small,boat-large,boat-xlarge`;
-  a `/options` suffix also matches). `--persistent-label` sets the pool label.
+  a `/options` suffix also matches). `--persistent-label` sets the persistent runners' label.
 
 ## API budget
 
 `gh api` is called at most `--max-calls` times (default 250), counting cached
-reads, plus one retry per failed call. Before its first uncached call the script stops
-if the core rate limit has under 1,500 calls left.
+reads, plus one retry per failed call and one rate-limit check. That check runs before
+the first uncached call and stops the script if the core rate limit has under 1,500
+calls left.
 Responses are cached in `eval/.cache/` (gitignored), so a rerun with the same
 arguments makes no calls. Runs are listed per workflow with `created=` filters;
 when a window has more pages than the budget allows, evenly spaced pages are
