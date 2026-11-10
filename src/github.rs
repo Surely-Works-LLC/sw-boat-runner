@@ -92,8 +92,9 @@ pub struct RunnerName {
     pub registered_at: UnixSecs,
 }
 
-/// Inverse of `runner_name`. Splits from the right, because a pool name may contain `-`
-/// and a boat id never does.
+/// Inverse of `runner_name`. Splits from the right: the time, slot and boat id never
+/// contain `-`, so the rest is the pool name. `policy::validate` keeps `-` out of pool
+/// names anyway.
 pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
     let mut parts = name.strip_prefix(PREFIX)?.rsplitn(4, '-');
     let registered_at = parts.next()?.parse().ok()?;

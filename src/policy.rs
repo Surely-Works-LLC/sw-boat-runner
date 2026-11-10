@@ -150,8 +150,9 @@ impl RawPool {
 }
 
 fn validate(p: &Pool) -> Result<(), String> {
-    // Runner names are `sbr-<pool>-<machine>-...`, so a `-` in the pool name would make
-    // one pool's prefix match another's runners.
+    // Runner names are `sbr-<pool>-<machine>-...`. `github::parse_runner_name` would read a
+    // `-` in a pool name, but then pool `ci`'s prefix `sbr-ci-` would also match the runners
+    // of a pool `ci-big` for anyone filtering GitHub's runner list by name.
     let name_ok = !p.name.is_empty()
         && p.name
             .chars()
