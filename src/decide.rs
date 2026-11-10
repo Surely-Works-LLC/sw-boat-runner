@@ -34,13 +34,13 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         .iter()
         .filter(|m| m.pool == pool.name)
         .collect();
-    machines.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    machines.sort_by(|a, b| a.id.cmp(&b.id));
     let mut runners: Vec<&Runner> = snap
         .runners
         .iter()
         .filter(|r| r.pool == pool.name)
         .collect();
-    runners.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    runners.sort_by(|a, b| a.name.cmp(&b.name));
     let mut jobs: Vec<JobKey> = snap
         .queued
         .iter()
@@ -50,9 +50,11 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     jobs.sort();
     jobs.dedup();
     let has = |step: Placement| pool.placement.contains(&step);
-    let ephemeral = |m: &&&Machine| m.job.is_some();
-    let kept = |m: &&&Machine| m.job.is_none();
-    let in_state = |state: MachineState| move |m: &&&Machine| m.state == state;
+    let kept_in = |state: MachineState| {
+        machines
+            .iter()
+            .filter(move |m| m.job.is_none() && m.state == state)
+    };
     let mut actions = Vec::new();
 
     let mut unregistered = BTreeSet::new();
@@ -75,8 +77,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     let mut fresh = Vec::new();
     for m in machines
         .iter()
-        .filter(ephemeral)
-        .filter(|m| m.state != MachineState::Gone)
+        .filter(|m| m.job.is_some() && m.state != MachineState::Gone)
     {
         let busy = runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy);
         let live = runners_on(snap, &m.id).any(|r| r.state != RunnerState::Offline);
@@ -98,11 +99,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     }
     // Only a pool that can resume ever brings a stopped kept machine back.
     if !has(Placement::Resume) {
-        for m in machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Stopped))
-        {
+        for m in kept_in(MachineState::Stopped) {
             if runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy) {
                 continue;
             }
@@ -135,11 +132,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         want -= 1;
     }
     if has(Placement::Slot) {
-        for m in machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Up))
-        {
+        for m in kept_in(MachineState::Up) {
             for slot in 0..pool.slots_per_box {
                 if want == 0 {
                     break;
@@ -165,8 +158,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     // would start more machines for the same demand.
     let pending: usize = machines
         .iter()
-        .filter(in_state(MachineState::Starting))
-        .filter(|m| !deleted.contains(m.id.as_str()))
+        .filter(|m| m.state == MachineState::Starting && !deleted.contains(m.id.as_str()))
         .map(|m| match m.job {
             Some(_) => 1,
             None => pool.slots_per_box as usize,
@@ -185,19 +177,11 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         taken: 0,
     };
     // `min_up` counts kept machines that are up or on their way up.
-    let held = machines
-        .iter()
-        .filter(kept)
-        .filter(|m| matches!(m.state, MachineState::Up | MachineState::Starting))
-        .count();
+    let held = kept_in(MachineState::Up).count() + kept_in(MachineState::Starting).count();
     let mut short = (pool.min_up as usize).saturating_sub(held);
     if has(Placement::Resume) {
-        let stopped = machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Stopped));
         // boat may have dropped the kept disk, so every resume is priced as a start.
-        for m in stopped {
+        for m in kept_in(MachineState::Stopped) {
             if (want == 0 && short == 0) || !starts.take() {
                 break;
             }
@@ -209,12 +193,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         }
         // A kept machine still stopping is resumed once it has stopped; a fork now would
         // leave the pool above `min_up` after that.
-        let stopping = machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Stopping))
-            .count();
-        short = short.saturating_sub(stopping);
+        short = short.saturating_sub(kept_in(MachineState::Stopping).count());
     }
     // A pool that resumes but never forks for a job would otherwise stay at its stopped
     // and `min_up` machines. Demand left after every resume forks a kept machine, which
@@ -259,16 +238,8 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     // come back (docs/design.md#properties, IdleStops). A machine is not
     // stopped while demand is still unmet, since a start just refused would want it back.
     if has(Placement::Resume) && want == 0 {
-        let mut up = machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Up))
-            .count();
-        for m in machines
-            .iter()
-            .filter(kept)
-            .filter(in_state(MachineState::Up))
-        {
+        let mut up = kept_in(MachineState::Up).count();
+        for m in kept_in(MachineState::Up) {
             if up <= pool.min_up as usize {
                 break;
             }
