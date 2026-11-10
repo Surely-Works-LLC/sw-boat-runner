@@ -252,7 +252,8 @@ impl<'t> Client<'t> {
 
     /// Starts a new machine from the saved snapshot. boat returns the first sandbox again
     /// for a repeat of the same key and body within 24 h, even a deleted one.
-    /// `ttl_s` must be 1 to `MAX_TTL_S`.
+    /// `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv` keeps the account's logins and secrets
+    /// out of the machine, because CI jobs run arbitrary code there.
     pub fn create_from_snapshot(
         &self,
         snapshot: &str,
@@ -271,6 +272,7 @@ impl<'t> Client<'t> {
             "type": machine_type,
             "labels": labels,
             "ttlSeconds": ttl_s,
+            "noEnv": true,
         });
         let created: Created = parse(self.call(
             "POST",
@@ -537,7 +539,7 @@ mod tests {
         let body: Value = serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body,
-            json!({"from":"runner-base","type":"large","ttlSeconds":3600,
+            json!({"from":"runner-base","type":"large","ttlSeconds":3600,"noEnv":true,
                    "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"7-2"}})
         );
     }

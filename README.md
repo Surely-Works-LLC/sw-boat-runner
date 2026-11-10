@@ -86,7 +86,9 @@ letters, digits and `_`. Optional pool fields and their defaults:
 
 Each pool starts its machines from a boat snapshot. The snapshot needs an extracted
 [actions/runner](https://github.com/actions/runner) release at
-`/home/user/actions-runner`, with its dependencies installed. Leave it unconfigured.
+`/home/user/actions-runner`, with its dependencies installed. Leave it unconfigured,
+and keep logins and tokens out of it: a job can read any file in the snapshot. The tool
+creates machines with `noEnv`, so boat adds none of the account's secrets.
 For each slot the tool copies that directory to `/home/user/sbr/<slot>`, writes the JIT
 config to a file, and starts `run.sh`. Rebuild the snapshot to update the runner.
 
