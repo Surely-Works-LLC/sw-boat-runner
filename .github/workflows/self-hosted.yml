@@ -1,26 +1,27 @@
-name: dogfood
+name: self-hosted
 # Runs this repository's tests on a boat machine that sw-boat-runner forks for the job.
 # The daemon runs in the `daemon` job for as long as the `test` job needs it, so no
-# always-on host is involved. dogfood/README.md has the setup.
+# always-on host is involved. examples/self-hosted/README.md has the setup.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 # The pool is shared, so one run at a time.
 concurrency:
-  group: dogfood
+  group: self-hosted
 permissions:
   contents: read
 jobs:
   daemon:
-    if: vars.DOGFOOD_SNAPSHOT != ''
+    if: vars.BOAT_SNAPSHOT != ''
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
-      GITHUB_TOKEN: ${{ secrets.DOGFOOD_GITHUB_TOKEN }}
-      GH_TOKEN: ${{ secrets.DOGFOOD_GITHUB_TOKEN }}
-      SNAPSHOT: ${{ vars.DOGFOOD_SNAPSHOT }}
+      # Not the token Actions creates for the run: that one cannot register runners.
+      GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      SNAPSHOT: ${{ vars.BOAT_SNAPSHOT }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: rustup toolchain install stable --profile minimal
@@ -28,7 +29,7 @@ jobs:
       - run: cargo build --locked --release
       - name: Policy
         run: |
-          sed "s/DOGFOOD_SNAPSHOT/$SNAPSHOT/" dogfood/policy.toml > policy.toml
+          sed "s/BOAT_SNAPSHOT/$SNAPSHOT/" examples/self-hosted/policy.toml > policy.toml
           target/release/sw-boat-runner check policy.toml
       - name: Run the daemon until the test job is done and its machine is deleted
         run: |
@@ -46,8 +47,8 @@ jobs:
           done
           kill "$daemon"
   test:
-    if: vars.DOGFOOD_SNAPSHOT != ''
-    runs-on: [self-hosted, sw-boat-runner-dogfood]
+    if: vars.BOAT_SNAPSHOT != ''
+    runs-on: [self-hosted, sw-boat-runner]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

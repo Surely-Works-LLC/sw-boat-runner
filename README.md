@@ -40,6 +40,80 @@ The included starts (1,250 a day) and the start price ($0.037) are estimates rea
 one bill in [eval/results/](eval/results/example-2026-11.md), not boat's published
 numbers, and the dollar columns depend on them. The start counts do not.
 
+## Connect a repository
+
+The daemon is one process for one repository. It keeps no database, so it can run on any
+host that stays up and can be restarted at any time.
+
+**1. Build it.**
+
+```sh
+cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner
+```
+
+**2. Make a boat snapshot for the runners.** Each pool starts its machines from one. It
+needs an extracted [actions/runner](https://github.com/actions/runner) release at
+`/home/user/actions-runner` with its dependencies installed, plus whatever your jobs
+expect to find. Leave the runner unconfigured, and keep logins and tokens out of the
+snapshot: a job can read every file in it. Remove cleanup timers too, because a forked
+machine keeps the snapshot's systemd timers.
+
+**3. Get two credentials.** The daemon reads them from its environment.
+
+| Variable | What it is |
+| - | - |
+| `BOAT_API_KEY` | A boat key for the account that owns the snapshot. |
+| `GITHUB_TOKEN` | A fine-grained personal access token for the repository with **Administration: read and write** (to register runners) and **Actions: read** (to see queued jobs). |
+
+The `GITHUB_TOKEN` that GitHub Actions creates for every workflow run does not work
+here. It cannot be given the Administration permission, so it cannot register runners.
+
+**4. Write a policy.** This is the smallest one:
+
+```toml
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "large"]
+machine_type = "large"
+snapshot = "snap-1"
+max_boxes = 4
+```
+
+**5. Check it, look at what it would do, then run it.**
+
+```sh
+sw-boat-runner check policy.toml   # validate; print each pool with its preset applied
+sw-boat-runner plan policy.toml    # observe boat and GitHub once and print the actions; changes nothing
+sw-boat-runner run policy.toml     # the loop
+```
+
+`plan` prints a summary of what it saw to stderr and one JSON action per line to stdout.
+`plan policy.toml snapshot.json` does the same offline against a saved snapshot.
+
+**6. Point jobs at the pool.** A job goes to the first pool whose `labels` include all
+of its `runs-on` labels:
+
+```yaml
+jobs:
+  test:
+    runs-on: [self-hosted, large]
+```
+
+The daemon creates machines with `noEnv`, so boat adds none of the account's secrets to
+them. It labels its machines `sw-boat-runner=<pool>` and names its runners
+`sbr-<pool>-...`, and ignores every other machine and runner. To update the runner,
+rebuild the snapshot.
+
+A new machine's `/home/user` is a FUSE mount until boat has copied the snapshot to disk,
+and the runner starts only once that mount is gone. Keep `register_timeout_s` above the
+copy time.
+
+[examples/self-hosted/](examples/self-hosted/) is a complete setup: this repository's
+[`self-hosted` workflow](.github/workflows/self-hosted.yml) runs the daemon and has it
+fork a machine for its own tests.
+
 ## Presets
 
 Each pool's `placement` lists the ways to find a runner for a queued job, tried in order.
@@ -53,77 +127,26 @@ Each pool's `placement` lists the ways to find a runner for a queued job, tried 
 
 `fork` is the one for untrusted code such as pull requests from forks.
 
-## Policy
+## Policy reference
 
-The smallest policy `check` accepts:
+`repo` and `tick_s` (default 15) sit at the top level. Each `[[pool]]` takes:
 
-```toml
-repo = "acme/app"
-
-[[pool]]
-name = "ci"
-labels = ["self-hosted", "large"]
-machine_type = "large"
-snapshot = "snap-1"
-max_boxes = 4
-```
-
-`labels` must include `self-hosted`, and jobs pick the pool with `runs-on`.
-`machine_type` is `small`, `default`, `large` or `xlarge`. Pool names use lowercase
-letters, digits and `_`. Optional pool fields and their defaults:
-
-| Field | Default |
-| - | - |
-| `preset` | `hybrid` |
-| `placement` | from the preset |
-| `min_up` | 1 for `pool`, else 0 |
-| `slots_per_box` | 1 |
-| `idle_stop_s` | 1800 |
-| `min_up_s` | 600 |
-| `register_timeout_s` | 300 |
-| `fork_ttl_s` | 3600 (at most 2592000) |
-| `paid_start_cents_per_day` | 0, so only starts the plan includes |
-
-`tick_s` (default 15) sits at the top level next to `repo`.
-
-## Credentials
-
-`run` and a live `plan` read two environment variables:
-
-- `BOAT_API_KEY`: a boat key for the account that owns the snapshot. The tool creates,
-  resumes, stops and deletes sandboxes, writes files to them, runs commands, and reads
-  `/limits`.
-- `GITHUB_TOKEN`: a token for `repo`. A fine-grained token needs repository
-  Administration read and write (self-hosted runners) and Actions read (runs and jobs).
-
-## Snapshot
-
-Each pool starts its machines from a boat snapshot. The snapshot needs an extracted
-[actions/runner](https://github.com/actions/runner) release at
-`/home/user/actions-runner`, with its dependencies installed. Leave it unconfigured,
-and keep logins and tokens out of it: a job can read any file in the snapshot. The tool
-creates machines with `noEnv`, so boat adds none of the account's secrets.
-For each slot the tool copies that directory to `/home/user/sbr/<slot>`, writes the JIT
-config to a file, and starts `run.sh`. Rebuild the snapshot to update the runner.
-A new machine's `/home/user` is a FUSE mount until boat finishes copying the snapshot
-to disk, and every file there then gets a new device and inode, so the runner starts
-only once the mount is gone. Keep `register_timeout_s` above that copy time.
-
-The tool labels its machines `sw-boat-runner=<pool>` and names its runners
-`sbr-<pool>-...`. It ignores other machines and runners.
-
-## Usage
-
-```sh
-sw-boat-runner check policy.toml                 # validate, print each pool with its preset applied
-sw-boat-runner plan policy.toml                  # observe once, print the actions; changes nothing
-sw-boat-runner plan policy.toml snapshot.json    # the same against a saved snapshot, offline
-sw-boat-runner run policy.toml                   # the loop
-```
-
-`plan` prints a summary of what it saw to stderr and one JSON action per line to stdout.
-Build with `cargo build --release`. CI uploads Linux x86_64 and macOS arm64 binaries as
-workflow artifacts.
+| Field | Default | Meaning |
+| - | - | - |
+| `name` | required | Lowercase letters, digits and `_`. |
+| `labels` | required | Runner labels. Must include `self-hosted`. |
+| `machine_type` | required | `small`, `default`, `large` or `xlarge`. |
+| `snapshot` | required | The boat snapshot machines start from. |
+| `max_boxes` | required | Most machines up or starting at once. |
+| `preset` | `hybrid` | See [Presets](#presets). |
+| `placement` | from the preset | Overrides the preset's steps. |
+| `min_up` | 1 for `pool`, else 0 | Kept machines that stay up without jobs. |
+| `slots_per_box` | 1 | Runners per kept machine. |
+| `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
+| `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
+| `register_timeout_s` | 300 | How long a registered runner may take to come online. |
+| `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
+| `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only starts the plan includes. |
 
 ## Verification
 
@@ -135,19 +158,17 @@ plus liveness: queued jobs get a runner and idle machines stop. The `tla` workfl
 the models on `main` when `spec/` changes. [spec/README.md](spec/README.md) lists what the
 model leaves out, the bugs it found, and [how to run TLC](spec/README.md#running-tlc).
 
-Property tests check `decide` against the same safety properties, and the loop is tested
+Property tests check `decide` against the safety properties, and the loop is tested
 against a fake transport.
 
 ## Status
 
 In November 2026 a `fork` pool ran against a production repository: it forked machines up
 to `max_boxes`, each machine's runner took one job, and the daemon deleted the machines
-and their runners afterwards. Machines forked from a snapshot keep the snapshot's systemd
-timers, so remove cleanup timers from the snapshot before you fork it.
+and their runners afterwards.
 
-This repository has a [dogfood workflow](dogfood/) that runs its own tests on a machine
-the daemon forks for the job. [eval/](eval/) measures a repository's move from
-`runs-on: boat` to persistent boat runners, which is the setup this daemon automates.
+[eval/](eval/) measures a repository's move from `runs-on: boat` to persistent boat
+runners, which is the setup this daemon automates.
 
 ## License
 
