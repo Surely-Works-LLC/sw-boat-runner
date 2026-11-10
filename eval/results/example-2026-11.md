@@ -2,7 +2,7 @@
 
 example-org/example-repo moved its `runs-on: boat` jobs to four persistent
 self-hosted runners (label `pool-a`, names `pool-*`) on always-on
-boat boxes. The change merged at 2026-11-05T21:52:45Z; the last `runs-on: boat`
+boat machines. The change merged at 2026-11-05T21:52:45Z; the last `runs-on: boat`
 job was queued at 21:53Z.
 
 Repository, label, runner and workflow names are placeholders; times and counts
@@ -31,7 +31,7 @@ python3 -I eval/evals.py --repo example-org/example-repo \
   `waitSeconds` to the second, so it does not include waiting on `needs:`.
 - "no runner" counts completed jobs that never got a runner; all of them here
   were cancelled while queued.
-- Runner kind comes from job labels: `boat-large` is a boat per-job sandbox,
+- Runner kind comes from job labels: `boat-large` is a boat per-job machine,
   `pool-a` is a persistent runner, anything else (`other-a`,
   `other-b`) is "other" and not part of the comparison.
 
@@ -80,7 +80,7 @@ python3 -I eval/evals.py --repo example-org/example-repo \
 ## Reading
 
 What improved:
-- Boat starts went from about 2,200/day to zero, and the extra-starts charge went
+- boat starts went from about 2,200/day to zero, and the extra-starts charge went
   from $69.05 on 2026-11-05 to $0 from 2026-11-07. No job has been refused for
   an empty wallet since.
 - Run time is similar at p50 (116s before, 108s after) and lower at p90 (10.6m
@@ -88,11 +88,11 @@ What improved:
   runners are faster.
 
 What got worse:
-- Queue time. Boat sandboxes started a job in 8s at p50 and 112s at p90; the pool
-  takes 5.6m and 27.8m. 82 of 179 pool jobs (46%) were cancelled before any
+- Queue time. boat machines started a job in 8s at p50 and 112s at p90; the
+  persistent runners take 5.6m and 27.8m. 82 of 179 persistent jobs (46%) were cancelled before any
   runner picked them up, against 22 of 179 (12%) on boat. Long queues make it
   more likely that a newer push cancels a queued run.
-- Two of the four pool runners, `pool-box1-2` and
+- Two of the four persistent runners, `pool-box1-2` and
   `pool-box2-2`, are offline today; neither started a sampled job after
   2026-11-07. 2026-11-08, with only two runners taking work, has the worst
   queue (p50 21.4m, p90 46.0m). With all four up on 2026-11-06 and 2026-11-07
@@ -107,8 +107,8 @@ Caveats:
 - Different traffic: tooling ran only in the before window, and the
   workflows themselves changed between windows (`ci-old.yml` became
   `ci.yml`, release jobs moved).
-- Machine time for always-on boxes is paid whether or not they run CI, and the
-  dashboard does not split pool use from other use of those boxes. The saving
+- Machine time for always-on machines is paid whether or not they run CI, and the
+  dashboard does not split CI use from other use of those machines. The saving
   shown here is the extra-starts line, not machine time.
-- Boat starts/day uses whole calendar days from boat stats, so the before value
+- boat starts/day uses whole calendar days from boat stats, so the before value
   counts all of 2026-11-05.

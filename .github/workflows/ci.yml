@@ -19,7 +19,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: cargo run --locked -- check dogfood/policy.toml
+      - run: cargo run --locked -- check examples/self-hosted/policy.toml
   release:
     name: release (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

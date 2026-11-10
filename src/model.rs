@@ -16,7 +16,7 @@ pub struct Config {
     pub pools: Vec<Pool>,
 }
 
-fn default_tick_s() -> u64 {
+pub(crate) fn default_tick_s() -> u64 {
     15
 }
 
@@ -52,7 +52,7 @@ pub struct Pool {
 impl Pool {
     /// A job goes to a pool when it names at least one label and each is one of the pool's.
     /// GitHub matches runner labels case-insensitively.
-    pub fn serves(&self, job_labels: &[String]) -> bool {
+    pub(crate) fn serves(&self, job_labels: &[String]) -> bool {
         !job_labels.is_empty()
             && job_labels
                 .iter()

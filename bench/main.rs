@@ -110,6 +110,7 @@ fn workload(jobs_per_day: u64, seed: u64) -> Vec<Job> {
             }
         }
     }
+    jobs.sort_by_key(|j| j.created);
     jobs
 }
 
@@ -175,7 +176,8 @@ impl World {
             match s.state {
                 State::Booting { until } if until <= now => s.state = State::Up,
                 State::Archiving { until } if until <= now => {
-                    s.state = State::Archived { at: until }
+                    // The keep window counts from the stop request.
+                    s.state = State::Archived { at: until - TICK_S }
                 }
                 _ => {}
             }
@@ -187,11 +189,11 @@ impl World {
         {
             self.arrived += 1;
         }
-        // GitHub hands the oldest queued job to an idle online runner. A runner that
-        // finishes its job is gone: JIT runners are removed after one job.
+        // GitHub hands each queued job, in that order, to the idle online runner that came
+        // online first. A runner that finishes its job is gone: JIT runners take one job.
         self.runners
             .retain(|r| r.busy_until.is_none_or(|t| t > now));
-        for job in self.jobs[..self.arrived].iter_mut() {
+        for job in &mut self.jobs[..self.arrived] {
             if job.started.is_some() {
                 continue;
             }
@@ -345,13 +347,15 @@ impl World {
                     .collect();
                 (200, json!({ "runners": runners }))
             }
-            // One run per push; the daemon reads the first 100.
+            // One run per push, listed as queued while any of its jobs is, and none as in
+            // progress, so the daemon sees each run once. It reads the first 100.
             ("GET", ["runs", query]) => {
                 let mut pushes: Vec<u64> = if query.contains("status=queued") {
                     queued.map(|j| j.push).collect()
                 } else {
                     Vec::new()
                 };
+                pushes.sort_unstable();
                 pushes.dedup();
                 pushes.truncate(100);
                 let runs: Vec<Value> = pushes.iter().map(|p| json!({ "id": p })).collect();
@@ -447,16 +451,18 @@ fn percentile(sorted: &[u64], p: usize) -> u64 {
 
 fn row(setup: &'static str, target: u64, jobs: &[Job], world: &World) -> Row {
     let day: Vec<&Job> = jobs.iter().filter(|j| j.created >= DAY_START).collect();
+    // A job that never got a runner waited until the simulation ended.
+    let end = DAY_START + DAY_S + DRAIN_S;
     let mut queue: Vec<u64> = day
         .iter()
-        .filter_map(|j| Some(j.started? - j.created))
+        .map(|j| j.started.unwrap_or(end) - j.created)
         .collect();
     queue.sort_unstable();
     Row {
         setup,
         target,
         jobs: day.len(),
-        unserved: day.len() - queue.len(),
+        unserved: day.iter().filter(|j| j.started.is_none()).count(),
         starts: world.starts,
         paid_starts: world.paid_starts,
         machine_hours: world.machine_s as f64 / 3_600.0,
@@ -474,7 +480,9 @@ fn managed(target: u64, jobs: &[Job]) -> Row {
         world.count_start();
         job.started = Some(job.created + BOOT_S);
         if world.in_day() {
-            world.machine_s += BOOT_S + job.run_s;
+            // Cut off at midnight, as the daemon's machine time is.
+            let end = (job.created + BOOT_S + job.run_s).min(DAY_START + DAY_S);
+            world.machine_s += end - job.created;
         }
     }
     row("runs-on: boat", target, &jobs, &world)
@@ -546,42 +554,38 @@ fn svg(rows: &[Row]) -> String {
     const H: f64 = 430.0;
     let (left, right, top, bottom) = (64.0, 150.0, 64.0, 48.0);
     let max = 5_000.0;
-    let x = |v: f64| left + v / max * (W - left - right);
-    let y = |v: f64| H - bottom - v / max * (H - top - bottom);
+    let x = |v: f64| ((left + v / max * (W - left - right)) * 10.0).round() / 10.0;
+    let y = |v: f64| ((H - bottom - v / max * (H - top - bottom)) * 10.0).round() / 10.0;
+    let x_end = x(max);
 
+    let (mut light, mut dark) = (String::new(), String::new());
+    for (i, (_, l, d)) in SERIES.iter().enumerate() {
+        write!(light, ".s{i}{{stroke:{l}}} .f{i}{{fill:{l}}} ").unwrap();
+        write!(dark, ".s{i}{{stroke:{d}}} .f{i}{{fill:{d}}} ").unwrap();
+    }
     let mut s = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title id="t">boat starts per day against CI jobs per day</title>
-<desc id="d">Simulated. runs-on: boat makes one start per job; the warm and hybrid presets stay far below the plan's included starts. bench/results.csv has the numbers.</desc>
+<desc id="d">Simulated. runs-on: boat makes one start per job; the warm preset stays near 100 starts a day, and hybrid stops at the plan's included starts. bench/results.csv has the numbers.</desc>
 <style>
 .bg{{fill:#fcfcfb}} .ink{{fill:#0b0b0b}} .dim{{fill:#52514e}} .grid{{stroke:#e4e3df}} .ref{{stroke:#8a8983}}
+{light}
+@media (prefers-color-scheme: dark){{
+.bg{{fill:#1a1a19}} .ink{{fill:#f0efec}} .dim{{fill:#c3c2b7}} .grid{{stroke:#34332f}} .ref{{stroke:#8f8e86}}
+{dark}
+}}
+</style>
+<rect class="bg" width="{W}" height="{H}" rx="8"/>
+<text class="ink" x="{left}" y="28" font-size="15" font-weight="600">boat starts per day</text>
+<text class="dim" x="{left}" y="46" font-size="12">one simulated day per point; the daemon's real loop against a mocked boat and GitHub</text>
 "##
     );
-    for (i, (_, light, _)) in SERIES.iter().enumerate() {
-        write!(s, ".s{i}{{stroke:{light}}} .f{i}{{fill:{light}}} ").unwrap();
-    }
-    s.push_str(
-        "\n@media (prefers-color-scheme: dark){\n.bg{fill:#1a1a19} .ink{fill:#f0efec} \
-         .dim{fill:#c3c2b7} .grid{stroke:#34332f} .ref{stroke:#8f8e86}\n",
-    );
-    for (i, (_, _, dark)) in SERIES.iter().enumerate() {
-        write!(s, ".s{i}{{stroke:{dark}}} .f{i}{{fill:{dark}}} ").unwrap();
-    }
-    s.push_str("\n}\n</style>\n");
-    writeln!(s, r#"<rect class="bg" width="{W}" height="{H}" rx="8"/>"#).unwrap();
-    writeln!(
-        s,
-        r#"<text class="ink" x="{left}" y="28" font-size="15" font-weight="600">boat starts per day</text>
-<text class="dim" x="{left}" y="46" font-size="12">one simulated day per point; the daemon's real loop against a mocked boat and GitHub</text>"#
-    )
-    .unwrap();
     for v in (0..=5).map(|i| f64::from(i) * 1_000.0) {
         writeln!(
             s,
-            r#"<line class="grid" x1="{left}" x2="{x1}" y1="{y0}" y2="{y0}"/>
+            r#"<line class="grid" x1="{left}" x2="{x_end}" y1="{y0}" y2="{y0}"/>
 <text class="dim" x="{tx}" y="{ty}" font-size="11" text-anchor="end">{v}</text>
 <text class="dim" x="{xv}" y="{xy}" font-size="11" text-anchor="middle">{v}</text>"#,
-            x1 = x(max),
             y0 = y(v),
             tx = left - 8.0,
             ty = y(v) + 4.0,
@@ -590,28 +594,21 @@ fn svg(rows: &[Row]) -> String {
         )
         .unwrap();
     }
+    let included = y(INCLUDED_STARTS_PER_DAY as f64);
     writeln!(
         s,
-        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>"#,
+        r#"<text class="dim" x="{mid}" y="{by}" font-size="12" text-anchor="middle">CI jobs per day</text>
+<line class="ref" x1="{left}" x2="{x_end}" y1="{included}" y2="{included}" stroke-dasharray="4 4"/>
+<text class="dim" x="{x_end}" y="{ly}" font-size="11" text-anchor="end">included in the plan (about {INCLUDED_STARTS_PER_DAY} a day, estimated)</text>"#,
         mid = x(max / 2.0),
-        by = H - 10.0
-    )
-    .unwrap();
-    let included = INCLUDED_STARTS_PER_DAY as f64;
-    writeln!(
-        s,
-        r#"<line class="ref" x1="{left}" x2="{x1}" y1="{y0}" y2="{y0}" stroke-dasharray="4 4"/>
-<text class="dim" x="{lx}" y="{ly}" font-size="11" text-anchor="end">included in the plan (about {INCLUDED_STARTS_PER_DAY} a day, estimated)</text>"#,
-        x1 = x(max),
-        y0 = y(included),
-        lx = x(max),
-        ly = y(included) - 7.0,
+        by = H - 10.0,
+        ly = included - 7.0,
     )
     .unwrap();
     for (i, (name, _, _)) in SERIES.iter().enumerate() {
-        let points: Vec<(f64, f64)> = rows
+        let series: Vec<&Row> = rows.iter().filter(|r| r.setup == *name).collect();
+        let points: Vec<(f64, f64)> = series
             .iter()
-            .filter(|r| r.setup == *name)
             .map(|r| (x(r.jobs as f64), y(r.starts as f64)))
             .collect();
         let path: Vec<String> = points
@@ -631,8 +628,10 @@ fn svg(rows: &[Row]) -> String {
             )
             .unwrap();
         }
-        let last = rows.iter().rfind(|r| r.setup == *name).expect("series");
-        let (px, py) = points.last().expect("series");
+        let ((px, py), last) = (
+            points.last().expect("series"),
+            series.last().expect("series"),
+        );
         writeln!(
             s,
             r#"<text class="ink" x="{tx:.1}" y="{ty:.1}" font-size="12">{name}: {starts}</text>"#,
@@ -660,7 +659,7 @@ fn main() {
     std::fs::write(dir.join("results.csv"), &table).expect("write results.csv");
     std::fs::write(dir.join("starts.svg"), svg(&rows)).expect("write starts.svg");
     print!("{table}");
-    // Checked here so a change that breaks the mock or the loop fails the bench.
+    // A change that breaks the mock or the loop shows up here as jobs that never ran.
     let by_setup: BTreeMap<&str, usize> = rows.iter().fold(BTreeMap::new(), |mut m, r| {
         *m.entry(r.setup).or_default() += r.unserved;
         m

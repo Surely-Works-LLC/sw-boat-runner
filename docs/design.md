@@ -1,7 +1,7 @@
 # Design
 
 sw-boat-runner keeps self-hosted GitHub Actions runners on [boat](https://boat.dev) machines,
-so jobs reuse machines instead of paying for a new one per job.
+so jobs reuse machines instead of starting a new one per job.
 
 ## Why
 
@@ -36,8 +36,8 @@ next tick tries again. Presets:
 | `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
 | `hybrid` | `slot, resume, fork` | stopped after `idle_stop_s` | bursts above the pool size |
 
-`hybrid` is the default. `min_up` needs `slot`, the only step that registers runners on
-kept machines.
+`hybrid` is the default. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
+`min_up` need `slot`, the only step that registers runners on kept machines.
 
 Every runner is a just-in-time runner: it is registered through GitHub's JIT config,
 takes one job and exits. A long-lived runner would need a registration token on the
@@ -99,9 +99,9 @@ second fork for one job; the listing-lag, lost-create and restart rules below do
 
 The daemon keeps a few facts in memory only: when each machine changed state and last had
 a busy or registered runner, which runners it has seen online, the forks boat has not
-listed yet, and the cents spent on starts today. A machine first seen counts as never
-busy, which can only delay a stop. The rules below keep the daemon safe on a stale
-snapshot and across a restart. Each is a `Fix*` flag in `spec/BoatRunner.tla`, and
+listed yet, the cents spent on starts today, and the time before which it makes no start.
+A machine first seen counts as never busy, which can only delay a stop. The rules below
+keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in `spec/BoatRunner.tla`, and
 [spec/README.md](../spec/README.md#fix-flags) describes the counterexample TLC finds
 without it.
 
@@ -163,16 +163,17 @@ process saw it online is `Registered` until that timeout.
 
 | Action | Guard |
 | - | - |
-| `Register(machine, slot)` | machine `Up`, slot free (a slot whose runner gets `Unregister` this tick counts as free), unmet demand for the pool's labels |
-| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand left after free slots or kept `Up + Starting < min_up` |
-| `Fork(job)` | unmet demand left after slots and resumes, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine with this job's label yet |
+| `Register(machine, slot)` | demand above 0, machine `Up`, and either an ephemeral machine with no runner seen since it came up (slot 0, filled first), or `slot` in placement and a free slot on a kept machine (a slot whose runner gets `Unregister` this tick counts as free) |
+| `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand or kept `Up + Starting < min_up` |
+| `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
-| `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand, no `Busy` or `Registered` runner, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` machines `Up` |
+| `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
 | `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
-in `Registered` or `Idle`, minus the capacity of its `Starting` machines (one for an
+in `Registered` or `Idle` that keep their slot this tick. Unmet demand is what is left
+after this tick's registers and the capacity of the pool's `Starting` machines (one for an
 ephemeral machine, `slots_per_box` for any other). A job matches a pool when the job's
 labels, compared without case, are a subset of the pool's. A JIT runner carries only the
 pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects a pool
@@ -184,7 +185,7 @@ last state change. The policy accepts `fork_ttl_s` from 1 to 2592000 (30 days, b
 longest TTL) and rejects anything else rather than clamping it.
 
 An ephemeral machine's job has finished when the machine is `Stopped`, or when it is `Up`
-with no live runner and either a runner on it was seen busy or it is older than
+with no live runner and either a runner was seen on it or it has been `Up` longer than
 `register_timeout_s`.
 
 ## Properties

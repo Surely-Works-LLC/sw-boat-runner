@@ -1,11 +1,11 @@
 ----------------------------- MODULE BoatRunner -----------------------------
 (***************************************************************************)
-(* One sw-boat-runner pool: GitHub's queue and runners, boat's machines,  *)
-(* and the reconciler of docs/design.md as src/decide.rs and src/run.rs   *)
-(* implement it. Stop and Delete are decided from one snapshot and        *)
-(* executed later, because run::execute does not look again; every other  *)
-(* tool action reads the current state. The Fix* constants switch on the  *)
-(* fixes listed in spec/README.md; the code has all nine.                 *)
+(* One sw-boat-runner pool: GitHub's queue and runners, boat's machines,   *)
+(* and the daemon of docs/design.md as src/decide.rs and src/run.rs        *)
+(* implement it. Stop and Delete are decided from one snapshot and         *)
+(* executed later, because run::execute does not look again; every other   *)
+(* daemon action reads the current state. The Fix* constants switch on the *)
+(* fixes listed in spec/README.md; the code has all nine.                  *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -27,11 +27,11 @@ CONSTANTS
     FixForkKey,     \* every fork request has a fresh Idempotency-Key
     FixStaleAct,    \* Stop and Delete first remove the machine's GitHub runner,
                     \* which GitHub refuses while it runs a job
-    FixKeptInflight,\* after a restart the tool starts nothing until every fork
+    FixKeptInflight,\* after a restart the daemon starts nothing until every fork
                     \* sent before the crash is listed or has failed
-    FixListLag,     \* the tool counts the forks it created until the listing
+    FixListLag,     \* the daemon counts the forks it created until the listing
                     \* shows them
-    FixLostCreate,  \* after a create with no definite answer the tool starts
+    FixLostCreate,  \* after a create with no definite answer the daemon starts
                     \* nothing until boat lists the machine
     FixLostSpend    \* a create with no definite answer counts its price as spent
 
@@ -54,15 +54,15 @@ VARIABLES
     runner,       \* GitHub: the runner on the machine's one slot
     status,       \* GitHub: Pending (not yet arrived), Queued, Running, Done
     jobOn,        \* GitHub: the machine running the job
-    seen,         \* tool memory: last_busy >= since on an ephemeral machine
-    idle,         \* tool memory: idle_stop_s since last_busy and min_up_s since since
+    seen,         \* daemon memory: last_busy >= since on an ephemeral machine
+    idle,         \* daemon memory: idle_stop_s since last_busy and min_up_s since since
     age,          \* now - since: 0, 1 past register_timeout_s, 2 past fork_ttl_s
-    plan,         \* tool: a Stop or Delete decided this tick and not yet executed
+    plan,         \* daemon: a Stop or Delete decided this tick and not yet executed
     starts,       \* boat: counted starts today
-    spent_today,  \* tool memory: Limits.spent_today_cents, in start prices
+    spent_today,  \* daemon memory: Limits.spent_today_cents, in start prices
     keys,         \* boat: job fork Idempotency-Keys already used today
     ran,          \* ghost: a job ran on this ephemeral machine
-    lag,          \* boat's listing and tool memory of a created machine; see Vis
+    lag,          \* boat's listing and daemon memory of a created machine; see Vis
     faults
 
 vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
@@ -74,14 +74,14 @@ vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
 Count(S) == Cardinality(S)
 Has(step) == step \in Placement
 
-(* boat lists a created machine some time after the create returns. Listed: *)
-(* in the listing. Known: not yet listed; the tool remembers creating it and *)
-(* counts it as a Starting machine. Hidden: not yet listed and not counted.  *)
-(* Lost: not yet listed, and the create's answer never reached the tool.    *)
-(* Orphan: not yet listed and created before a restart, which lost the      *)
-(* tool's memory. The listing catches up before the machine boots; an Up    *)
-(* machine missing from it would add only a delay, since the tool registers *)
-(* runners on listed machines alone.                                         *)
+(* boat lists a created machine some time after the create returns.        *)
+(* Listed: in the listing. Known: not yet listed; the daemon remembers     *)
+(* creating it and counts it as a Starting machine. Hidden: not yet listed *)
+(* and not counted. Lost: not yet listed, and the create's answer never    *)
+(* reached the daemon. Orphan: not yet listed and created before a         *)
+(* restart, which lost the daemon's memory. The listing catches up before  *)
+(* the machine boots; an Up machine missing from it would add only a       *)
+(* delay, since the daemon registers runners on listed machines alone.     *)
 Vis(m) == lag[m] \in {"Listed", "Known"}
 Grows == Has("resume") /\ ~Has("fork")
 Live(m) == mstate[m] \in {"Starting", "Up"}
@@ -145,7 +145,7 @@ Observed == \A m \in Machines : ~ObserveGuard(m)
 NoPlan == \A m \in Machines : plan[m] = "None"
 
 -----------------------------------------------------------------------------
-(* Tool actions, in decide's order. *)
+(* Daemon actions, in decide's order. *)
 
 UnregisterGuard(m) ==
     /\ Observed
@@ -210,7 +210,7 @@ StopGuard(m) ==
     /\ ~RegisterPick(m)
 
 \* A stopped or deleted machine takes its runner offline, and the job that was
-\* running there goes back to the queue. With FixStaleAct the tool deleted the
+\* running there goes back to the queue. With FixStaleAct the daemon deleted the
 \* runner first, so none is left.
 Drop(m) ==
     /\ runner' = [runner EXCEPT ![m] = IF @ = "None" \/ FixStaleAct THEN "None" ELSE "Offline"]
@@ -271,7 +271,7 @@ Register(m) ==
     /\ UNCHANGED <<lag, mstate, job, keep, status, jobOn, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
-\* The tool adds the quoted price whether or not boat counts the start.
+\* The daemon adds the quoted price whether or not boat counts the start.
 Resume(m) ==
     /\ ResumeGuard(m)
     /\ mstate' = [mstate EXCEPT ![m] = "Starting"]
@@ -297,7 +297,7 @@ ForkKept ==
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, keys, ran, faults>>
 
 \* With the job key as Idempotency-Key, boat answers a reused key with the old,
-\* deleted machine: nothing starts, and the tool still adds the price.
+\* deleted machine: nothing starts, and the daemon still adds the price.
 Fork(j) ==
     /\ ForkGuard(j)
     /\ IF FixForkKey \/ j \notin keys
@@ -363,11 +363,11 @@ ComeOnline(m) ==
     /\ UNCHANGED <<lag, mstate, job, keep, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
-(* Time is abstract: a flag moves once its timeout has passed. The timing    *)
-(* assumptions: the tool registers within a tick and GitHub assigns within   *)
-(* seconds, both far inside idle_stop_s and register_timeout_s, so a machine *)
-(* that could serve a queued job does not age into idle, and a fresh fork    *)
-(* with demand waiting does not age past register_timeout_s.                 *)
+(* Time is abstract: a flag moves once its timeout has passed. The timing  *)
+(* assumptions: the daemon registers within a tick and GitHub assigns      *)
+(* within seconds, both far inside idle_stop_s and register_timeout_s, so  *)
+(* a machine that could serve a queued job does not age into idle, and a   *)
+(* fresh fork with demand waiting does not age past register_timeout_s.    *)
 TickIdle(m) ==
     /\ Kept(m)
     /\ mstate[m] = "Up"
@@ -436,7 +436,7 @@ RunnerOffline(m) ==
                    starts, spent_today, keys, ran>>
 
 \* With FixStaleAct, deleting the runner fails on a network error, a rate limit
-\* or a 5xx, and the tool skips the Stop or Delete this tick. A Busy runner is
+\* or a 5xx, and the daemon skips the Stop or Delete this tick. A Busy runner is
 \* refused every time, in Execute.
 RefuseUnregister(m) ==
     /\ Fault
@@ -448,7 +448,7 @@ RefuseUnregister(m) ==
                    starts, spent_today, keys, ran>>
 
 \* A create times out, fails in transport or gets a 5xx, and boat made the
-\* machine anyway. Without FixLostSpend the tool adds the price only when boat
+\* machine anyway. Without FixLostSpend the daemon adds the price only when boat
 \* answers, so it misses the start boat counted. A lost create of a machine
 \* boat never made only delays the next start.
 LostCreate ==
@@ -462,20 +462,21 @@ LostCreate ==
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
 
 \* boat answers 429, or 503 no_ready_machine or out_of_capacity: nothing starts,
-\* nothing is counted, and the tool tries again after Retry-After.
+\* nothing is counted, and the daemon tries again after Retry-After.
 RefuseStart ==
     /\ Fault
     /\ CanResume \/ ForkKeptGuard \/ \E j \in Jobs : ForkGuard(j)
     /\ UNCHANGED <<lag, mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran>>
 
-(* A restart between two actions loses the tick's unexecuted plan. Every     *)
-(* machine's since and last_busy start over at first sight, and the online   *)
-(* set is lost, so a runner that went offline reads as Registered past its   *)
-(* timeout. spent_today cannot be recovered from boat. Every fork key is a   *)
-(* fresh UUID v4, so the tool cannot find a create that boat has not listed  *)
-(* yet: that machine becomes an Orphan. A create still in flight at the      *)
-(* crash is the same case, with boat counting the start a little later.     *)
+(* A restart between two actions loses the tick's unexecuted plan. Every   *)
+(* machine's since and last_busy start over at first sight, and the online *)
+(* set is lost, so a runner that went offline reads as Registered past its *)
+(* timeout. spent_today cannot be recovered from boat. Every fork key is a *)
+(* fresh UUID v4, so the daemon cannot find a create that boat has not     *)
+(* listed yet: that machine becomes an Orphan. A create still in flight at *)
+(* the crash is the same case, with boat counting the start a little       *)
+(* later.                                                                  *)
 Crash ==
     /\ Fault
     /\ seen' = [m \in Machines |-> FixCrashSeen /\ IsEph(m) /\ mstate[m] = "Up"]
@@ -627,7 +628,7 @@ NoLeak ==
         (IsEph(m) /\ Live(m) /\ (status[job[m]] = "Done" \/ PastTtl(m)))
             ~> (mstate[m] = "Gone")
 
-\* No placement step can serve a job: nothing is up or starting, and the tool's
+\* No placement step can serve a job: nothing is up or starting, and the daemon's
 \* budget or max_boxes allows no start. A pool with resume and no fork forks kept
 \* machines for demand, so either step can start one.
 CanStart ==

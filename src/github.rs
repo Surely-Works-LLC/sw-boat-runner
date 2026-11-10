@@ -10,12 +10,12 @@ use crate::boat;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
 use crate::run::Transport;
 
-pub const API: &str = "https://api.github.com";
+pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
-pub const PREFIX: &str = "sbr-";
+pub(crate) const PREFIX: &str = "sbr-";
 /// Requests stop for the rest of the rate-limit window once fewer than this many remain,
 /// so a human with the same token keeps some budget.
-pub const RATE_FLOOR: u64 = 200;
+pub(crate) const RATE_FLOOR: u64 = 200;
 const PER_PAGE: usize = 100;
 const MAX_PAGES: u32 = 10;
 
@@ -40,7 +40,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn is_fatal(&self) -> bool {
+    pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::Unauthorized { .. })
     }
 }
@@ -61,7 +61,7 @@ impl fmt::Display for Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct GhRunner {
+pub(crate) struct GhRunner {
     pub id: u64,
     pub name: String,
     /// `online` or `offline`.
@@ -71,16 +71,16 @@ pub struct GhRunner {
 
 /// A just-in-time runner config. It is a credential: no `Debug`, no `Display`, and the
 /// only way out is `expose`.
-pub struct JitConfig(String);
+pub(crate) struct JitConfig(String);
 
 impl JitConfig {
-    pub fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
 
 /// `sbr-<pool>-<machine id>-<slot>-<registered unix time>`.
-pub fn runner_name(pool: &str, machine: &str, slot: u32, registered_at: UnixSecs) -> String {
+pub(crate) fn runner_name(pool: &str, machine: &str, slot: u32, registered_at: UnixSecs) -> String {
     format!("{PREFIX}{pool}-{machine}-{slot}-{registered_at}")
 }
 
@@ -92,8 +92,9 @@ pub struct RunnerName {
     pub registered_at: UnixSecs,
 }
 
-/// Inverse of `runner_name`. Splits from the right, because a pool name may contain `-`
-/// and a boat id never does.
+/// Inverse of `runner_name`. Splits from the right: the time, slot and boat id never
+/// contain `-`, so the rest is the pool name. `policy::validate` keeps `-` out of pool
+/// names anyway.
 pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
     let mut parts = name.strip_prefix(PREFIX)?.rsplitn(4, '-');
     let registered_at = parts.next()?.parse().ok()?;
@@ -115,7 +116,7 @@ pub fn parse_runner_name(name: &str) -> Option<RunnerName> {
 /// process has not seen online. After a restart a runner that went offline earlier is
 /// `Registered`, and `decide` unregisters it once `register_timeout_s` has passed since its
 /// `registered_at`.
-pub fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
+pub(crate) fn runner_state(online: bool, busy: bool, seen_online: bool) -> RunnerState {
     if busy {
         RunnerState::Busy
     } else if online {
@@ -133,7 +134,7 @@ struct Cached {
     used: bool,
 }
 
-pub struct Client<'t> {
+pub(crate) struct Client<'t> {
     t: &'t dyn Transport,
     token: String,
     repo: String,
@@ -146,7 +147,7 @@ pub struct Client<'t> {
 }
 
 impl<'t> Client<'t> {
-    pub fn new(t: &'t dyn Transport, token: String, repo: String) -> Self {
+    pub(crate) fn new(t: &'t dyn Transport, token: String, repo: String) -> Self {
         Client {
             t,
             token,
@@ -159,7 +160,7 @@ impl<'t> Client<'t> {
 
     /// Sets the clock and drops cached bodies the previous tick did not use, so the
     /// cache holds at most one tick's URLs.
-    pub fn begin_tick(&mut self, now: UnixSecs) {
+    pub(crate) fn begin_tick(&mut self, now: UnixSecs) {
         self.now = now;
         self.cache.retain(|_, c| c.used);
         for c in self.cache.values_mut() {
@@ -207,9 +208,37 @@ impl<'t> Client<'t> {
 
         let num = |name: &str| resp.header(name).and_then(|v| v.trim().parse::<u64>().ok());
         let remaining = num("x-ratelimit-remaining");
-        let reset = num("x-ratelimit-reset").unwrap_or(self.now.saturating_add(60));
+        let retry_after = num("retry-after");
+        let a_minute = self.now.saturating_add(60);
+        let reset = num("x-ratelimit-reset").unwrap_or(a_minute);
         if let Some(r) = remaining.filter(|&r| r < RATE_FLOOR) {
             self.limited = Some((r, reset));
+        }
+        let message = || {
+            let v: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
+            v.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        // GitHub signals a secondary rate limit with 403 or 429 and a message, sometimes
+        // with neither header; it then asks for a wait of at least a minute.
+        let rate_limited = matches!(resp.status, 403 | 429)
+            && (resp.status == 429
+                || remaining == Some(0)
+                || retry_after.is_some()
+                || message().to_ascii_lowercase().contains("rate limit"));
+        if rate_limited {
+            let reset = match (retry_after, remaining) {
+                (Some(s), _) => self.now.saturating_add(s),
+                (None, Some(0)) => reset,
+                (None, _) => a_minute,
+            };
+            self.limited = Some((0, reset));
+            return Err(Error::RateLimited {
+                remaining: 0,
+                reset,
+            });
         }
         match resp.status {
             304 => match self.cache.get_mut(&url) {
@@ -233,26 +262,14 @@ impl<'t> Client<'t> {
                 }
                 Ok(resp.body)
             }
-            403 | 429 if remaining == Some(0) || resp.header("retry-after").is_some() => {
-                let reset = num("retry-after").map_or(reset, |s| self.now.saturating_add(s));
-                self.limited = Some((0, reset));
-                Err(Error::RateLimited {
-                    remaining: 0,
-                    reset,
-                })
-            }
             401 | 403 => Err(Error::Unauthorized {
                 status: resp.status,
             }),
             404 => Err(Error::NotFound),
-            status => {
-                let v: Value = serde_json::from_slice(&resp.body).unwrap_or(Value::Null);
-                let message = v.get("message").and_then(Value::as_str).unwrap_or("");
-                Err(Error::Status {
-                    status,
-                    message: message.to_string(),
-                })
-            }
+            status => Err(Error::Status {
+                status,
+                message: message(),
+            }),
         }
     }
 
@@ -262,7 +279,7 @@ impl<'t> Client<'t> {
     }
 
     /// The repository's runners whose names start with `sbr-`.
-    pub fn runners(&mut self) -> Result<Vec<GhRunner>, Error> {
+    pub(crate) fn runners(&mut self) -> Result<Vec<GhRunner>, Error> {
         #[derive(Deserialize)]
         struct Page {
             runners: Vec<GhRunner>,
@@ -282,7 +299,7 @@ impl<'t> Client<'t> {
     }
 
     /// Registers an ephemeral runner (one job) in the default group 1.
-    pub fn generate_jitconfig(
+    pub(crate) fn generate_jitconfig(
         &mut self,
         name: &str,
         labels: &[String],
@@ -299,14 +316,14 @@ impl<'t> Client<'t> {
         Ok(JitConfig(out.encoded_jit_config))
     }
 
-    pub fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
+    pub(crate) fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
         self.request("DELETE", &format!("/actions/runners/{id}"), None)
             .map(drop)
     }
 
     /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
     /// in-progress run still queues its later jobs.
-    pub fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
+    pub(crate) fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
         #[derive(Deserialize)]
         struct Runs {
             workflow_runs: Vec<Run>,
@@ -505,6 +522,31 @@ mod tests {
         assert_eq!(gh.delete_runner(5), Err(Error::NotFound));
         let err = gh.generate_jitconfig("n", &[]).err().unwrap();
         assert!(err.is_fatal());
+    }
+
+    /// A secondary rate limit without headers waits a minute instead of ending the daemon.
+    #[test]
+    fn secondary_rate_limit_is_not_unauthorized() {
+        let fake = Fake::new(|_| {
+            respond(
+                403,
+                &[("X-RateLimit-Remaining", "4000")],
+                r#"{"message":"You have exceeded a secondary rate limit."}"#,
+            )
+        });
+        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        gh.begin_tick(100);
+        let limited = Error::RateLimited {
+            remaining: 0,
+            reset: 160,
+        };
+        assert_eq!(gh.runners().unwrap_err(), limited);
+        assert_eq!(gh.queued_jobs().unwrap_err(), limited);
+        assert_eq!(fake.sent().len(), 1);
+
+        let fake = Fake::new(|_| respond(429, &[], "{}"));
+        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        assert!(matches!(gh.runners(), Err(Error::RateLimited { .. })));
     }
 
     #[test]
