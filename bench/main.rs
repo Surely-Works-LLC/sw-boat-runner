@@ -467,16 +467,20 @@ impl Transport for Mock {
     ) -> Result<Response, NetworkError> {
         let body: Value = body.map_or(Value::Null, |b| serde_json::from_slice(b).expect("json"));
         let mut world = self.0.borrow_mut();
+        let mut headers = Vec::new();
         let (status, answer) = if let Some(path) = url.strip_prefix("https://boat.dev/api/v1/") {
             world.boat(method, path, &body)
         } else if let Some(path) = url.strip_prefix("https://api.github.com/repos/o/r/actions/") {
+            // The mock sends no ETags, so every read would count against a real limit. A
+            // limit this high keeps the daemon's GitHub request budget out of the numbers.
+            headers.push(("x-ratelimit-limit".to_string(), "1000000000".to_string()));
             world.github(method, path, &body)
         } else {
             panic!("mock: {method} {url}")
         };
         Ok(Response {
             status,
-            headers: Vec::new(),
+            headers,
             body: answer.to_string().into_bytes(),
         })
     }
