@@ -66,9 +66,8 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         short = short.saturating_sub(1);
         want = want.saturating_sub(slots);
     }
-    if pool.has(Resume) {
-        short = short.saturating_sub(v.kept(Stopping).count());
-    }
+    let stopping = v.kept(Stopping).filter(|_| pool.has(Resume));
+    short = short.saturating_sub(stopping.count());
     // A start refused above is refused here too: the budget and boxes are the same.
     while v.fork_kept(want, short) && v.start(&mut starts) {
         actions.push(Action::Fork {
@@ -127,17 +126,11 @@ struct View<'a> {
 
 impl<'a> View<'a> {
     fn new(snap: &'a Snapshot, pool: &'a Pool) -> Self {
-        let mut machines: Vec<&Machine> = snap
-            .machines
-            .iter()
-            .filter(|m| m.pool == pool.name)
-            .collect();
+        let own = snap.machines.iter().filter(|m| m.pool == pool.name);
+        let mut machines: Vec<&Machine> = own.collect();
         machines.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut runners: Vec<&Runner> = snap
-            .runners
-            .iter()
-            .filter(|r| r.pool == pool.name)
-            .collect();
+        let own = snap.runners.iter().filter(|r| r.pool == pool.name);
+        let mut runners: Vec<&Runner> = own.collect();
         runners.sort_by(|a, b| a.name.cmp(&b.name));
         let mut by_machine: Vec<&Runner> = snap.runners.iter().collect();
         by_machine.sort_by(|a, b| a.machine.cmp(&b.machine));

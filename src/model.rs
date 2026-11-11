@@ -96,8 +96,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// A machine forked for one job, deleted after it (spec `IsEph`); every other machine
-    /// is kept and takes job after job.
+    /// Forked for one job and deleted after it (spec `IsEph`); any other machine is kept.
     pub fn is_ephemeral(&self) -> bool {
         self.job.is_some()
     }
