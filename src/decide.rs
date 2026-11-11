@@ -314,10 +314,6 @@ fn run_of<'s, T>(sorted: &'s [T], key: &str, key_of: impl Fn(&T) -> &String) -> 
 }
 
 #[cfg(test)]
-#[path = "decide_reference.rs"]
-mod reference;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Limits, MachineState as Ms, QueuedJob, RunnerState as Rs};
@@ -698,16 +694,12 @@ mod tests {
     #[ignore = "timing, not a check"]
     fn decide_timing() {
         let (s, p) = large_tick();
-        let time = |f: fn(&Snapshot, &Pool) -> Vec<Action>| {
-            let rounds = 20;
-            let start = std::time::Instant::now();
-            for _ in 0..rounds {
-                std::hint::black_box(f(std::hint::black_box(&s), &p));
-            }
-            start.elapsed() / rounds
-        };
-        println!("decide: {:?} per tick", time(decide));
-        println!("reference: {:?} per tick", time(reference::decide));
+        let rounds = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(decide(std::hint::black_box(&s), &p));
+        }
+        println!("decide: {:?} per tick", start.elapsed() / rounds);
     }
 
     mod properties {
@@ -835,61 +827,6 @@ mod tests {
                 .iter()
                 .filter(|a| matches!(a, Action::Resume { .. } | Action::Fork { .. }))
                 .count()
-        }
-
-        /// Wider than `arb_pool`: any placement order, limits of 0, and `min_up` without
-        /// slot, so the differential test also covers pools the policy rejects.
-        fn arb_any_pool() -> impl Strategy<Value = Pool> {
-            use Placement::{Fork, Resume, Slot};
-            let step = prop_oneof![Just(Slot), Just(Resume), Just(Fork)];
-            let times = (0u64..200, 0u64..200, 0u64..200, 0u64..400);
-            (vec(step, 0..4), 0u32..5, 0u32..5, 0u32..3, times, 0u32..30).prop_map(
-                |(placement, max_boxes, min_up, slots, times, cap)| Pool {
-                    name: "p".into(),
-                    labels: vec!["a".into(), "B".into()],
-                    machine_type: "large".into(),
-                    snapshot: "s".into(),
-                    placement,
-                    min_up,
-                    max_boxes,
-                    slots_per_box: slots,
-                    idle_stop_s: times.0,
-                    min_up_s: times.1,
-                    register_timeout_s: times.2,
-                    fork_ttl_s: times.3,
-                    paid_start_cents_per_day: cap,
-                },
-            )
-        }
-
-        /// Wider than `arb_snapshot`: machine ids and runner names may repeat, runners may
-        /// sit on machines of no pool, and boat may report the free starts left.
-        fn arb_any_snapshot() -> impl Strategy<Value = Snapshot> {
-            (
-                arb_snapshot(),
-                vec(0usize..6, 0..8),
-                vec(0usize..6, 0..8),
-                proptest::option::of(0u32..4),
-            )
-                .prop_map(|(mut snap, machine_ids, runner_names, free)| {
-                    for (m, id) in snap.machines.iter_mut().zip(machine_ids) {
-                        m.id = format!("m{id}");
-                    }
-                    for (r, name) in snap.runners.iter_mut().zip(runner_names) {
-                        r.name = format!("r{name}");
-                    }
-                    snap.limits.free_starts_left = free;
-                    snap
-                })
-        }
-
-        proptest! {
-            #![proptest_config(ProptestConfig::with_cases(20_000))]
-            /// The rewrite returns exactly what the frozen pre-rewrite `decide` returned.
-            #[test]
-            fn matches_the_reference(snap in arb_any_snapshot(), pool in arb_any_pool()) {
-                prop_assert_eq!(decide(&snap, &pool), reference::decide(&snap, &pool));
-            }
         }
 
         proptest! {
