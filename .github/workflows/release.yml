@@ -99,8 +99,10 @@ jobs:
             on { print }
           ' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          # No --clobber: a re-run fails on an asset that is already published rather
+          # than replace it.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+            gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS
           else
             pre=()
             [[ $TAG != *-* ]] || pre=(--prerelease)

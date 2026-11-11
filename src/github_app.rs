@@ -185,7 +185,8 @@ fn installation_id(t: &dyn Transport, jwt: &str, repo: &str) -> Result<u64, Erro
     Ok(out.id)
 }
 
-/// `POST /app/installations/{id}/access_tokens`, for the policy's repository only.
+/// `POST /app/installations/{id}/access_tokens`, for the policy's repository only and
+/// only the permissions the daemon uses, whatever else the app was granted.
 fn exchange(
     t: &dyn Transport,
     jwt: &str,
@@ -199,7 +200,10 @@ fn exchange(
     }
     let url = format!("{API}/app/installations/{installation}/access_tokens");
     let name = repo.split_once('/').map_or(repo, |(_, name)| name);
-    let body = json!({ "repositories": [name] });
+    let body = json!({
+        "repositories": [name],
+        "permissions": { "administration": "write", "actions": "read" },
+    });
     let what = format!("get a token for installation {installation}");
     let bytes = call(t, "POST", &url, jwt, Some(&body), &what)?;
     // serde errors can quote the input; this input holds the token.
@@ -398,7 +402,13 @@ pub(crate) mod tests {
             assert_eq!(b64(jwt.split('.').nth(1).unwrap())["iss"], 12345);
         }
         let body: Value = serde_json::from_slice(sent[1].body.as_deref().unwrap()).unwrap();
-        assert_eq!(body, json!({"repositories": ["r"]}));
+        assert_eq!(
+            body,
+            json!({
+                "repositories": ["r"],
+                "permissions": {"administration": "write", "actions": "read"},
+            })
+        );
 
         // Held until five minutes before it expires; the installation is not looked up again.
         let refresh_at = 1_000_000_000 - REFRESH_EARLY_S;

@@ -33,8 +33,10 @@ All notable changes to this project are documented here. The format follows
 - The default preset is `warm`, not `hybrid`. A pool with no `preset` no longer forks a
   machine per job past its kept machines; set `preset = "hybrid"` to keep that.
 - The `runners` workflow lists the run's jobs with the run's own token, so the calling
-  job must grant `actions: read`.
-  Its `ref` default and the example's `uses:` follow `main`; pin both to one SHA.
+  job must grant `actions: read`. Its `ref` input is required, with no default; set it to
+  the same tag or SHA as `uses:`.
+- The daemon asks for GitHub App installation tokens with only Administration write and
+  Actions read, besides the one repository.
 
 ## [0.1.0] - 2026-11-11
 

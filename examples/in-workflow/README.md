@@ -16,10 +16,10 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@main   # pin a SHA
+    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.2.0
     with:
       snapshot: snap-1
-      ref: main                                                               # the same SHA
+      ref: v0.2.0                     # required; the same ref as `uses:`
       app-id: ${{ vars.BOAT_APP_ID }}
     secrets:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
@@ -40,11 +40,12 @@ if you add triggers: in a `pull_request_target` run `github.ref` is still the ba
 so only the event check stops it. [Pull requests](#pull-requests) says why.
 
 The `runners` job needs `contents: read` and `actions: read` from the run's token: it
-checks out the daemon and lists the run's jobs to know when they are done. `@main` and
-`ref` (default `main`) are placeholders: pin both to one commit SHA of this repository,
-or to a release tag that has the inputs you use (`app-id` is newer than `v0.1.0`).
-GitHub tells a called workflow nothing reliable about its own ref, so `uses:` pins the
-workflow and `ref` pins the daemon it builds: change both together.
+checks out the daemon and lists the run's jobs to know when they are done. Pin `uses:`
+to a release tag and set `ref` to the same tag (`v0.2.0` above is an example; `app-id`
+is newer than `v0.1.0`). For more certainty, pin both to the tag's full commit SHA,
+which nobody can move. `ref` is required: GitHub tells a called workflow nothing
+reliable about its own ref, so `uses:` pins the workflow and `ref` pins the daemon it
+builds, and the job gets your keys. Change both together.
 
 `snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
 describes. The daemon registers runners as a GitHub App installed on the repository with
@@ -55,7 +56,8 @@ an owner-only file in the job's temporary directory after the build and deleted 
 end. Instead of an app, pass a fine-grained token with Administration read and write and
 Actions read as the `RUNNER_ADMIN_TOKEN` secret; the `GITHUB_TOKEN` Actions creates for the run cannot
 register runners. Passing both, or an app ID without its key, fails the job at its first
-step. Optional inputs:
+step. The daemon asks for installation tokens limited to the calling repository with
+Administration write and Actions read, whatever else the app may do. Optional inputs:
 
 | Input | Default | |
 | - | - | - |
@@ -63,7 +65,6 @@ step. Optional inputs:
 | `max_boxes` | 4 | |
 | `pool` | `preset = "fork"` | More policy lines for the pool, such as `preset = "warm"`. |
 | `name` | none | Set it when one run calls the workflow more than once. The label is then `boat-<run id>-<attempt>-<name>`. |
-| `ref` | `main` | The sw-boat-runner tag or commit to build. Keep it the same as the `@` ref of `uses:`. |
 | `app-id` | none | The GitHub App's ID or client ID; its key goes in the `app-private-key` secret. Empty means `RUNNER_ADMIN_TOKEN`. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never

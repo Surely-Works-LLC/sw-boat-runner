@@ -13,10 +13,9 @@ To release `vX.Y.Z`:
 
 1. Set `version` in `Cargo.toml` and run `cargo check` so `Cargo.lock` follows.
 2. Add a `CHANGELOG.md` entry for the version, dated.
-3. The examples follow `main` (`@main` and `ref: main` in
-   `examples/in-workflow/README.md` and the `ref` default in
-   `.github/workflows/runners.yml`), with a note to pin a SHA. Point them at the tag if
-   you like.
+3. Point the examples at the new tag: `@vX.Y.Z` and `ref: vX.Y.Z` in
+   `examples/in-workflow/README.md`, and the `install.sh` URL and `SBR_REF` in
+   `examples/always-on/README.md`.
 4. Merge, then tag the merge commit `vX.Y.Z` and push the tag. The `release` workflow
    checks that the tag matches `Cargo.toml`, builds the binaries, attests their build
    provenance and publishes them with `SHA256SUMS` on the GitHub Release, with the

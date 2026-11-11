@@ -32,10 +32,12 @@ on:
       ref:
         # A called workflow cannot read the ref it was called at (github.workflow_ref and
         # workflow_sha name the caller's workflow), so the daemon's ref is its own pin.
+        # Required, with no default: a caller that pins `uses:` but leaves `ref` out would
+        # otherwise build whatever main is now, with its keys in the job.
         description: >-
-          The sw-boat-runner tag or commit to build. Keep it the same as the ref in the
-          caller's `uses:` line.
-        default: main
+          The sw-boat-runner tag or commit to build, such as v0.2.0. Keep it the same as
+          the ref in the caller's `uses:` line.
+        required: true
         type: string
       app-id:
         description: >-
