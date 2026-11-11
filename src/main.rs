@@ -8,12 +8,31 @@ const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
        sw-boat-runner plan <policy.toml> [snapshot.json]
        sw-boat-runner run <policy.toml>
-       sw-boat-runner drain <policy.toml>";
+       sw-boat-runner drain <policy.toml>
+       sw-boat-runner --help | --version";
+
+const HELP: &str = "\
+Keeps self-hosted GitHub Actions runners on boat machines.
+
+  check   validate a policy and print each pool with its preset applied
+  plan    print the actions run would take, from a snapshot file or one live read
+  run     observe, decide and act every tick_s seconds
+  drain   delete the policy's runners and machines; fails while any are left
+
+run, drain and a live plan read BOAT_API_KEY and GITHUB_TOKEN.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
+        ["-h" | "--help"] => {
+            println!("{USAGE}\n\n{HELP}");
+            ExitCode::SUCCESS
+        }
+        ["-V" | "--version"] => {
+            println!("sw-boat-runner {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         ["check", policy] => with_policy(policy, cmd_check),
         ["plan", policy] => with_policy(policy, |cfg| cmd_plan(cfg, None)),
         ["plan", policy, snapshot] => {
@@ -65,6 +84,9 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
             p.idle_stop_s,
             p.paid_start_cents_per_day,
         );
+    }
+    for warning in policy::warnings(cfg) {
+        eprintln!("warning: {warning}");
     }
     ExitCode::SUCCESS
 }
