@@ -1,3 +1,4 @@
+# Pins: Fork(none): an empty warm pool with nothing queued forks kept machines up to min_up.
 repo = "acme/app"
 
 [[pool]]

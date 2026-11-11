@@ -1,3 +1,4 @@
+# Pins: Fork(job): an empty fork pool forks one machine per queued job, up to max_boxes.
 repo = "acme/app"
 
 [[pool]]

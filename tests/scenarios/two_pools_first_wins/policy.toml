@@ -1,3 +1,4 @@
+# Pins: Routing: a job counts only for the first pool in the file whose labels match it.
 repo = "acme/app"
 
 [[pool]]

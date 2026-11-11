@@ -1,3 +1,4 @@
+# Pins: Start budget: at a paid quote, starts stop where spent_today plus their price would pass paid_start_cents_per_day.
 repo = "acme/app"
 
 [[pool]]

@@ -1,3 +1,4 @@
+# Pins: Delete: a fork whose job finished goes (runner offline after use, stopped, or no runner within register_timeout_s), a Busy one stays; Register fills a fresh fork.
 repo = "acme/app"
 
 [[pool]]

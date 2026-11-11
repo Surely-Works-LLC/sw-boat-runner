@@ -1,3 +1,4 @@
+# Pins: Fork(none): an empty warm pool forks kept machines for its jobs, one per slots_per_box jobs, up to max_boxes.
 repo = "acme/app"
 
 [[pool]]

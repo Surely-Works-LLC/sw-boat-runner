@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::boat;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
-use crate::transport::Transport;
+use crate::transport::{Transport, redact};
 
 pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
@@ -58,6 +58,17 @@ pub enum Error {
 impl Error {
     pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::Unauthorized { .. })
+    }
+
+    /// This error with every copy of `secret` in its text replaced.
+    fn redact(mut self, secret: &str) -> Self {
+        match &mut self {
+            Error::Network(text) | Error::Status { message: text, .. } | Error::Parse(text) => {
+                redact(text, secret)
+            }
+            Error::RateLimited { .. } | Error::Unauthorized { .. } | Error::NotFound => {}
+        }
+        self
     }
 }
 
@@ -275,12 +286,19 @@ impl<'t> Client<'t> {
         }
     }
 
+    /// The one request path: auth, the rate-limit floor, ETag reuse and status mapping.
+    /// No error carries the token.
     fn request(
         &mut self,
         method: &str,
         path: &str,
         body: Option<&Value>,
     ) -> Result<Vec<u8>, Error> {
+        let result = self.send(method, path, body);
+        result.map_err(|e| e.redact(&self.token))
+    }
+
+    fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Vec<u8>, Error> {
         if let Some((remaining, reset)) = self.limited {
             if self.now < reset {
                 return Err(Error::RateLimited { remaining, reset });
@@ -313,15 +331,14 @@ impl<'t> Client<'t> {
             .send(method, &url, &headers, bytes.as_deref())
             .map_err(|e| Error::Network(e.0))?;
 
-        let num = |name: &str| resp.header(name).and_then(|v| v.trim().parse::<u64>().ok());
-        let remaining = num("x-ratelimit-remaining");
-        let retry_after = num("retry-after");
+        let remaining = resp.number("x-ratelimit-remaining");
+        let retry_after = resp.number("retry-after");
         let a_minute = self.now.saturating_add(60);
-        let reset = num("x-ratelimit-reset").unwrap_or(a_minute);
+        let reset = resp.number("x-ratelimit-reset").unwrap_or(a_minute);
         if resp.status != 304 {
             self.budget.tokens -= 1.0;
         }
-        if let Some(limit) = num("x-ratelimit-limit").filter(|&l| l > 0) {
+        if let Some(limit) = resp.number("x-ratelimit-limit").filter(|&l| l > 0) {
             self.budget.limit = limit;
         }
         if let Some(r) = remaining {
@@ -470,7 +487,7 @@ impl<'t> Client<'t> {
     /// job's labels.
     ///
     /// A queued run's jobs are read every call; they rarely change, so most reads are
-    /// free 304s. An in-progress run's jobs change with every step, so they are read when
+    /// free 304s. A run in both lists, because it started between them, is read once. An in-progress run's jobs change with every step, so they are read when
     /// they can matter:
     /// - every call, while the run is new or re-run, or its last read found a queued job
     ///   a pool serves, so a job another runner took drops out at once;
@@ -498,13 +515,17 @@ impl<'t> Client<'t> {
         }
         let mut out = BTreeMap::new();
         let queued: Runs = self.get(&format!("/actions/runs?status=queued&per_page={PER_PAGE}"))?;
+        let mut read = HashSet::new();
         for run in queued.workflow_runs {
             out.extend(self.run_jobs(run.id)?);
+            read.insert(run.id);
         }
 
-        let runs: Runs = self.get(&format!(
+        let mut runs: Runs = self.get(&format!(
             "/actions/runs?status=in_progress&per_page={PER_PAGE}"
         ))?;
+        // A run that started between the two lists was just read as queued.
+        runs.workflow_runs.retain(|r| !read.contains(&r.id));
         let listed: HashSet<u64> = runs.workflow_runs.iter().map(|r| r.id).collect();
         self.runs.retain(|id, _| listed.contains(id));
         // (0 required, 1 changed, 2 old; last read; run)
@@ -737,7 +758,8 @@ mod tests {
             let body = if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5, "run_attempt": 2}]})
             } else if s.url.contains("status=in_progress") {
-                json!({"workflow_runs": [{"id": 6, "run_attempt": 1}]})
+                // Run 5 started between the two lists, so both have it.
+                json!({"workflow_runs": [{"id": 6, "run_attempt": 1}, {"id": 5, "run_attempt": 2}]})
             } else if s.url.contains("/runs/5/jobs") {
                 json!({"jobs": [
                     {"id": 50, "run_attempt": 2, "status": "queued", "labels": ["self-hosted", "large"]},
@@ -766,6 +788,12 @@ mod tests {
                 },
             ]
         );
+        let run_5 = fake
+            .sent()
+            .iter()
+            .filter(|s| s.url.contains("/runs/5/jobs"))
+            .count();
+        assert_eq!(run_5, 1);
     }
 
     #[test]

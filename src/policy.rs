@@ -116,7 +116,8 @@ struct RawPool {
     paid_start_cents_per_day: Option<Cents>,
 }
 
-/// The preset table in docs/design.md#strategies.
+/// The preset tables in docs/design.md#strategies and README.md#policy; the test
+/// `docs_state_the_presets_and_defaults` holds them to this code.
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum Preset {
@@ -206,7 +207,7 @@ fn validate(p: &Pool) -> Result<(), String> {
     }
     // The first step that fits is used, and a free slot never costs a start, so a list
     // that tries a start before a free slot only wastes starts.
-    if !p.placement.windows(2).all(|w| rank(w[0]) < rank(w[1])) {
+    if !p.placement.windows(2).all(|w| w[0] < w[1]) {
         return Err("placement steps must keep the order slot, resume, fork".into());
     }
     if p.placement.contains(&Placement::Resume) && !p.placement.contains(&Placement::Slot) {
@@ -236,14 +237,6 @@ fn validate(p: &Pool) -> Result<(), String> {
         return Err(format!("fork_ttl_s must be 1 to {MAX_TTL_S}"));
     }
     Ok(())
-}
-
-fn rank(step: Placement) -> u8 {
-    match step {
-        Placement::Slot => 0,
-        Placement::Resume => 1,
-        Placement::Fork => 2,
-    }
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -356,6 +349,96 @@ max_boxes = 4
         );
     }
 
+    /// The cells of each row of a Markdown table whose first cell is a `code` name.
+    fn table_rows(doc: &str) -> Vec<Vec<&str>> {
+        let rows = doc.lines().filter(|l| l.starts_with("| `"));
+        rows.map(|l| {
+            l.split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
+        .collect()
+    }
+
+    /// README's pool table and the preset tables in README and docs/design.md state what
+    /// `Preset::shape` and `RawPool::into_pool` do.
+    #[test]
+    fn docs_state_the_presets_and_defaults() {
+        let readme = include_str!("../README.md");
+        let design = include_str!("../docs/design.md");
+        let defaults = serde_json::to_value(&parse(&policy("")).unwrap().pools[0]).unwrap();
+        let mut checked = 0;
+        for row in table_rows(readme) {
+            let field = row[0].trim_matches('`');
+            let Some(value) = defaults.get(field) else {
+                continue;
+            };
+            let default = row[1];
+            match field {
+                "placement" => assert_eq!(default, "from the preset"),
+                "min_up" => assert_eq!(default, "1 for `pool`, else 0"),
+                "fork_ttl_s" => {
+                    assert_eq!(default, format!("{value} (at most {MAX_TTL_S})"));
+                }
+                _ if default == "required" => {
+                    let without = |l: &&str| !l.starts_with(&format!("{field} ="));
+                    let full = policy("");
+                    let text: Vec<&str> = full.lines().filter(without).collect();
+                    let missing = format!("missing field `{field}`");
+                    assert!(error(&text.join("\n")).contains(&missing), "{field}");
+                }
+                _ => assert_eq!(default, value.to_string(), "{field}"),
+            }
+            checked += 1;
+        }
+        // Every field of `Pool` has a row.
+        assert_eq!(checked, defaults.as_object().unwrap().len());
+        let hybrid = parse(&policy("preset = \"hybrid\"")).unwrap().pools[0].clone();
+        assert!(readme.contains("| `preset` | `hybrid` |"));
+        assert_eq!(parse(&policy("")).unwrap().pools[0], hybrid);
+
+        let presets = [
+            (Preset::Pool, "pool"),
+            (Preset::Warm, "warm"),
+            (Preset::Fork, "fork"),
+            (Preset::Hybrid, "hybrid"),
+        ];
+        for doc in [readme, design] {
+            let mut seen = 0;
+            // design.md's table of steps also has a `fork` row, with prose in column 2.
+            for row in table_rows(doc)
+                .into_iter()
+                .filter(|r| r[1].starts_with('`'))
+            {
+                let Some(&(preset, _)) = presets.iter().find(|p| row[0] == format!("`{}`", p.1))
+                else {
+                    continue;
+                };
+                let (placement, min_up) = preset.shape();
+                let steps: Vec<String> = placement
+                    .iter()
+                    .map(|s| {
+                        serde_json::to_value(s)
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect();
+                assert_eq!(row[1], format!("`{}`", steps.join(", ")));
+                assert_eq!(min_up == 1, matches!(preset, Preset::Pool));
+                seen += 1;
+            }
+            assert_eq!(seen, presets.len());
+        }
+        assert!(design.contains("`hybrid` is the default."));
+        assert!(readme.contains(&format!(
+            "`tick_s` (default {})",
+            crate::model::default_tick_s()
+        )));
+    }
+
     #[test]
     fn unknown_keys_are_errors() {
         assert!(error(&policy("idle_stop = 60")).contains("unknown field `idle_stop`"));
@@ -363,12 +446,6 @@ max_boxes = 4
         assert!(error(&policy("preset = \"lazy\"")).contains("unknown variant `lazy`"));
         assert!(error(&policy("preset = \"pool-jit\"")).contains("unknown variant `pool-jit`"));
         assert!(error(&policy("runner = \"jit\"")).contains("unknown field `runner`"));
-    }
-
-    #[test]
-    fn max_boxes_is_required() {
-        let text = format!("{REPO}{}", POOL.replace("max_boxes = 4", ""));
-        assert!(error(&text).contains("missing field `max_boxes`"));
     }
 
     #[test]

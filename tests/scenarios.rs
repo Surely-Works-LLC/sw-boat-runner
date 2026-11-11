@@ -1,5 +1,6 @@
 //! Each directory in tests/scenarios holds a `policy.toml`, a `snapshot.json` and, in
 //! `expected.jsonl`, the lines `sw-boat-runner plan policy.toml snapshot.json` prints.
+//! The policy's first line, `# Pins: ...`, names the one rule the scenario pins.
 
 use std::fs;
 use std::path::Path;
@@ -38,7 +39,12 @@ fn scenarios_plan_the_expected_actions() {
     dirs.sort();
     assert!(!dirs.is_empty());
     let mut failed = Vec::new();
+    let mut pins = String::new();
     for dir in &dirs {
+        match read(dir, "policy.toml").lines().next() {
+            Some(line) if line.starts_with("# Pins: ") => pins += line,
+            _ => failed.push(format!("{}: no `# Pins: ` first line", dir.display())),
+        }
         let expected: Result<Vec<Value>, _> = read(dir, "expected.jsonl")
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -51,6 +57,21 @@ fn scenarios_plan_the_expected_actions() {
                 "{}:\n  actual   {actual:?}\n  expected {expected:?}",
                 dir.display()
             ));
+        }
+    }
+    // Every action in the table in docs/design.md#state-machine has a scenario.
+    let guards = [
+        "Register",
+        "Resume",
+        "Fork(job)",
+        "Fork(none)",
+        "Stop",
+        "Delete",
+        "Unregister",
+    ];
+    for guard in guards {
+        if !pins.contains(&format!("{guard}:")) && !pins.contains(&format!("{guard} ")) {
+            failed.push(format!("no scenario pins {guard}"));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

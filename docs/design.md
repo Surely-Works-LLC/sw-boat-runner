@@ -62,8 +62,8 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 `GET /limits` quotes one price, for the next start, so `decide` prices every start of a
 tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
 boat's minute, hour and day windows, because the price past them is not known until the
-next tick. After each accepted start the daemon reads `GET /limits` again and makes no
-more starts that tick if the price changed. One account serves every pool, so each pool's
+next tick. Before each start that follows an accepted one, the daemon reads `GET /limits`
+again and makes no more starts that tick if the price changed. One account serves every pool, so each pool's
 cap is checked against the account-wide spend, including the starts that pools earlier in
 the file planned in the same tick. Prices are counted in whole cents, and a positive price
 under half a cent counts as 1 cent, so a paid start is never counted as free.
@@ -219,11 +219,11 @@ process saw it online is `Registered` until that timeout.
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
 | `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
-| `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
+| `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that the pool's listing does not show `Up` |
 
-Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
-in `Registered` or `Idle` that keep their slot this tick. Unmet demand is what is left
-after this tick's registers and the capacity of the pool's `Starting` machines (one for an
+Demand for a pool is the number of queued jobs whose labels it matches, each id and
+attempt counted once, minus its runners in `Registered` or `Idle` that keep their slot
+this tick. Unmet demand is what is left after this tick's registers and the capacity of the pool's `Starting` machines (one for an
 ephemeral machine, `slots_per_box` for any other). A job matches a pool when the job's
 labels, compared without case, are a subset of the pool's. A JIT runner carries only the
 pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects a pool
@@ -243,8 +243,9 @@ with no live runner and either a runner was seen on it or it has been `Up` longe
 
 ## Properties
 
-Safety, checked by TLC. `NoBusyStop`, `MaxBoxes`, `StartBudget`, `NoDoubleFork` and
-`EphemeralIsolation` also have property tests on one tick of `decide`.
+Safety, checked by TLC. Every property below but `OneJobPerRunner`, which is GitHub's
+behaviour, also has a property test on one tick of `decide`, named after it in
+`src/decide.rs`; for liveness the test checks the tick that makes progress.
 
 1. `NoBusyStop`: no `Stop` or `Delete` of a machine with a `Busy` runner.
 2. `OneJobPerRunner`: a JIT runner runs at most one job.

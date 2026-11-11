@@ -1,3 +1,4 @@
+# Pins: Unregister: a Registered runner past register_timeout_s is unregistered and its slot takes a Register.
 repo = "acme/app"
 
 [[pool]]
