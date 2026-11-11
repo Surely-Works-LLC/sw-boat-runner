@@ -12,8 +12,9 @@ boat ssh <id>
 Inside the machine:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/main/examples/always-on/install.sh
-bash install.sh    # builds the daemon, then runs `sw-boat-runner setup`
+# v0.2.0 is an example: use the release you tested, here and in SBR_REF.
+curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.2.0/examples/always-on/install.sh
+SBR_REF=v0.2.0 bash install.sh    # gets the daemon, then runs `sw-boat-runner setup`
 ```
 
 `setup` asks for the repository, labels and snapshot, creates a GitHub App and asks for
@@ -21,14 +22,17 @@ bash install.sh    # builds the daemon, then runs `sw-boat-runner setup`
 ([policy.toml](policy.toml) is a start), and a `GITHUB_TOKEN` in the environment means a
 personal token instead of an App.
 
-The script builds the `main` branch. For production, pin a commit, in both the `curl` URL
-and `SBR_REF`, so a reinstall builds what you tested:
-
-```sh
-SBR_REF=<commit hash> bash install.sh policy.toml
-```
-
-`SBR_REF` also takes another branch name, or a tag such as `v0.2.0` once there are tags.
+Pin the same tag in the URL and in `SBR_REF`, so a reinstall gets what you tested. On
+Linux x86_64 or arm64 the script downloads that release's static binary and checks it
+against the release's `SHA256SUMS`; if `gh` is installed and logged in, it also checks
+the binary's build provenance attestation with `gh attestation verify`, and otherwise
+says the attestation was not checked. On other machines, or for a release with no binary
+for the machine, it builds that tag with cargo. A network error, a server error or a
+failed check stops the script; it never falls back to another version. Without
+`SBR_REF` it installs the latest release, and stops if that release has no `setup`.
+`SBR_REF` can also be a commit hash or a branch name, which are built with cargo; `main`
+is built only when you ask for it. [Verifying a release](#verifying-a-release) shows the
+same checks by hand.
 
 To use a GitHub App instead of a personal token, copy its private key to the machine
 (over `boat scp`, or paste it into a file over `boat ssh`) and set the App variables
@@ -41,7 +45,7 @@ bash install.sh policy.toml    # asks for BOAT_API_KEY only
 rm "$HOME/app.pem"
 ```
 
-[install.sh](install.sh) builds the daemon, and `setup` asks for the keys without echo
+[install.sh](install.sh) gets the daemon, and `setup` asks for the keys without echo
 and stores the policy in `/etc/sw-boat-runner` and the keys in `/etc/sw-boat-runner/env`
 (mode 0600, readable by root only). An App's private key goes to
 `/etc/sw-boat-runner/github-app.pem`, also 0600 and root's, and systemd hands the
@@ -74,3 +78,19 @@ sudo sh -c 'set -a; . /etc/sw-boat-runner/env; /usr/local/bin/sw-boat-runner dra
 The script has been run on a boat `small` machine with a GitHub App: the policy, the
 unit it writes, `LoadCredential` for the App's key and `DynamicUser`. The service starts
 and runs.
+
+## Verifying a release
+
+Each release has `sw-boat-runner-<target>.tar.gz` for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu` and `aarch64-apple-darwin`, a `SHA256SUMS` file, and a build
+provenance attestation signed by the `release` workflow. To check a download by hand:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify sw-boat-runner-x86_64-unknown-linux-gnu.tar.gz --repo Surely-Works-LLC/sw-boat-runner
+```
+
+`SHA256SUMS` is published on the same release as the tarballs, so the checksum only
+catches a corrupted or truncated download, not a release whose files were replaced
+together. The attestation is what shows the tarball was built by this repository's
+`release` workflow from the tagged commit; check it whenever you can.

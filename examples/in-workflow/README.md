@@ -13,12 +13,17 @@ permissions:
 jobs:
   runners:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.1.0
+    permissions:
+      contents: read
+      actions: read
+    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.2.0
     with:
       snapshot: snap-1
+      ref: v0.2.0                     # required; the same ref as `uses:`
+      app-id: ${{ vars.BOAT_APP_ID }}
     secrets:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
-      RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+      app-private-key: ${{ secrets.BOAT_APP_PRIVATE_KEY }}
 
   test:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -34,14 +39,25 @@ The trigger and the `if:` on both jobs keep the pool to pushes to `main`. Keep t
 if you add triggers: in a `pull_request_target` run `github.ref` is still the base branch,
 so only the event check stops it. [Pull requests](#pull-requests) says why.
 
-The `runners` job needs only `contents: read` from the run's token. `@v0.1.0` pins the
-workflow and `ref` (default `v0.1.0`) pins the daemon it builds. GitHub tells a called
-workflow nothing reliable about its own ref, so the two are separate: change both
-together, to a later tag or to one commit SHA.
+The `runners` job needs `contents: read` and `actions: read` from the run's token: it
+checks out the daemon and lists the run's jobs to know when they are done. Pin `uses:`
+to a release tag and set `ref` to the same tag (`v0.2.0` above is an example; `app-id`
+is newer than `v0.1.0`). For more certainty, pin both to the tag's full commit SHA,
+which nobody can move. `ref` is required: GitHub tells a called workflow nothing
+reliable about its own ref, so `uses:` pins the workflow and `ref` pins the daemon it
+builds, and the job gets your keys. Change both together.
 
 `snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
-describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section; the
-`GITHUB_TOKEN` Actions creates for the run cannot register runners. Optional inputs:
+describes. The daemon registers runners as a GitHub App installed on the repository with
+Administration read and write and Actions read: pass its ID as `app-id` (a variable is
+fine) and its private key as the `app-private-key` secret. The daemon mints and renews
+the installation token, scoped to the calling repository, itself; the key is written to
+an owner-only file in the job's temporary directory after the build and deleted at the
+end. Instead of an app, pass a fine-grained token with Administration read and write and
+Actions read as the `RUNNER_ADMIN_TOKEN` secret; the `GITHUB_TOKEN` Actions creates for the run cannot
+register runners. Passing both, or an app ID without its key, fails the job at its first
+step. The daemon asks for installation tokens limited to the calling repository with
+Administration write and Actions read, whatever else the app may do. Optional inputs:
 
 | Input | Default | |
 | - | - | - |
@@ -49,7 +65,7 @@ describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section;
 | `max_boxes` | 4 | |
 | `pool` | `preset = "fork"` | More policy lines for the pool, such as `preset = "warm"`. |
 | `name` | none | Set it when one run calls the workflow more than once. The label is then `boat-<run id>-<attempt>-<name>`. |
-| `ref` | `v0.1.0` | The sw-boat-runner tag or commit to build. Keep it the same as the `@` ref of `uses:`. |
+| `app-id` | none | The GitHub App's ID or client ID; its key goes in the `app-private-key` secret. Empty means `RUNNER_ADMIN_TOKEN`. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never
 share a daemon. The `runners` job ends once every other job of the run is done, and then
@@ -69,8 +85,9 @@ What this costs compared with a daemon that stays up:
 
 [self-hosted.yml](../../.github/workflows/self-hosted.yml) in this repository is a
 working caller that runs `cargo test` on a machine the daemon forks. Its jobs are skipped
-unless the repository variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) and the
-two secrets are set, and they are not set here, so it does not run in this repository. A
+unless the repository variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) is set,
+along with the variable `BOAT_APP_ID` and the secrets `BOAT_API_KEY` and
+`BOAT_APP_PRIVATE_KEY`, and they are not set here, so it does not run in this repository. A
 fork that sets them runs it.
 
 ## Pull requests
