@@ -31,17 +31,21 @@ pub enum Error {
     /// after `retry_after_s`.
     Refused {
         code: String,
+        message: String,
         retry_after_s: u64,
     },
-    /// 409: state conflict, idempotency in progress or key reused.
+    /// 409: state conflict, idempotency in progress, key reused, or a `deploy_failed`
+    /// create that boat cannot place.
     Conflict {
         code: String,
+        message: String,
     },
     /// 402: the wallet needs billing; nothing will start until a human acts.
     BillingRequired,
     /// 401 or 403: bad key, suspended org, or a machine type the plan does not allow.
     Unauthorized {
         code: String,
+        message: String,
     },
     NotFound,
     Network(String),
@@ -75,22 +79,42 @@ impl fmt::Display for Error {
         match self {
             Error::Refused {
                 code,
+                message,
                 retry_after_s,
-            } => write!(
-                f,
-                "boat refused the call ({code}), retry in {retry_after_s}s"
-            ),
-            Error::Conflict { code } => write!(f, "boat conflict ({code})"),
+            } => {
+                write!(f, "boat refused the call ({code})")?;
+                detail(f, message)?;
+                write!(f, ", retry in {retry_after_s}s")
+            }
+            Error::Conflict { code, message } => {
+                write!(f, "boat conflict ({code})")?;
+                detail(f, message)
+            }
             Error::BillingRequired => write!(f, "boat billing required"),
-            Error::Unauthorized { code } => write!(f, "boat unauthorized ({code})"),
+            Error::Unauthorized { code, message } => {
+                write!(f, "boat unauthorized ({code})")?;
+                detail(f, message)
+            }
             Error::NotFound => write!(f, "boat: not found"),
             Error::Network(e) => write!(f, "boat network error: {e}"),
             Error::Other {
                 status,
                 code,
                 message,
-            } => write!(f, "boat error {status} ({code}): {message}"),
+            } => {
+                write!(f, "boat error {status} ({code})")?;
+                detail(f, message)
+            }
         }
+    }
+}
+
+/// boat's own words after the code, when it sent any.
+fn detail(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
+    if message.is_empty() {
+        Ok(())
+    } else {
+        write!(f, ": {message}")
     }
 }
 
@@ -330,6 +354,16 @@ pub(crate) fn map_error(resp: &Response) -> Error {
             .to_string()
     };
     let code = text("code");
+    // boat sends its human text as `message`, as `error` when that is a string, or as
+    // `error.message` beside `error.code`.
+    let message = Some(text("message"))
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            body.get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
     let retry_after_s = resp
         .header("retry-after")
         .and_then(|v| v.trim().parse().ok())
@@ -339,20 +373,22 @@ pub(crate) fn map_error(resp: &Response) -> Error {
     match resp.status {
         429 => Error::Refused {
             code,
+            message,
             retry_after_s,
         },
         503 if code == "no_ready_machine" || code == "out_of_capacity" => Error::Refused {
             code,
+            message,
             retry_after_s,
         },
-        409 => Error::Conflict { code },
+        409 => Error::Conflict { code, message },
         402 => Error::BillingRequired,
-        401 | 403 => Error::Unauthorized { code },
+        401 | 403 => Error::Unauthorized { code, message },
         404 => Error::NotFound,
         status => Error::Other {
             status,
             code,
-            message: text("message"),
+            message,
         },
     }
 }
@@ -385,6 +421,7 @@ mod tests {
             err(429, &[("Retry-After", "30")], r#"{"code":"limit_reached"}"#),
             Error::Refused {
                 code: "limit_reached".into(),
+                message: String::new(),
                 retry_after_s: 30
             }
         );
@@ -396,6 +433,7 @@ mod tests {
             ),
             Error::Refused {
                 code: "no_ready_machine".into(),
+                message: String::new(),
                 retry_after_s: 5
             }
         );
@@ -403,6 +441,7 @@ mod tests {
             err(503, &[], r#"{"error":{"code":"out_of_capacity"}}"#),
             Error::Refused {
                 code: "out_of_capacity".into(),
+                message: String::new(),
                 retry_after_s: DEFAULT_RETRY_S
             }
         );
@@ -417,7 +456,8 @@ mod tests {
                 r#"{"code":"sandbox_stopping"}"#
             ),
             Error::Conflict {
-                code: "sandbox_stopping".into()
+                code: "sandbox_stopping".into(),
+                message: String::new(),
             }
         );
         assert!(err(402, &[], r#"{"code":"billing_required"}"#).is_fatal());
@@ -433,6 +473,52 @@ mod tests {
             }
         );
         assert!(!err(429, &[], "").is_fatal());
+    }
+
+    #[test]
+    fn errors_keep_boats_message() {
+        let deploy_failed = err(
+            409,
+            &[],
+            r#"{"code":"deploy_failed","error":"This sandbox uses 92.8 GB of disk, which does not fit any available 'default' machine (largest budget: 76.0 GB).","status":409}"#,
+        );
+        assert_eq!(
+            deploy_failed.to_string(),
+            "boat conflict (deploy_failed): This sandbox uses 92.8 GB of disk, which does not \
+             fit any available 'default' machine (largest budget: 76.0 GB)."
+        );
+        assert_eq!(
+            err(
+                409,
+                &[],
+                r#"{"error":{"code":"sandbox_stopping","message":"still stopping"}}"#
+            ),
+            Error::Conflict {
+                code: "sandbox_stopping".into(),
+                message: "still stopping".into(),
+            }
+        );
+        assert_eq!(
+            err(403, &[], r#"{"code":"org_suspended","message":"pay up"}"#).to_string(),
+            "boat unauthorized (org_suspended): pay up"
+        );
+        assert_eq!(
+            err(
+                429,
+                &[("Retry-After", "7")],
+                r#"{"code":"limit_reached","error":"5 starts a minute"}"#
+            )
+            .to_string(),
+            "boat refused the call (limit_reached): 5 starts a minute, retry in 7s"
+        );
+        assert_eq!(
+            err(500, &[], r#"{"code":"internal","error":"boom"}"#).to_string(),
+            "boat error 500 (internal): boom"
+        );
+        assert_eq!(
+            err(409, &[], r#"{"code":"sandbox_stopping"}"#).to_string(),
+            "boat conflict (sandbox_stopping)"
+        );
     }
 
     #[test]
