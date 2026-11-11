@@ -637,13 +637,13 @@ impl<'a> Loop<'a> {
                 job,
             });
         }
-        self.machines
-            .retain(|id, _| machines.iter().any(|m| &m.id == id));
+        let listed: HashSet<&str> = machines.iter().map(|m| m.id.as_str()).collect();
+        self.machines.retain(|id, _| listed.contains(id.as_str()));
         self.restarted = false;
         // A create that answered has had its full request timeout and a tick to show up.
         let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
         self.pending.retain(|p| {
-            if machines.iter().any(|m| m.id == p.id) {
+            if listed.contains(p.id.as_str()) {
                 return false;
             }
             let keep = now.saturating_sub(p.sent) <= lag_s;
@@ -664,13 +664,14 @@ impl<'a> Loop<'a> {
             job: p.job,
         }));
 
+        let price = cents(limits.next_start_dollars);
         let limits = Limits {
             can_start: boat_can_start(&limits) && now >= self.starts_blocked_until,
-            next_start_cents: cents(limits.next_start_dollars),
+            next_start_cents: price,
             spent_today_cents: self.spent_cents,
             free_starts_left: limits
                 .starts_left
-                .filter(|_| cents(limits.next_start_dollars) == 0)
+                .filter(|_| price == 0)
                 .map(|left| u32::try_from(left).unwrap_or(u32::MAX)),
         };
         let snapshot = Snapshot {
@@ -698,13 +699,7 @@ impl<'a> Loop<'a> {
                 }
                 Ok(())
             }
-            Action::Delete { machine } => {
-                self.remove_runners(machine, runner_ids)?;
-                match self.boat.delete(machine) {
-                    Err(boat::Error::NotFound) => Ok(()),
-                    r => r.map_err(Error::from),
-                }
-            }
+            Action::Delete { machine } => self.delete_machine(machine, runner_ids),
             Action::Stop { machine } => {
                 self.remove_runners(machine, runner_ids)?;
                 self.boat.stop(machine).map_err(Error::from)
@@ -722,11 +717,7 @@ impl<'a> Loop<'a> {
                     if code == DISK_EXPIRED)
                 {
                     eprintln!("warn: {machine} lost its disk; deleting it");
-                    self.remove_runners(machine, runner_ids)?;
-                    return match self.boat.delete(machine) {
-                        Err(boat::Error::NotFound) => Ok(()),
-                        r => r.map_err(Error::from),
-                    };
+                    return self.delete_machine(machine, runner_ids);
                 }
                 result
             }
@@ -814,6 +805,18 @@ impl<'a> Loop<'a> {
             runner_ids.remove(&name);
         }
         Ok(())
+    }
+
+    fn delete_machine(
+        &mut self,
+        machine: &str,
+        runner_ids: &mut HashMap<String, u64>,
+    ) -> Result<(), Error> {
+        self.remove_runners(machine, runner_ids)?;
+        match self.boat.delete(machine) {
+            Err(boat::Error::NotFound) => Ok(()),
+            r => r.map_err(Error::from),
+        }
     }
 
     /// If the file write or the command fails, the GitHub runner stays `Registered` and
