@@ -242,8 +242,9 @@ fn rank(step: Placement) -> u8 {
 }
 
 fn valid_repo(repo: &str) -> bool {
+    // `repo` goes into every GitHub URL path, where `.` and `..` would name another path.
     let part_ok = |s: &str| {
-        !s.is_empty()
+        !matches!(s, "" | "." | "..")
             && s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
@@ -369,6 +370,8 @@ max_boxes = 4
     fn invalid_policies_name_the_problem() {
         let cases = [
             (policy("").replace("acme/app", "acme"), "owner/name"),
+            (policy("").replace("acme/app", "../app"), "owner/name"),
+            (policy("").replace("acme/app", "acme/."), "owner/name"),
             (format!("tick_s = 0\n{}", policy("")), "tick_s"),
             (REPO.to_string(), "no [[pool]]"),
             (format!("{}{POOL}", policy("")), "defined twice"),
