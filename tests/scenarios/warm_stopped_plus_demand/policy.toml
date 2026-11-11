@@ -1,3 +1,4 @@
+# Pins: Resume before Fork(none): a full warm pool resumes its stopped machine, then forks a kept one for the jobs left.
 repo = "acme/app"
 
 [[pool]]

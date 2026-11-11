@@ -14,6 +14,19 @@ impl Response {
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
         find_header(&self.headers, name)
     }
+
+    /// A header holding a count of seconds or requests, such as `Retry-After`.
+    pub(crate) fn number(&self, name: &str) -> Option<u64> {
+        self.header(name)?.trim().parse().ok()
+    }
+}
+
+/// Replaces every copy of `secret` in `text`, so an API that echoes a credential back
+/// cannot put it into an error, and from there into a log.
+pub(crate) fn redact(text: &mut String, secret: &str) {
+    if !secret.is_empty() && text.contains(secret) {
+        *text = text.replace(secret, "[redacted]");
+    }
 }
 
 fn find_header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {

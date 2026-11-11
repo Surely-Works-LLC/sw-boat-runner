@@ -4,22 +4,6 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
-
-### Added
-
-- GitHub App authentication: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and an
-  optional `GITHUB_APP_INSTALLATION_ID` instead of `GITHUB_TOKEN`. The daemon mints and
-  renews the installation token itself. Setting both modes is an error.
-
-### Security
-
-- A runner is registered only on a machine boat reports free of its creator's personal
-  logins (`holdsCreatorLogins: false`). A `noEnv` create keeps logins saved in a snapshot
-  of a sandbox made without `--no-env`, so a CI job could read them. Such a job fork is
-  deleted and the pool's forks back off; a kept machine waits for its next start.
-- Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
-
 ## [0.1.0] - 2026-11-11
 
 First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
@@ -37,6 +21,9 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
 - A reusable `runners` workflow that runs the daemon for one workflow run, and an install
   script for a daemon on a small boat machine.
 - A TLA+ model of the daemon's safety and liveness rules, checked with TLC.
+- GitHub App authentication: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and an
+  optional `GITHUB_APP_INSTALLATION_ID` instead of `GITHUB_TOKEN`. The daemon mints and
+  renews the installation token itself. Setting both modes is an error.
 
 ### Fixed
 
@@ -47,7 +34,19 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   resumed twice and holds its `max_boxes` box.
 - A kept machine left in a pool whose placement no longer has `slot` is deleted instead of
   holding a box until boat's 30-day TTL.
+- An error from boat or GitHub that echoes the request no longer carries the API key,
+  token or jit config into the log.
+- A daemon started just before 00:00 UTC no longer counts every pool's cap as spent for
+  the whole next day.
 - `register_timeout_s` defaults to 900 s, above the runner's 600 s wait for the snapshot
   copy, and 0 is rejected. `repo` rejects `.` and `..`.
+
+### Security
+
+- A runner is registered only on a machine boat reports free of its creator's personal
+  logins (`holdsCreatorLogins: false`). A `noEnv` create keeps logins saved in a snapshot
+  of a sandbox made without `--no-env`, so a CI job could read them. Such a job fork is
+  deleted and the pool's forks back off; a kept machine waits for its next start.
+- Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
 [0.1.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/releases/tag/v0.1.0

@@ -1,3 +1,4 @@
+# Pins: Start budget: at a paid quote and the default cap of 0, nothing starts; free slots still take runners.
 repo = "acme/app"
 
 [[pool]]

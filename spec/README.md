@@ -1,7 +1,7 @@
 # BoatRunner TLA+ spec
 
 `BoatRunner.tla` models one sw-boat-runner pool: GitHub's job queue and JIT runners,
-boat's machines, and the daemon as `src/decide.rs` and `src/run.rs` implement the rules
+boat's machines, and the daemon as `src/decide.rs` and `src/run/` implement the rules
 in [docs/design.md](../docs/design.md). The spec does not read Rust code.
 
 ## What is modelled

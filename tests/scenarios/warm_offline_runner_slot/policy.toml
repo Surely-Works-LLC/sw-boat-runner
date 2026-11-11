@@ -1,3 +1,4 @@
+# Pins: Unregister: an Offline runner is unregistered and its slot takes a Register in the same tick.
 repo = "acme/app"
 
 [[pool]]

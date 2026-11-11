@@ -1,3 +1,4 @@
+# Pins: Stop: kept machines idle past idle_stop_s stop while more than min_up stay up; a recently busy one stays.
 repo = "acme/app"
 
 [[pool]]

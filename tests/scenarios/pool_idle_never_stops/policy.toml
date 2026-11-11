@@ -1,3 +1,4 @@
+# Pins: Stop needs resume: a pool pool keeps idle machines up.
 repo = "acme/app"
 
 [[pool]]

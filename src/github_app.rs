@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::github::{API, Error};
 use crate::model::UnixSecs;
-use crate::transport::Transport;
+use crate::transport::{Transport, redact};
 
 /// The JWT says it was issued this long ago, so a clock a little ahead of GitHub's still
 /// passes.
@@ -133,6 +133,11 @@ impl App {
         Ok(token)
     }
 
+    /// The installation token held now, if any.
+    pub(crate) fn held_token(&self) -> Option<&str> {
+        self.token.as_ref().map(|held| held.token.as_str())
+    }
+
     /// Drops the held token, after GitHub answered it with 401.
     pub(crate) fn forget_token(&mut self) {
         self.token = None;
@@ -208,10 +213,11 @@ fn call(
     if (200..300).contains(&resp.status) {
         return Ok(resp.body);
     }
-    let message = serde_json::from_slice::<Value>(&resp.body)
+    let mut message = serde_json::from_slice::<Value>(&resp.body)
         .ok()
         .and_then(|v| v.get("message")?.as_str().map(str::to_string))
         .unwrap_or_default();
+    redact(&mut message, jwt);
     let rate_limited = resp.status == 429
         || (resp.status == 403 && message.to_ascii_lowercase().contains("rate limit"));
     match resp.status {

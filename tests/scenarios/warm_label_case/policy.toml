@@ -1,3 +1,4 @@
+# Pins: Routing: a job matches when all its labels are the pool's, compared without case; Register fills free kept slots.
 repo = "acme/app"
 
 [[pool]]

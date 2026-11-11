@@ -1,3 +1,4 @@
+# Pins: Demand: a Registered runner within register_timeout_s covers a queued job, so nothing starts.
 repo = "acme/app"
 
 [[pool]]

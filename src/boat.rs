@@ -5,16 +5,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::{Value, json};
 
-use crate::model::MachineState;
-use crate::transport::{Response, Transport};
+use crate::model::{Cents, JobKey, MachineState};
+use crate::transport::{Response, Transport, redact};
 
 pub(crate) const BASE: &str = "https://boat.dev/api/v1";
 /// Label every machine of a pool carries: `sw-boat-runner=<pool>`.
-pub(crate) const POOL_LABEL: &str = "sw-boat-runner";
+const POOL_LABEL: &str = "sw-boat-runner";
 /// Label of a forked machine: `sw-boat-runner-job=<job id>-<attempt>`.
-pub(crate) const JOB_LABEL: &str = "sw-boat-runner-job";
+const JOB_LABEL: &str = "sw-boat-runner-job";
 /// The longest `ttlSeconds` boat accepts. Expiry archives a machine; it does not delete it.
 pub(crate) const MAX_TTL_S: u64 = 2_592_000;
 
@@ -72,49 +73,46 @@ impl Error {
             _ => false,
         }
     }
+
+    /// This error with every copy of `secret` in its text replaced, for an answer that
+    /// might echo a credential back. Codes are boat's identifiers and stay as sent.
+    fn redact(mut self, secret: &str) -> Self {
+        match &mut self {
+            Error::Refused { message, .. }
+            | Error::Conflict { message, .. }
+            | Error::Unauthorized { message, .. }
+            | Error::Other { message, .. }
+            | Error::Network(message) => redact(message, secret),
+            Error::BillingRequired | Error::NotFound => {}
+        }
+        self
+    }
 }
 
 impl fmt::Display for Error {
+    /// `boat <what> (<code>)`, then boat's own words when it sent any.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Refused {
-                code,
-                message,
-                retry_after_s,
-            } => {
-                write!(f, "boat refused the call ({code})")?;
-                detail(f, message)?;
-                write!(f, ", retry in {retry_after_s}s")
-            }
-            Error::Conflict { code, message } => {
-                write!(f, "boat conflict ({code})")?;
-                detail(f, message)
-            }
-            Error::BillingRequired => write!(f, "boat billing required"),
-            Error::Unauthorized { code, message } => {
-                write!(f, "boat unauthorized ({code})")?;
-                detail(f, message)
-            }
-            Error::NotFound => write!(f, "boat: not found"),
-            Error::Network(e) => write!(f, "boat network error: {e}"),
+        let (what, code, message) = match self {
+            Error::BillingRequired => return write!(f, "boat billing required"),
+            Error::NotFound => return write!(f, "boat: not found"),
+            Error::Network(e) => return write!(f, "boat network error: {e}"),
+            Error::Refused { code, message, .. } => ("refused the call".into(), code, message),
+            Error::Conflict { code, message } => ("conflict".into(), code, message),
+            Error::Unauthorized { code, message } => ("unauthorized".into(), code, message),
             Error::Other {
                 status,
                 code,
                 message,
-            } => {
-                write!(f, "boat error {status} ({code})")?;
-                detail(f, message)
-            }
+            } => (format!("error {status}"), code, message),
+        };
+        write!(f, "boat {what} ({code})")?;
+        if !message.is_empty() {
+            write!(f, ": {message}")?;
         }
-    }
-}
-
-/// boat's own words after the code, when it sent any.
-fn detail(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
-    if message.is_empty() {
+        if let Error::Refused { retry_after_s, .. } = self {
+            write!(f, ", retry in {retry_after_s}s")?;
+        }
         Ok(())
-    } else {
-        write!(f, ": {message}")
     }
 }
 
@@ -132,16 +130,44 @@ pub(crate) struct Sandbox {
     pub holds_creator_logins: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Limits {
-    pub can_start: bool,
-    /// 0 inside every limit, `None` when boat would refuse the start.
-    #[serde(default)]
-    pub next_start_dollars: Option<f64>,
-    /// The fewest starts left among boat's minute, hour and day windows, if it sent them.
-    #[serde(skip)]
-    pub starts_left: Option<u64>,
+impl Sandbox {
+    /// The job a machine was forked for, from its `JOB_LABEL`; `None` for a kept machine.
+    pub(crate) fn job(&self) -> Option<JobKey> {
+        let (id, attempt) = self.labels.get(JOB_LABEL)?.split_once('-')?;
+        Some(JobKey {
+            id: id.parse().ok()?,
+            attempt: attempt.parse().ok()?,
+        })
+    }
+}
+
+/// The labels a fork carries: its pool, and the job it is for unless it is a kept machine.
+fn fork_labels(pool: &str, job: Option<JobKey>) -> BTreeMap<&'static str, String> {
+    let mut labels = BTreeMap::from([(POOL_LABEL, pool.to_string())]);
+    if let Some(job) = job {
+        labels.insert(JOB_LABEL, format!("{}-{}", job.id, job.attempt));
+    }
+    labels
+}
+
+/// What `GET /limits` says about the next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Quote {
+    /// boat would take a start now: `canStart`, with a price. A null price means boat
+    /// would refuse it even with `canStart` set.
+    pub allows: bool,
+    pub cents: Cents,
+    /// At a price of 0, the fewest starts left among boat's minute, hour and day windows,
+    /// if it sent them.
+    pub free_left: Option<u32>,
+}
+
+/// Whole cents, at least 1 for any price above 0, so the 0 that marks an included start
+/// never stands for a paid one.
+fn cents(dollars: Option<f64>) -> Cents {
+    dollars
+        .filter(|&d| d > 0.0)
+        .map_or(0, |d| ((d * 100.0).round() as Cents).max(1))
 }
 
 /// boat state → model state. boat's `archived` is a stop with the disk kept, so it maps to
@@ -179,13 +205,15 @@ impl<'t> Client<'t> {
         Client { t, key }
     }
 
-    fn call(
+    /// The one request path: auth, status mapping, and the 2xx body read as `T`. An
+    /// empty body reads as `null`. No error carries the API key.
+    fn call<T: DeserializeOwned>(
         &self,
         method: &str,
         path: &str,
         body: Option<&Value>,
         extra: &[(&str, &str)],
-    ) -> Result<Value, Error> {
+    ) -> Result<T, Error> {
         let auth = format!("Bearer {}", self.key);
         let mut headers = vec![
             ("Authorization", auth.as_str()),
@@ -198,21 +226,29 @@ impl<'t> Client<'t> {
         headers.extend_from_slice(extra);
         let bytes = body.map(|b| b.to_string().into_bytes());
         let url = format!("{BASE}{path}");
-        let resp = self
-            .t
-            .send(method, &url, &headers, bytes.as_deref())
-            .map_err(|e| Error::Network(e.0))?;
-        if !(200..300).contains(&resp.status) {
-            return Err(map_error(&resp));
-        }
-        if resp.body.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&resp.body).map_err(|e| Error::Other {
-            status: resp.status,
-            code: "bad_json".into(),
-            message: e.to_string(),
-        })
+        let result = match self.t.send(method, &url, &headers, bytes.as_deref()) {
+            Err(e) => Err(Error::Network(e.0)),
+            Ok(resp) if !(200..300).contains(&resp.status) => Err(map_error(&resp)),
+            Ok(resp) => {
+                let body: &[u8] = if resp.body.is_empty() {
+                    b"null"
+                } else {
+                    &resp.body
+                };
+                serde_json::from_slice(body).map_err(|e| Error::Other {
+                    status: resp.status,
+                    code: "bad_json".into(),
+                    message: e.to_string(),
+                })
+            }
+        };
+        result.map_err(|e| e.redact(&self.key))
+    }
+
+    /// A call whose answer this client only needs to be readable JSON (or empty).
+    fn send(&self, method: &str, path: &str, body: &Value) -> Result<(), Error> {
+        self.call::<IgnoredAny>(method, path, Some(body), &[])
+            .map(drop)
     }
 
     /// Every sandbox of `pool`, in any state, following `pageInfo.nextCursor`.
@@ -238,7 +274,7 @@ impl<'t> Client<'t> {
                 path.push_str("&cursor=");
                 path.push_str(&encode(c));
             }
-            let page: Page = parse(self.call("GET", &path, None, &[])?)?;
+            let page: Page = self.call("GET", &path, None, &[])?;
             out.extend(page.sandboxes);
             match page.page_info.next_cursor {
                 Some(c) if page.page_info.has_more => cursor = Some(c),
@@ -252,17 +288,13 @@ impl<'t> Client<'t> {
         })
     }
 
-    fn post(&self, path: &str, body: &Value) -> Result<(), Error> {
-        self.call("POST", path, Some(body), &[]).map(drop)
-    }
-
     /// One sandbox, with `holdsCreatorLogins`.
     pub(crate) fn get(&self, id: &str) -> Result<Sandbox, Error> {
         #[derive(Deserialize)]
         struct Info {
             sandbox: Sandbox,
         }
-        let info: Info = parse(self.call("GET", &format!("/sandboxes/{id}"), None, &[])?)?;
+        let info: Info = self.call("GET", &format!("/sandboxes/{id}"), None, &[])?;
         Ok(info.sandbox)
     }
 
@@ -270,38 +302,34 @@ impl<'t> Client<'t> {
     /// the restored snapshot holds before the machine is reachable. One-way; the machine
     /// stays no-env.
     pub(crate) fn resume(&self, id: &str) -> Result<(), Error> {
-        self.post(
-            &format!("/sandboxes/{id}/resume"),
-            &json!({ "noEnv": true }),
-        )
+        let body = json!({ "noEnv": true });
+        self.send("POST", &format!("/sandboxes/{id}/resume"), &body)
     }
 
     /// Returns at once; 200 when already stopped, 202 while the stop runs.
     pub(crate) fn stop(&self, id: &str) -> Result<(), Error> {
-        self.post(&format!("/sandboxes/{id}/stop"), &json!({}))
+        self.send("POST", &format!("/sandboxes/{id}/stop"), &json!({}))
     }
 
     /// Permanently deletes the sandbox and its disk.
     pub(crate) fn delete(&self, id: &str) -> Result<(), Error> {
-        self.call(
-            "DELETE",
-            &format!("/sandboxes/{id}"),
-            None,
-            &[("X-Ascii-Confirm-Delete", id)],
-        )
-        .map(drop)
+        let path = format!("/sandboxes/{id}");
+        self.call::<IgnoredAny>("DELETE", &path, None, &[("X-Ascii-Confirm-Delete", id)])
+            .map(drop)
     }
 
-    /// Starts a new machine from the saved snapshot. boat returns the first sandbox again
-    /// for a repeat of the same key and body within 24 h, even a deleted one.
-    /// `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv` keeps the account's secrets out of the
-    /// machine, because CI jobs run arbitrary code there. It does not scrub logins saved
-    /// in the snapshot; `holds_creator_logins` reports those.
-    pub(crate) fn create_from_snapshot(
+    /// Starts a new machine from the saved snapshot, labelled with `pool` and, for a job
+    /// fork, `job`. boat returns the first sandbox again for a repeat of the same key and
+    /// body within 24 h, even a deleted one. `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv`
+    /// keeps the account's secrets out of the machine, because CI jobs run arbitrary code
+    /// there. It does not scrub logins saved in the snapshot; `holds_creator_logins`
+    /// reports those.
+    pub(crate) fn fork(
         &self,
         snapshot: &str,
         machine_type: &str,
-        labels: &BTreeMap<String, String>,
+        pool: &str,
+        job: Option<JobKey>,
         ttl_s: u64,
         idempotency_key: &str,
     ) -> Result<String, Error> {
@@ -313,56 +341,55 @@ impl<'t> Client<'t> {
         let body = json!({
             "from": snapshot,
             "type": machine_type,
-            "labels": labels,
+            "labels": fork_labels(pool, job),
             "ttlSeconds": ttl_s,
             "noEnv": true,
         });
-        let created: Created = parse(self.call(
-            "POST",
-            "/sandboxes",
-            Some(&body),
-            &[("Idempotency-Key", idempotency_key)],
-        )?)?;
+        let key = [("Idempotency-Key", idempotency_key)];
+        let created: Created = self.call("POST", "/sandboxes", Some(&body), &key)?;
         Ok(created.sandbox.id)
     }
 
-    /// Writes a UTF-8 file under `/home/user` or `/tmp`; 200 means it is on disk.
+    /// Writes a UTF-8 file under `/home/user` or `/tmp`; 200 means it is on disk. The
+    /// content may be a credential, so no error quotes it.
     pub(crate) fn write_file(&self, id: &str, path: &str, content: &str) -> Result<(), Error> {
         let body = json!({ "path": path, "content": content, "encoding": "utf8" });
-        self.call("PUT", &format!("/sandboxes/{id}/files"), Some(&body), &[])
-            .map(drop)
+        self.send("PUT", &format!("/sandboxes/{id}/files"), &body)
+            .map_err(|e| e.redact(content))
     }
 
     /// Starts `command` in the background. boat keeps every command in its history, so the
     /// command must never contain a secret.
     pub(crate) fn exec_detached(&self, id: &str, command: &str) -> Result<(), Error> {
         let body = json!({ "command": command, "detached": true });
-        self.post(&format!("/sandboxes/{id}/commands"), &body)
+        self.send("POST", &format!("/sandboxes/{id}/commands"), &body)
     }
 
-    pub(crate) fn limits(&self) -> Result<Limits, Error> {
-        let body = self.call("GET", "/limits", None, &[])?;
-        let starts_left = ["minute", "hour", "day"]
+    pub(crate) fn limits(&self) -> Result<Quote, Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Limits {
+            can_start: bool,
+            /// 0 inside every limit, `None` when boat would refuse the start.
+            #[serde(default)]
+            next_start_dollars: Option<f64>,
+            #[serde(default)]
+            starts: Value,
+        }
+        let l: Limits = self.call("GET", "/limits", None, &[])?;
+        let cents = cents(l.next_start_dollars);
+        let free_left = ["minute", "hour", "day"]
             .iter()
-            .filter_map(|window| {
-                body.pointer(&format!("/starts/{window}/remaining"))?
-                    .as_u64()
-            })
-            .min();
-        let limits: Limits = parse(body)?;
-        Ok(Limits {
-            starts_left,
-            ..limits
+            .filter_map(|w| l.starts.get(w)?.get("remaining")?.as_u64())
+            .min()
+            .filter(|_| cents == 0)
+            .map(|left| u32::try_from(left).unwrap_or(u32::MAX));
+        Ok(Quote {
+            allows: l.can_start && l.next_start_dollars.is_some(),
+            cents,
+            free_left,
         })
     }
-}
-
-fn parse<T: for<'de> Deserialize<'de>>(v: Value) -> Result<T, Error> {
-    serde_json::from_value(v).map_err(|e| Error::Other {
-        status: 0,
-        code: "bad_json".into(),
-        message: e.to_string(),
-    })
 }
 
 /// Maps a non-2xx response. A 429 always sends `Retry-After`; a 503 puts
@@ -388,8 +415,7 @@ pub(crate) fn map_error(resp: &Response) -> Error {
         })
         .unwrap_or_default();
     let retry_after_s = resp
-        .header("retry-after")
-        .and_then(|v| v.trim().parse().ok())
+        .number("retry-after")
         .or_else(|| body.get("retryAfterSeconds").and_then(Value::as_u64))
         .or_else(|| body.get("retryAfter").and_then(Value::as_u64))
         .unwrap_or(DEFAULT_RETRY_S);
@@ -553,7 +579,7 @@ mod tests {
         for body in ["not json", r#"{"ok":true}"#] {
             let fake = Fake::new(move |_| respond(202, &[], body));
             let e = Client::new(&fake, "k".into())
-                .create_from_snapshot("base", "large", &BTreeMap::new(), 60, "key")
+                .fork("base", "large", "ci", None, 60, "key")
                 .unwrap_err();
             assert!(e.may_have_applied(), "{e}");
         }
@@ -635,12 +661,9 @@ mod tests {
             )
         });
         let boat = Client::new(&fake, "k".into());
-        let labels = BTreeMap::from([
-            (POOL_LABEL.to_string(), "ci".to_string()),
-            (JOB_LABEL.to_string(), "7-2".to_string()),
-        ]);
+        let job = JobKey { id: 7, attempt: 2 };
         let id = boat
-            .create_from_snapshot("runner-base", "large", &labels, 3600, "7-2")
+            .fork("runner-base", "large", "ci", Some(job), 3600, "7-2")
             .unwrap();
         assert_eq!(id, "bx_44444444");
         let sent = fake.sent();
@@ -722,15 +745,68 @@ mod tests {
             )
         });
         let limits = Client::new(&fake, "k".into()).limits().unwrap();
-        assert_eq!(limits.starts_left, Some(4));
+        assert_eq!(limits.free_left, Some(4));
+    }
+
+    /// Windows are reported only for included starts: past them the price is not known.
+    #[test]
+    fn limits_report_no_free_starts_at_a_price() {
+        let fake = Fake::new(|_| {
+            respond(
+                200,
+                &[],
+                r#"{"canStart":true,"nextStartDollars":0.03,
+                    "starts":{"day":{"remaining":3}}}"#,
+            )
+        });
+        let quote = Client::new(&fake, "k".into()).limits().unwrap();
+        assert_eq!(
+            quote,
+            Quote {
+                allows: true,
+                cents: 3,
+                free_left: None
+            }
+        );
     }
 
     #[test]
     fn limits_null_price() {
         let fake = Fake::new(|_| respond(200, &[], r#"{"canStart":true,"nextStartDollars":null}"#));
         let limits = Client::new(&fake, "k".into()).limits().unwrap();
-        assert!(limits.can_start);
-        assert_eq!(limits.next_start_dollars, None);
-        assert_eq!(limits.starts_left, None);
+        // boat would refuse a start it cannot price, even with `canStart` set.
+        assert!(!limits.allows);
+        assert_eq!(limits.cents, 0);
+        assert_eq!(limits.free_left, None);
+    }
+
+    /// Only a start boat quotes at exactly 0 is included; a fraction of a cent is paid.
+    #[test]
+    fn cents_never_round_a_paid_start_to_free() {
+        assert_eq!(cents(Some(0.29)), 29);
+        assert_eq!(cents(Some(0.07)), 7);
+        assert_eq!(cents(Some(0.004)), 1);
+        assert_eq!(cents(Some(0.0)), 0);
+        assert_eq!(cents(Some(-1.0)), 0);
+        assert_eq!(cents(None), 0);
+    }
+
+    #[test]
+    fn job_labels_round_trip() {
+        let sandbox = |job: Option<JobKey>| Sandbox {
+            id: "bx_22222222".into(),
+            state: "idle".into(),
+            labels: fork_labels("ci", job)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            holds_creator_logins: None,
+        };
+        let job = JobKey { id: 9, attempt: 3 };
+        assert_eq!(sandbox(Some(job)).job(), Some(job));
+        assert_eq!(sandbox(None).job(), None);
+        let mut bad = sandbox(None);
+        bad.labels.insert(JOB_LABEL.into(), "9".into());
+        assert_eq!(bad.job(), None);
     }
 }
