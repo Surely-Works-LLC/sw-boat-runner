@@ -150,7 +150,7 @@ const APP_VARS: [&str; 3] = [
 /// `GITHUB_TOKEN`, or a GitHub App from `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and,
 /// when set, `GITHUB_APP_INSTALLATION_ID`. Both at once is an error, so the daemon never
 /// quietly runs on a token someone meant to retire.
-fn github_auth(var: &dyn Fn(&str) -> Option<String>) -> Result<github::Auth, Error> {
+pub(crate) fn github_auth(var: &dyn Fn(&str) -> Option<String>) -> Result<github::Auth, Error> {
     let app = APP_VARS.iter().any(|name| var(name).is_some());
     match (var("GITHUB_TOKEN"), app) {
         (Some(_), true) => Err(Error::Config(
@@ -185,7 +185,7 @@ fn env(name: &'static str) -> Result<String, Error> {
         .ok_or(Error::MissingEnv(name))
 }
 
-fn unix_now() -> UnixSecs {
+pub(crate) fn unix_now() -> UnixSecs {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

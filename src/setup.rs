@@ -255,6 +255,7 @@ fn setup(opts: &Options) -> Result<(), String> {
          pool with this line in the workflow:\n\n    {}\n",
         runs_on(&cfg.pools[0].labels)
     );
+    crate::doctor::after_setup(BIN, POLICY, sudo);
     Ok(())
 }
 

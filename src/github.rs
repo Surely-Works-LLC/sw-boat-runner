@@ -334,6 +334,11 @@ impl<'t> Client<'t> {
         }
     }
 
+    /// The last `X-RateLimit-Remaining` and `X-RateLimit-Reset` GitHub sent.
+    pub(crate) fn rate_left(&self) -> Option<(u64, UnixSecs)> {
+        self.budget.left
+    }
+
     /// The one request path: auth, the rate-limit floor, ETag reuse and status mapping.
     /// No error carries the token.
     fn request(
