@@ -20,6 +20,10 @@ const DISK_EXPIRED: &str = "snapshot_data_expired";
 /// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
 /// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Back-off for a start that boat keeps refusing with the same error: the first wait, and
+/// the most it doubles to.
+const BACKOFF_MIN_S: u64 = 15;
+const BACKOFF_MAX_S: u64 = 600;
 
 pub struct NetworkError(pub String);
 
@@ -252,6 +256,22 @@ fn rank(a: &Action) -> u8 {
     }
 }
 
+/// The pool and kind a start backs off under; `None` for actions that never wait.
+fn backoff_key(snap: &Snapshot, a: &Action) -> Option<(String, &'static str)> {
+    match a {
+        Action::Fork { pool, .. } => Some((pool.clone(), "fork")),
+        Action::Resume { machine } => snap
+            .machines
+            .iter()
+            .find(|m| &m.id == machine)
+            .map(|m| (m.pool.clone(), "resume")),
+        Action::Unregister { .. }
+        | Action::Delete { .. }
+        | Action::Stop { .. }
+        | Action::Register { .. } => None,
+    }
+}
+
 /// `<job id>-<attempt>`: the job label of a forked machine.
 fn job_label(job: JobKey) -> String {
     format!("{}-{}", job.id, job.attempt)
@@ -380,6 +400,18 @@ pub struct Loop<'a> {
     restarted: bool,
     /// Forks this process created that boat has not listed yet.
     pending: Vec<Pending>,
+    /// Starts that failed last time they were sent, by pool and kind; see `Failing`.
+    failing: HashMap<(String, &'static str), Failing>,
+}
+
+/// The last error of a kind of start in a pool. When the next one fails the same way, the
+/// pool's starts of that kind wait `backoff_s`, doubling each time, so a refusal no tick
+/// can fix (a snapshot too big for its machine type) is not sent every tick. Deletes,
+/// stops and runner calls never wait.
+struct Failing {
+    error: String,
+    backoff_s: u64,
+    until: UnixSecs,
 }
 
 /// A fork boat accepted but may not list for a while. Until it is listed, `decide` sees
@@ -419,6 +451,7 @@ impl<'a> Loop<'a> {
             starts_blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             restarted: true,
             pending: Vec::new(),
+            failing: HashMap::new(),
         }
     }
 
@@ -447,22 +480,73 @@ impl<'a> Loop<'a> {
             .map(|(_, a)| a)
             .collect();
         actions.sort_by_key(rank);
+        // A start `decide` no longer asks for starts afresh when it is asked for again.
+        let asked: HashSet<_> = actions
+            .iter()
+            .filter_map(|a| backoff_key(&snapshot, a))
+            .collect();
+        self.failing.retain(|k, _| asked.contains(k));
         let mut starts = Starts {
             open: snapshot.limits.can_start,
             price: snapshot.limits.next_start_cents,
         };
         for action in &actions {
+            let key = backoff_key(&snapshot, action);
+            let waiting = key.as_ref().and_then(|k| self.failing.get(k));
+            if waiting.is_some_and(|f| now < f.until) {
+                continue;
+            }
             match self.execute(now, action, &mut runner_ids, &mut starts) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(k) = &key {
+                        self.failing.remove(k);
+                    }
+                }
                 Err(e) if e.is_fatal() => return Err(e),
                 Err(e @ Error::GitHub(github::Error::RateLimited { .. })) => {
                     eprintln!("{action:?}: {e}; rest of tick skipped");
                     break;
                 }
-                Err(e) => eprintln!("{action:?}: {e}"),
+                // Closed starts and boat's refusals already wait on their own.
+                Err(e @ (Error::StartsClosed | Error::Boat(boat::Error::Refused { .. }))) => {
+                    eprintln!("{action:?}: {e}")
+                }
+                Err(e) => match key {
+                    Some(k) => self.note_failure(now, k, action, &e),
+                    None => eprintln!("{action:?}: {e}"),
+                },
             }
         }
         Ok(())
+    }
+
+    /// Logs a failed start. The same error twice in a row backs the start off; a repeat
+    /// is logged only when it is sent again after its wait.
+    fn note_failure(
+        &mut self,
+        now: UnixSecs,
+        key: (String, &'static str),
+        action: &Action,
+        e: &Error,
+    ) {
+        let error = e.to_string();
+        let backoff_s = match self.failing.get(&key) {
+            Some(f) if f.error == error => (f.backoff_s * 2).clamp(BACKOFF_MIN_S, BACKOFF_MAX_S),
+            _ => 0,
+        };
+        if backoff_s == 0 {
+            eprintln!("{action:?}: {e}");
+        } else {
+            eprintln!("{action:?}: {e} (again; next try in {backoff_s}s)");
+        }
+        self.failing.insert(
+            key,
+            Failing {
+                error,
+                backoff_s,
+                until: now.saturating_add(backoff_s),
+            },
+        );
     }
 
     fn observe(&mut self, now: UnixSecs) -> Result<(Snapshot, HashMap<String, u64>), Error> {
@@ -625,7 +709,7 @@ impl<'a> Loop<'a> {
                 let result = self.start(now, starts, |b| b.resume(machine));
                 // boat deleted the disk of a machine that stayed stopped too long. It can
                 // never resume, so delete it; the pool then forks a new one if it needs to.
-                if matches!(&result, Err(Error::Boat(boat::Error::Conflict { code }))
+                if matches!(&result, Err(Error::Boat(boat::Error::Conflict { code, .. }))
                     if code == DISK_EXPIRED)
                 {
                     eprintln!("warn: {machine} lost its disk; deleting it");
@@ -1510,6 +1594,42 @@ mod tests {
             pool: p.name.clone(),
             job: Some(JobKey { id: 70, attempt: 1 }),
         }]
+    }
+
+    fn no_actions(_: &Snapshot, _: &Pool) -> Vec<Action> {
+        Vec::new()
+    }
+
+    /// A fork boat refuses the same way every time backs off 15 s, doubling to 10 min,
+    /// and starts afresh once `decide` stops asking for it.
+    #[test]
+    fn a_fork_refused_the_same_way_backs_off() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.method == "POST" && s.url == format!("{BOAT}/sandboxes") {
+                respond(
+                    409,
+                    &[],
+                    r#"{"code":"deploy_failed","error":"too big","status":409}"#,
+                )
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let mut sent_at = Vec::new();
+        for t in (0..1800).step_by(15) {
+            let before = forks(&fake).len();
+            tick_loop.tick(NOW + t, fork_job_70).unwrap();
+            if forks(&fake).len() > before {
+                sent_at.push(t);
+            }
+        }
+        assert_eq!(sent_at, [0, 15, 30, 60, 120, 240, 480, 960, 1560]);
+        tick_loop.tick(NOW + 1800, no_actions).unwrap();
+        let before = forks(&fake).len();
+        tick_loop.tick(NOW + 1815, fork_job_70).unwrap();
+        assert_eq!(forks(&fake).len(), before + 1);
     }
 
     /// boat omits the fork for job 70 from the next listing. Once it lists it, the fork

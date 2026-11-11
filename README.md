@@ -113,7 +113,7 @@ This repository runs its own tests through the first option, in its
 | `name` | required | Lowercase letters, digits and `_`. |
 | `labels` | required | Runner labels. Must include `self-hosted`. |
 | `machine_type` | required | `small`, `default`, `large` or `xlarge`. |
-| `snapshot` | required | The boat snapshot machines start from. |
+| `snapshot` | required | The boat snapshot machines start from. Its disk must fit `machine_type`'s disk budget, or boat refuses each fork with 409 `deploy_failed`; pick a larger `machine_type` for a large snapshot. |
 | `max_boxes` | required | Most machines up or starting at once. |
 | `preset` | `hybrid` | See below. |
 | `placement` | from the preset | Overrides the preset's steps. |
