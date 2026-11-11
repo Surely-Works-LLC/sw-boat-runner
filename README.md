@@ -27,7 +27,7 @@ You need a boat snapshot made from a `--no-env` sandbox, with an unconfigured
 ```sh
 boat new --no-auto-stop --type small    # prints the machine's id
 boat ssh <id>
-# v0.2.0 is an example: pin the release you tested, in both places.
+# Pin a release you tested, in both places.
 curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.2.0/examples/always-on/install.sh
 SBR_REF=v0.2.0 bash install.sh    # checks the binary, then runs `sw-boat-runner setup`
 ```
@@ -152,9 +152,10 @@ loop, for example that no machine stops mid-job. Report vulnerabilities per
 
 ## Status
 
-The authors ran a `fork` pool on a private repository in November 2026. The queue times
-above are simulated; [eval/](eval/results/example-2026-11.md) measured only the setup
-this daemon replaces.
+Since November 2026 a `warm` pool (`large` machines, up to 6) runs the CI of the authors'
+private monorepo, with a GitHub App; `pool`, `fork` and `hybrid` were tested on the same
+repository. The queue times above are simulated; [eval/](eval/results/example-2026-11.md)
+measured only the setup this daemon replaces.
 
 ## License
 
