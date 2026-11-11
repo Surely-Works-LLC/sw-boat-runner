@@ -1054,7 +1054,12 @@ fn headers() -> Vec<(&'static str, &'static str)> {
 /// App names are unique on GitHub and at most 34 characters; the suffix tells apart two
 /// setups of one repository.
 fn app_name(repo_name: &str, random: &str) -> String {
-    let base: String = repo_name.chars().take(21).collect();
+    // `sbr-sbr-e2e-…` reads badly; drop a leading `sbr-` the prefix already says.
+    let trimmed = match repo_name.strip_prefix("sbr-") {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => repo_name,
+    };
+    let base: String = trimmed.chars().take(21).collect();
     format!("sbr-{base}-{}", &random[..8])
 }
 
@@ -1583,6 +1588,8 @@ mod tests {
         assert_eq!(m["redirect_url"], NEW_APP_PAGE);
         let name = app_name(&"n".repeat(40), "0123abcdef");
         assert!(name.len() <= 34 && name.ends_with("-0123abcd"), "{name}");
+        assert_eq!(app_name("sbr-e2e", "0123abcdef"), "sbr-e2e-0123abcd");
+        assert_eq!(app_name("sbr-", "0123abcdef"), "sbr-sbr--0123abcd");
     }
 
     #[test]
