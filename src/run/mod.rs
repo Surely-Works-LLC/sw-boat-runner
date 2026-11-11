@@ -30,8 +30,9 @@ pub(crate) use script::HOME_WAIT_S;
 /// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
 /// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
-/// The "budget spent" line is logged at most once in this many seconds.
-const PACED_LOG_S: UnixSecs = 60;
+/// The "pacing" line is logged at most once in this many seconds: pacing is normal,
+/// so a minute-by-minute line would only be noise.
+const PACED_LOG_S: UnixSecs = 600;
 
 #[derive(Debug)]
 pub enum Error {
@@ -283,7 +284,7 @@ impl<'a> Loop<'a> {
                 .paced_logged
                 .is_none_or(|t| now >= t.saturating_add(PACED_LOG_S))
             {
-                eprintln!("observe: {}; observing less often", self.gh.budget_note());
+                eprintln!("observe: {}; skipping this tick", self.gh.budget_note());
                 self.paced_logged = Some(now);
             }
             return Ok(());
