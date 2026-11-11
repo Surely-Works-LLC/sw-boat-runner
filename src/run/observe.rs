@@ -212,17 +212,28 @@ impl Memory {
 }
 
 impl Loop<'_> {
-    /// Reads every list once (boat's per pool), then updates `Memory`; a failed read
-    /// leaves `Memory` as it was.
+    /// Starts GitHub's tick at `now` and observes, whatever the request budget says.
     pub(super) fn observe(&mut self, now: UnixSecs) -> Result<Observed, Error> {
         self.gh.begin_tick(now);
+        self.read(now)
+    }
+
+    /// Reads every list once (boat's per pool), then updates `Memory`; a failed read
+    /// leaves `Memory` as it was. GitHub's tick must have begun at `now`.
+    pub(super) fn read(&mut self, now: UnixSecs) -> Result<Observed, Error> {
         let mut listed = Vec::new();
         for pool in &self.cfg.pools {
             let sandboxes = self.boat.list(&pool.name)?;
             listed.extend(sandboxes.into_iter().map(|sb| (pool.name.clone(), sb)));
         }
         let gh_runners = self.gh.runners()?;
-        let queued = self.gh.queued_jobs()?;
+        let queued = if self.read_jobs {
+            let pools = &self.cfg.pools;
+            self.gh
+                .queued_jobs(&|labels| pools.iter().any(|p| p.serves(labels)))?
+        } else {
+            Vec::new()
+        };
         let quote = self.boat.limits()?;
 
         let (runners, runner_ids) = self.memory.runners(self.cfg, gh_runners);

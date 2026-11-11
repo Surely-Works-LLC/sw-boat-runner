@@ -22,6 +22,8 @@ higher `slots_per_box` looks better here than it will on a real machine.
   machine is gone when the job ends.
 - The daemon is real: `run::Loop` ticks every 15 s with `decide::decide`, and only the
   HTTP transport is replaced, by a mock of the boat and GitHub endpoints it calls.
+  The mocked GitHub reports a rate limit high enough that the daemon's request budget
+  never slows it.
 
 Four policies run through the daemon: `fork` (may pay for starts), `hybrid` with
 `min_up = 4`, `warm`, and `pool` with 16 machines. The first three allow 48 machines.

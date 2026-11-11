@@ -188,6 +188,10 @@ pub struct Loop<'a> {
     gh: github::Client<'a>,
     memory: observe::Memory,
     ledger: act::Ledger,
+    /// False for `drain`, which needs no queued jobs.
+    read_jobs: bool,
+    /// The last tick skipped its observe to stay in the GitHub request budget.
+    paced: bool,
 }
 
 impl<'a> Loop<'a> {
@@ -205,6 +209,8 @@ impl<'a> Loop<'a> {
             gh: github::Client::new(t, token, cfg.repo.clone()),
             memory: observe::Memory::default(),
             ledger: act::Ledger::new(cfg, now),
+            read_jobs: true,
+            paced: false,
         }
     }
 
@@ -226,7 +232,18 @@ impl<'a> Loop<'a> {
         decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>,
     ) -> Result<(), Error> {
         self.ledger.begin_tick(now);
-        let observed = match self.observe(now) {
+        self.gh.begin_tick(now);
+        // A tick without budget acts on nothing rather than on a stale snapshot; see
+        // docs/design.md#github-requests.
+        if !self.gh.may_observe() {
+            if !self.paced {
+                eprintln!("observe: {}; observing less often", self.gh.budget_note());
+                self.paced = true;
+            }
+            return Ok(());
+        }
+        self.paced = false;
+        let observed = match self.read(now) {
             Ok(v) => v,
             Err(e) if e.is_fatal() => return Err(e),
             Err(e) => {
@@ -243,6 +260,8 @@ impl<'a> Loop<'a> {
 
     /// `drain`'s one tick, then the machines left.
     fn drain(&mut self, now: UnixSecs) -> Result<usize, Error> {
+        // `delete_everything` ignores queued jobs, so drain does not spend requests on them.
+        self.read_jobs = false;
         self.tick(now, delete_everything)?;
         let after = self.observe(now)?.snapshot;
         let left = after
@@ -446,6 +465,8 @@ mod tests {
             .drain(NOW)
             .unwrap();
         assert_eq!(left, 3);
+        // Queued jobs do not matter to drain, so it spends no requests on them.
+        assert!(!requests(&fake).iter().any(|r| r.contains("/runs")));
         let writes: Vec<String> = requests(&fake)
             .into_iter()
             .filter(|r| !r.starts_with("GET"))
