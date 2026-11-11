@@ -43,7 +43,14 @@ link to install the App on the repository and waits until it is. It asks for the
 key without echo, stores the policy and the keys in `/etc/sw-boat-runner` (keys root
 only), installs the binary and enables a hardened systemd service. Every prompt also
 reads a flag or an environment variable; `sw-boat-runner setup --help` lists them.
-Secrets come only from the environment or a prompt, never from arguments.
+Secrets come only from the environment or a prompt, never from arguments. Running
+`setup` again keeps the App that `/etc/sw-boat-runner/env` names; `--new-app` creates
+another, whose key replaces the old one only once the App is installed.
+
+Administration write is the least GitHub accepts for registering a runner, and it can
+do a lot to a repository: change its settings, add deploy keys, or delete it. Keep
+`github-app.pem` root-only, as `setup` writes it, and install the App only on the
+repositories that need runners.
 
 ## Connect a repository
 

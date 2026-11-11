@@ -133,14 +133,31 @@ impl App {
         Ok(token)
     }
 
-    /// The app's installation on `repo`; an `Error::App` until the app is installed there.
+    /// One look for the app's installation on `repo`, for `setup`'s wait: `Ok(None)` while
+    /// GitHub answers 404 (not installed there yet), `Error::Status` for any other refusal.
     pub fn installation_on(
         &self,
         t: &dyn Transport,
         repo: &str,
         now: UnixSecs,
-    ) -> Result<u64, Error> {
-        installation_id(t, &self.jwt(now)?, repo)
+    ) -> Result<Option<u64>, Error> {
+        #[derive(Deserialize)]
+        struct Out {
+            id: u64,
+        }
+        let jwt = self.jwt(now)?;
+        let url = format!("{API}/repos/{repo}/installation");
+        let (status, body) = send(t, "GET", &url, &jwt, None)?;
+        match status {
+            200..=299 => serde_json::from_slice::<Out>(&body)
+                .map(|out| Some(out.id))
+                .map_err(|_| Error::Parse("installation response".into())),
+            404 => Ok(None),
+            status => Err(Error::Status {
+                status,
+                message: message(&body, &jwt),
+            }),
+        }
     }
 
     /// The installation token held now, if any.
@@ -206,6 +223,29 @@ fn call(
     body: Option<&Value>,
     what: &str,
 ) -> Result<Vec<u8>, Error> {
+    let (status, body) = send(t, method, url, jwt, body)?;
+    if (200..300).contains(&status) {
+        return Ok(body);
+    }
+    let message = message(&body, jwt);
+    let rate_limited =
+        status == 429 || (status == 403 && message.to_ascii_lowercase().contains("rate limit"));
+    match status {
+        401 | 403 | 404 | 422 if !rate_limited => {
+            Err(Error::App(format!("could not {what}: {status} {message}")))
+        }
+        status => Err(Error::Status { status, message }),
+    }
+}
+
+/// Sends one request signed with the app's JWT: the status and the body.
+fn send(
+    t: &dyn Transport,
+    method: &str,
+    url: &str,
+    jwt: &str,
+    body: Option<&Value>,
+) -> Result<(u16, Vec<u8>), Error> {
     let auth = format!("Bearer {jwt}");
     let mut headers = vec![
         ("Authorization", auth.as_str()),
@@ -220,23 +260,17 @@ fn call(
     let resp = t
         .send(method, url, &headers, bytes.as_deref())
         .map_err(|e| Error::Network(e.0))?;
-    if (200..300).contains(&resp.status) {
-        return Ok(resp.body);
-    }
-    let mut message = serde_json::from_slice::<Value>(&resp.body)
+    Ok((resp.status, resp.body))
+}
+
+/// The `message` of an error response, with the JWT redacted.
+fn message(body: &[u8], jwt: &str) -> String {
+    let mut message = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v.get("message")?.as_str().map(str::to_string))
         .unwrap_or_default();
     redact(&mut message, jwt);
-    let rate_limited = resp.status == 429
-        || (resp.status == 403 && message.to_ascii_lowercase().contains("rate limit"));
-    match resp.status {
-        401 | 403 | 404 | 422 if !rate_limited => Err(Error::App(format!(
-            "could not {what}: {} {message}",
-            resp.status
-        ))),
-        status => Err(Error::Status { status, message }),
-    }
+    message
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, the form GitHub sends, to Unix seconds.

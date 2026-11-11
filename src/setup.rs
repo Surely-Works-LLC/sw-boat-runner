@@ -8,7 +8,7 @@
 //! `Secret`, which has no `Debug` or `Display`. They reach root-owned files through a
 //! command's stdin, never its arguments.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, ErrorKind, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::github::API;
+use crate::github::{API, Error};
 use crate::github_app::App;
 use crate::policy;
 use crate::transport::{Transport, Ureq};
@@ -35,13 +35,14 @@ const INSTALL_POLL: Duration = Duration::from_secs(5);
 
 const HELP: &str = "\
 usage: sw-boat-runner setup [--repo owner/name] [--labels a,b] [--snapshot name]
-                            [--policy file] [--pat] [--dry-run] [--bin path]
+                            [--policy file] [--pat] [--new-app] [--dry-run] [--bin path]
 
 Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
 
   1. writes a policy for the repository, labels and snapshot, and checks it
-  2. creates a private GitHub App from a manifest (Administration write, Actions read,
-     no webhook) and waits until it is installed on the repository
+  2. reuses the GitHub App an earlier setup stored in /etc/sw-boat-runner/env, or creates
+     a private one from a manifest (Administration write, Actions read, no webhook) and
+     waits until it is installed on the repository
   3. asks for the boat key without echo
   4. writes /etc/sw-boat-runner/{policy.toml,env,github-app.pem}, installs the binary
      to /usr/local/bin and enables the sw-boat-runner service
@@ -49,6 +50,7 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
   --repo, --labels, --snapshot   skip the prompt; or set SBR_REPO, SBR_LABELS, SBR_SNAPSHOT
   --policy FILE                  use this policy instead of the three prompts
   --pat                          a fine-grained personal token (GITHUB_TOKEN) instead of an App
+  --new-app                      create a new App even when /etc/sw-boat-runner/env names one
   --dry-run                      print what setup would do; asks no secret, changes nothing
   --bin PATH                     the binary to install (default: this one)
 
@@ -73,6 +75,7 @@ struct Options {
     snapshot: Option<String>,
     policy: Option<PathBuf>,
     pat: bool,
+    new_app: bool,
     dry_run: bool,
     bin: Option<PathBuf>,
 }
@@ -93,12 +96,16 @@ fn parse_args(args: &[&str]) -> Result<Options, String> {
             "--policy" => o.policy = Some(value()?.into()),
             "--bin" => o.bin = Some(value()?.into()),
             "--pat" => o.pat = true,
+            "--new-app" => o.new_app = true,
             "--dry-run" => o.dry_run = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
     if o.policy.is_some() && (o.repo.is_some() || o.labels.is_some() || o.snapshot.is_some()) {
         return Err("--policy replaces --repo, --labels and --snapshot".into());
+    }
+    if o.pat && o.new_app {
+        return Err("--new-app creates a GitHub App; --pat uses a token instead".into());
     }
     Ok(o)
 }
@@ -148,23 +155,42 @@ fn setup(opts: &Options) -> Result<(), String> {
     println!("Policy:\n\n{policy_text}");
     show_check(&policy_text)?;
 
-    let app_env = std::env::var("GITHUB_APP_ID").is_ok_and(|v| !v.is_empty());
+    let shell_app_id = std::env::var("GITHUB_APP_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
     let token_env = std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.is_empty());
     if token_env && !opts.pat {
         return Err(
             "GITHUB_TOKEN is set: pass --pat to use it, or unset it for a GitHub App".into(),
         );
     }
-    if opts.pat && app_env {
+    if opts.pat && shell_app_id.is_some() {
         return Err("set GITHUB_TOKEN or GITHUB_APP_*, not both".into());
     }
+    if opts.new_app && shell_app_id.is_some() {
+        return Err("--new-app creates a GitHub App: unset GITHUB_APP_ID".into());
+    }
+    let sudo = !is_root();
+    // Only an App setup reuses what an earlier setup stored, and not with --new-app.
+    let look_for_app = !opts.pat && !opts.new_app && shell_app_id.is_none();
 
     if opts.dry_run {
-        return dry_run(opts, &cfg.repo, &policy_text, &bin);
+        let existing = if look_for_app {
+            match read_root(ENV, sudo, false) {
+                Ok(Some(text)) => Existing::Text(text),
+                Ok(None) => Existing::Absent,
+                Err(_) => Existing::Unreadable,
+            }
+        } else {
+            Existing::Absent
+        };
+        let plan = (!opts.pat)
+            .then(|| plan_app(opts.new_app, shell_app_id.as_deref(), &existing))
+            .transpose()?;
+        return dry_run(plan, &cfg.repo, &policy_text, &bin);
     }
 
     let t = Ureq::new(Duration::from_secs(30));
-    let sudo = !is_root();
     let boat_key = secret("BOAT_API_KEY", "boat API key")?;
     let auth = if opts.pat {
         let token = secret(
@@ -175,22 +201,28 @@ fn setup(opts: &Options) -> Result<(), String> {
             ),
         )?;
         Auth::Pat(token)
-    } else if app_env {
-        existing_app()?
     } else {
-        let (id, pem) = create_app(&t, &cfg.repo, sudo)?;
-        let app = App::new(id.clone(), None, pem.expose().as_bytes())?;
-        println!(
-            "Waiting until the app is installed on {} (up to {} min)...",
-            cfg.repo,
-            INSTALL_WAIT.as_secs() / 60
-        );
-        let installation = wait_installed(&t, &app, &cfg.repo, INSTALL_WAIT, std::thread::sleep)?;
-        println!("Installed (installation {installation}).");
-        Auth::App {
-            id,
-            pem,
-            installation: Some(installation),
+        let existing = if look_for_app {
+            match read_root(ENV, sudo, true)? {
+                Some(text) => Existing::Text(text),
+                None => Existing::Absent,
+            }
+        } else {
+            Existing::Absent
+        };
+        match plan_app(opts.new_app, shell_app_id.as_deref(), &existing)? {
+            AppPlan::Shell(id) => shell_app(id, sudo)?,
+            AppPlan::Reuse {
+                id,
+                key_file,
+                installation,
+            } => {
+                println!("Using GitHub App {id} from {ENV} (--new-app creates a new one).");
+                app_from_file(id, &key_file, installation, sudo)
+                    .map_err(|e| format!("{e}; pass --new-app to create a new App"))?
+            }
+            AppPlan::Unknown => unreachable!("a real run reads {ENV} or fails"),
+            AppPlan::Create => new_app(&t, &cfg.repo, sudo)?,
         }
     };
     for step in steps(&policy_text, &env_file(&boat_key, &auth)?, &auth, &bin) {
@@ -205,22 +237,19 @@ fn setup(opts: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Prints the steps with placeholders for the secrets, which it does not ask for.
-fn dry_run(opts: &Options, repo: &str, policy_text: &str, bin: &Path) -> Result<(), String> {
-    let placeholder = |name: &str| Secret(format!("<{name}>"));
-    let auth = if opts.pat {
-        Auth::Pat(placeholder("GITHUB_TOKEN"))
-    } else {
-        println!(
-            "Would create a private GitHub App for {repo} from this manifest (owned by the \
-             repository's owner), print the link to install it, and wait until it is \
-             installed:\n\n{}\n",
-            serde_json::to_string_pretty(&manifest(repo, "<name>")).expect("JSON")
-        );
-        Auth::App {
-            id: "<app id>".into(),
-            pem: placeholder("private key"),
-            installation: None,
+fn placeholder(name: &str) -> Secret {
+    Secret(format!("<{name}>"))
+}
+
+/// Prints the steps with placeholders for the secrets, which it does not ask for. `plan`
+/// is `None` with `--pat`.
+fn dry_run(plan: Option<AppPlan>, repo: &str, policy_text: &str, bin: &Path) -> Result<(), String> {
+    let auth = match plan {
+        None => Auth::Pat(placeholder("GITHUB_TOKEN")),
+        Some(plan) => {
+            let (what, auth) = dry_run_app(plan, repo);
+            println!("{what}\n");
+            auth
         }
     };
     let env = env_text(&placeholder("BOAT_API_KEY"), &auth);
@@ -230,6 +259,48 @@ fn dry_run(opts: &Options, repo: &str, policy_text: &str, bin: &Path) -> Result<
         println!("{}", step.describe());
     }
     Ok(())
+}
+
+/// What a real run would do for the App, as a sentence, and the `Auth` it would end with.
+fn dry_run_app(plan: AppPlan, repo: &str) -> (String, Auth) {
+    let app = |id: String, installation, staged| Auth::App {
+        id,
+        pem: placeholder("private key"),
+        installation,
+        staged,
+    };
+    match plan {
+        AppPlan::Shell(id) => (
+            format!(
+                "Would use GitHub App {id} from GITHUB_APP_ID, with the key at \
+                 GITHUB_APP_PRIVATE_KEY_FILE."
+            ),
+            app(id, None, None),
+        ),
+        AppPlan::Reuse {
+            id, installation, ..
+        } => (
+            format!("Would reuse GitHub App {id} from {ENV} (--new-app creates a new one)."),
+            app(id, installation, None),
+        ),
+        AppPlan::Unknown => (
+            format!(
+                "Would reuse the GitHub App {ENV} names, if it names one (reading it needs \
+                 sudo), or else create one as below. --new-app always creates one."
+            ),
+            app("<app id>".into(), None, None),
+        ),
+        AppPlan::Create => (
+            format!(
+                "Would create a private GitHub App for {repo} from this manifest (owned by \
+                 the repository's owner), store its key at {}, print the link to install it, \
+                 and wait until it is installed:\n\n{}",
+                staged_key("<app id>"),
+                serde_json::to_string_pretty(&manifest(repo, "<name>")).expect("JSON")
+            ),
+            app("<app id>".into(), None, Some(staged_key("<app id>"))),
+        ),
+    }
 }
 
 /// `flag`, else the environment variable `env`, else a prompt.
@@ -259,41 +330,19 @@ fn secret(env: &str, prompt: &str) -> Result<Secret, String> {
     Ok(Secret(v))
 }
 
-/// Turns echo back on when dropped, so an error or a panic cannot leave it off.
-struct EchoOff;
-
-impl Drop for EchoOff {
-    fn drop(&mut self) {
-        let _ = Command::new("stty")
-            .arg("echo")
-            .stdin(Stdio::inherit())
-            .status();
-    }
-}
-
 fn read_line(prompt: &str, hidden: bool) -> Result<String, String> {
+    let stdin = std::io::stdin();
+    if hidden && stdin.is_terminal() {
+        // rpassword reads the terminal with echo off and handles Ctrl-C itself: it puts the
+        // terminal back before it raises SIGINT, so an interrupt never leaves echo off.
+        return rpassword::prompt_password(format!("{prompt}: "))
+            .map(|v| v.trim().to_string())
+            .map_err(|e| format!("{prompt}: {e}"));
+    }
     eprint!("{prompt}: ");
     let _ = std::io::stderr().flush();
-    let stdin = std::io::stdin();
-    let guard = if hidden && stdin.is_terminal() {
-        let off = Command::new("stty")
-            .arg("-echo")
-            .stdin(Stdio::inherit())
-            .status();
-        if !off.is_ok_and(|s| s.success()) {
-            return Err("cannot turn off echo to read a secret; set it in the environment".into());
-        }
-        Some(EchoOff)
-    } else {
-        None
-    };
     let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
-    if guard.is_some() {
-        drop(guard);
-        eprintln!();
-    }
-    match read {
+    match stdin.lock().read_line(&mut line) {
         Ok(0) => Err(format!("{prompt}: no input")),
         Ok(_) => Ok(line.trim().to_string()),
         Err(e) => Err(format!("{prompt}: {e}")),
@@ -356,16 +405,144 @@ pub enum Auth {
         id: String,
         pem: Secret,
         installation: Option<u64>,
+        /// Where a new App's key waits until the last steps move it into place.
+        staged: Option<String>,
     },
 }
 
+/// `/etc/sw-boat-runner/env` as an earlier setup left it.
+enum Existing {
+    Absent,
+    /// It exists, but a dry run could not read it without a sudo password.
+    Unreadable,
+    Text(String),
+}
+
+/// Where the App comes from.
+#[derive(Debug, PartialEq, Eq)]
+enum AppPlan {
+    /// `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_FILE` in setup's own environment.
+    Shell(String),
+    /// The App an earlier setup stored in `/etc/sw-boat-runner/env`.
+    Reuse {
+        id: String,
+        key_file: String,
+        installation: Option<u64>,
+    },
+    /// A dry run that could not read the env file.
+    Unknown,
+    Create,
+}
+
+/// The shell's App first, then (unless `--new-app`) the one the env file names, else a
+/// new one. Re-running setup so keeps the App, its key and its installation.
+fn plan_app(new_app: bool, shell_id: Option<&str>, existing: &Existing) -> Result<AppPlan, String> {
+    if let Some(id) = shell_id {
+        check_app_id("GITHUB_APP_ID", id)?;
+        return Ok(AppPlan::Shell(id.to_string()));
+    }
+    if new_app {
+        return Ok(AppPlan::Create);
+    }
+    let text = match existing {
+        Existing::Absent => return Ok(AppPlan::Create),
+        Existing::Unreadable => return Ok(AppPlan::Unknown),
+        Existing::Text(text) => text,
+    };
+    let vars = parse_env(text);
+    let get = |name: &str| {
+        vars.iter()
+            .find(|(k, v)| k == name && !v.is_empty())
+            .map(|(_, v)| v.clone())
+    };
+    let Some(id) = get("GITHUB_APP_ID") else {
+        return Ok(AppPlan::Create);
+    };
+    let hint = "; fix it or pass --new-app to create a new App";
+    check_app_id(&format!("GITHUB_APP_ID in {ENV}"), &id).map_err(|e| format!("{e}{hint}"))?;
+    let installation = get("GITHUB_APP_INSTALLATION_ID")
+        .map(|v| v.parse::<u64>())
+        .transpose()
+        .map_err(|_| format!("GITHUB_APP_INSTALLATION_ID in {ENV} is not a number{hint}"))?;
+    Ok(AppPlan::Reuse {
+        id,
+        key_file: get("GITHUB_APP_PRIVATE_KEY_FILE").unwrap_or_else(|| KEY.into()),
+        installation,
+    })
+}
+
+/// `NAME=value` lines; blank lines and `#` comments are skipped and a value's surrounding
+/// quotes dropped, as systemd reads them.
+fn parse_env(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| {
+            let v = v.trim();
+            let v = ['"', '\'']
+                .iter()
+                .find_map(|q| v.strip_prefix(*q)?.strip_suffix(*q))
+                .unwrap_or(v);
+            (k.trim().to_string(), v.to_string())
+        })
+        .collect()
+}
+
+/// An App's ID (digits) or client ID (`Iv` and letters, digits, dots). The daemon puts it
+/// in the JWT and systemd reads it from the env file, so nothing else may pass.
+fn check_app_id(what: &str, id: &str) -> Result<(), String> {
+    let digits = !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit());
+    let client = id.strip_prefix("Iv").is_some_and(|rest| {
+        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+    });
+    if digits || client {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} must be an App ID (digits) or a client ID (Iv...)"
+        ))
+    }
+}
+
+/// A root-only file, read with `sudo cat` when this user cannot read it; `None` when it
+/// does not exist. Without `prompt`, sudo fails rather than ask for a password. Errors
+/// never hold the content.
+fn read_root(path: &str, sudo: bool, prompt: bool) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => return Ok(Some(text)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) if !(sudo && e.kind() == ErrorKind::PermissionDenied) => {
+            return Err(format!("{path}: {e}"));
+        }
+        Err(_) => {}
+    }
+    let mut cmd = Command::new("sudo");
+    if !prompt {
+        cmd.arg("-n");
+    }
+    let out = cmd
+        .args(["cat", "--", path])
+        .stdin(Stdio::inherit())
+        .stderr(if prompt {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .output()
+        .map_err(|e| format!("sudo: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sudo cat {path} failed ({})", out.status));
+    }
+    String::from_utf8(out.stdout)
+        .map(Some)
+        .map_err(|_| format!("{path}: not UTF-8"))
+}
+
 /// An App from `GITHUB_APP_ID` and the key at `GITHUB_APP_PRIVATE_KEY_FILE`.
-fn existing_app() -> Result<Auth, String> {
-    let id = std::env::var("GITHUB_APP_ID").unwrap_or_default();
+fn shell_app(id: String, sudo: bool) -> Result<Auth, String> {
     let path = std::env::var("GITHUB_APP_PRIVATE_KEY_FILE")
         .map_err(|_| "GITHUB_APP_ID is set: set GITHUB_APP_PRIVATE_KEY_FILE too".to_string())?;
-    let pem = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-    App::new(id.clone(), None, pem.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
     let installation = match std::env::var("GITHUB_APP_INSTALLATION_ID") {
         Ok(v) if !v.is_empty() => Some(
             v.parse()
@@ -373,16 +550,61 @@ fn existing_app() -> Result<Auth, String> {
         ),
         _ => None,
     };
+    app_from_file(id, &path, installation, sudo)
+}
+
+/// An App whose key is at `path`, checked before anything is written.
+fn app_from_file(
+    id: String,
+    path: &str,
+    installation: Option<u64>,
+    sudo: bool,
+) -> Result<Auth, String> {
+    let pem = read_root(path, sudo, true)?.ok_or_else(|| format!("{path}: not found"))?;
+    App::new(id.clone(), None, pem.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
     Ok(Auth::App {
         id,
         pem: Secret(pem),
         installation,
+        staged: None,
+    })
+}
+
+/// Where a new App's key waits, next to the key in use, until the last steps.
+fn staged_key(id: &str) -> String {
+    format!("{KEY}.{id}")
+}
+
+/// Creates an App and waits until it is installed. Until the last steps, the service
+/// keeps the App and key it had: the new key waits at `staged_key`.
+fn new_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<Auth, String> {
+    let (id, pem) = create_app(t, repo, sudo)?;
+    let staged = staged_key(&id);
+    let app = App::new(id.clone(), None, pem.expose().as_bytes())?;
+    println!(
+        "Waiting until the app is installed on {repo} (up to {} min)...",
+        INSTALL_WAIT.as_secs() / 60
+    );
+    let installation =
+        wait_installed(t, &app, repo, INSTALL_WAIT, std::thread::sleep).map_err(|e| {
+            format!(
+                "{e}\nNothing else changed: the service keeps its old settings. The new app's \
+                 key is at {staged}; to use the app, install it and run setup again with \
+                 GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE={staged}."
+            )
+        })?;
+    println!("Installed (installation {installation}).");
+    Ok(Auth::App {
+        id,
+        pem,
+        installation: Some(installation),
+        staged: Some(staged),
     })
 }
 
 /// The manifest flow: the user creates the App in a browser, pastes back the code GitHub
-/// redirects with, and setup exchanges it for the App's id and private key, which it
-/// stores at once so a later failure does not lose it.
+/// redirects with, and setup exchanges it for the App's id and private key. It stores
+/// the key at once at `staged_key`, since GitHub shows it only once.
 fn create_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<(String, Secret), String> {
     let (owner, name) = repo.split_once('/').expect("a checked repo");
     let kind = owner_kind(t, owner)?;
@@ -405,10 +627,14 @@ fn create_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<(String, Secr
         created.pem.expose().as_bytes(),
     )?;
     println!("Created app {} (id {}).", created.slug, created.id);
-    // Stored now: GitHub shows the key only once.
+    // Stored now, GitHub shows the key only once; not yet over the key in use.
     for step in [
         Step::Dir,
-        Step::write(KEY, "600", Content::Secret(&created.pem)),
+        Step::write(
+            staged_key(&created.id.to_string()),
+            "600",
+            Content::Secret(&created.pem),
+        ),
     ] {
         println!("{}", step.describe());
         step.execute(sudo)?;
@@ -529,8 +755,8 @@ fn data_url(html: &str) -> String {
     url
 }
 
-/// The code from a pasted redirect address, or a pasted code. A `state` in the address
-/// must be the one setup sent.
+/// The code from a pasted redirect address, or a pasted code. An address must carry the
+/// `state` setup sent.
 fn parse_code(pasted: &str, state: &str) -> Result<Secret, String> {
     let pasted = pasted.trim();
     let code = match pasted.split_once('?') {
@@ -541,8 +767,18 @@ fn parse_code(pasted: &str, state: &str) -> Result<Secret, String> {
                     .split('&')
                     .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
             };
-            if param("state").is_some_and(|s| s != state) {
-                return Err("the address is from another setup (its state differs)".into());
+            match param("state") {
+                Some(s) if s == state => {}
+                Some(_) => {
+                    return Err("the address is from another setup (its state differs)".into());
+                }
+                None => {
+                    return Err(
+                        "the address has no state; paste the whole address GitHub opened, \
+                         or just the code"
+                            .into(),
+                    );
+                }
             }
             param("code").ok_or("the address has no code")?
         }
@@ -604,15 +840,42 @@ fn wait_installed(
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        match app.installation_on(t, repo, now) {
-            Ok(id) => return Ok(id),
-            Err(e) if waited >= limit => {
-                return Err(format!("the app is not installed on {repo}: {e}"));
+        let network = match app.installation_on(t, repo, now) {
+            Ok(Some(id)) => return Ok(id),
+            // 404: not installed yet.
+            Ok(None) => None,
+            // A dropped connection is worth another try; any answer but 404 is not.
+            Err(Error::Network(e)) => Some(e),
+            Err(Error::Status { status: 401, .. }) => {
+                return Err(
+                    "GitHub refused the app's JWT (401). Check this machine's clock \
+                            (`timedatectl`): GitHub refuses a JWT from a clock more than a \
+                            minute off."
+                        .into(),
+                );
             }
-            Err(_) => {
-                sleep(INSTALL_POLL);
-                waited += INSTALL_POLL;
+            Err(Error::Status {
+                status: 403,
+                message,
+            }) => {
+                return Err(format!(
+                    "GitHub refused to show the app's installation on {repo} (403 {message})"
+                ));
             }
+            Err(e) => return Err(format!("look up the app's installation on {repo}: {e}")),
+        };
+        if waited >= limit {
+            let last = network.map_or(String::new(), |e| format!(" (last try: {e})"));
+            return Err(format!("the app is not installed on {repo}{last}"));
+        }
+        sleep(INSTALL_POLL);
+        waited += INSTALL_POLL;
+        if waited.as_secs() % 60 == 0 {
+            println!(
+                "Still waiting for the app to be installed on {repo} ({} of {} min)...",
+                waited.as_secs() / 60,
+                limit.as_secs() / 60
+            );
         }
     }
 }
@@ -620,8 +883,12 @@ fn wait_installed(
 /// `/etc/sw-boat-runner/env`, which systemd reads as root before it starts the service.
 fn env_file(boat_key: &Secret, auth: &Auth) -> Result<Secret, String> {
     let mut values = vec![("BOAT_API_KEY", boat_key.expose())];
-    if let Auth::Pat(token) = auth {
-        values.push(("GITHUB_TOKEN", token.expose()));
+    match auth {
+        Auth::Pat(token) => values.push(("GITHUB_TOKEN", token.expose())),
+        Auth::App { id, .. } => {
+            check_app_id("GITHUB_APP_ID", id)?;
+            values.push(("GITHUB_APP_ID", id));
+        }
     }
     for (name, value) in values {
         // systemd would read a quote, a backslash or a space as syntax.
@@ -700,10 +967,12 @@ enum Content<'a> {
 enum Step<'a> {
     Dir,
     Write {
-        path: &'static str,
+        path: String,
         mode: &'static str,
         content: Content<'a>,
     },
+    /// A new App's key, from where it waited to where the service reads it.
+    MoveKey(String),
     Install(PathBuf),
     Run {
         args: &'static [&'static str],
@@ -712,9 +981,9 @@ enum Step<'a> {
 }
 
 impl<'a> Step<'a> {
-    fn write(path: &'static str, mode: &'static str, content: Content<'a>) -> Self {
+    fn write(path: impl Into<String>, mode: &'static str, content: Content<'a>) -> Self {
         Step::Write {
-            path,
+            path: path.into(),
             mode,
             content,
         }
@@ -748,6 +1017,7 @@ impl<'a> Step<'a> {
                 };
                 format!("+ write {path} (mode {mode}, root only): {what}")
             }
+            Step::MoveKey(from) => format!("+ mv -f {from} {KEY}"),
             Step::Install(from) => format!("+ install -m 755 {} {BIN}", from.display()),
             Step::Run { args, .. } => format!("+ {}", args.join(" ")),
         }
@@ -776,6 +1046,8 @@ impl<'a> Step<'a> {
                     true,
                 )
             }
+            // A rename in one directory: the service sees the old key or the new one.
+            Step::MoveKey(from) => (strings(&["mv", "-f", from, KEY]), None, true),
             Step::Install(from) => (
                 vec![
                     "install".into(),
@@ -841,8 +1113,14 @@ fn steps<'a>(policy_text: &str, env: &'a Secret, auth: &'a Auth, bin: &Path) -> 
         Step::write(POLICY, "644", Content::Public(policy_text.to_string())),
         Step::write(ENV, "600", Content::Secret(env)),
     ];
-    if let Auth::App { pem, .. } = auth {
-        steps.push(Step::write(KEY, "600", Content::Secret(pem)));
+    // The env and the key together, and before the restart.
+    match auth {
+        Auth::App {
+            staged: Some(staged),
+            ..
+        } => steps.push(Step::MoveKey(staged.clone())),
+        Auth::App { pem, .. } => steps.push(Step::write(KEY, "600", Content::Secret(pem))),
+        Auth::Pat(_) => {}
     }
     let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -905,6 +1183,8 @@ mod tests {
                 .contains("unknown")
         );
         assert!(parse_args(&["--policy", "p", "--repo", "a/b"]).is_err());
+        assert!(parse_args(&["--new-app"]).unwrap().new_app);
+        assert!(parse_args(&["--new-app", "--pat"]).is_err());
     }
 
     #[test]
@@ -992,7 +1272,11 @@ mod tests {
             code(&format!(" {HOMEPAGE}?state=st&code=a_1#x ")).unwrap(),
             "a_1"
         );
-        assert_eq!(code(&format!("{HOMEPAGE}?code=abc")).unwrap(), "abc");
+        assert!(
+            code(&format!("{HOMEPAGE}?code=abc"))
+                .unwrap_err()
+                .contains("no state")
+        );
         assert!(
             code(&format!("{HOMEPAGE}?code=abc&state=other"))
                 .unwrap_err()
@@ -1051,6 +1335,136 @@ mod tests {
         let err = wait_installed(&never, &app, "o/r", INSTALL_POLL * 2, |_| {}).unwrap_err();
         assert!(err.contains("not installed on o/r"), "{err}");
         assert_eq!(never.sent().len(), 3);
+
+        // A dropped connection is tried again.
+        let calls = std::cell::Cell::new(0);
+        let flaky = Fake::failing(move |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 2 {
+                Err(crate::transport::NetworkError("reset".into()))
+            } else {
+                Ok(respond(200, &[], r#"{"id":5}"#))
+            }
+        });
+        assert_eq!(
+            wait_installed(&flaky, &app, "o/r", INSTALL_WAIT, |_| {}).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn the_wait_stops_at_once_on_any_answer_but_404() {
+        let app = App::new("42".into(), None, test_pem().as_bytes()).unwrap();
+        for (status, expect) in [
+            (401, "clock"),
+            (403, "403 Resource not accessible"),
+            (500, "500"),
+        ] {
+            let fake = Fake::new(move |_| {
+                respond(status, &[], r#"{"message":"Resource not accessible"}"#)
+            });
+            let err = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, |_| {
+                panic!("slept after {status}")
+            })
+            .unwrap_err();
+            assert!(err.contains(expect), "{status}: {err}");
+            assert_eq!(fake.sent().len(), 1);
+        }
+    }
+
+    #[test]
+    fn reads_an_env_file_as_systemd_does() {
+        let vars = parse_env("# c\n\nA=1\n B = \"two\" \nC='3'\nnoequals\nD=\n");
+        let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (&**k, &**v)).collect();
+        assert_eq!(pairs, [("A", "1"), ("B", "two"), ("C", "3"), ("D", "")]);
+    }
+
+    #[test]
+    fn a_second_setup_reuses_the_app_in_the_env_file() {
+        let env = |text: &str| Existing::Text(text.into());
+        let ours = env("BOAT_API_KEY=bk\nGITHUB_APP_ID=42\n\
+             GITHUB_APP_PRIVATE_KEY_FILE=/etc/sw-boat-runner/github-app.pem\n\
+             GITHUB_APP_INSTALLATION_ID=77\n");
+        let reuse = AppPlan::Reuse {
+            id: "42".into(),
+            key_file: KEY.into(),
+            installation: Some(77),
+        };
+        assert_eq!(plan_app(false, None, &ours).unwrap(), reuse);
+        assert_eq!(plan_app(true, None, &ours).unwrap(), AppPlan::Create);
+        assert_eq!(
+            plan_app(false, Some("7"), &ours).unwrap(),
+            AppPlan::Shell("7".into())
+        );
+        assert_eq!(
+            plan_app(false, None, &env("GITHUB_APP_ID=Iv1.ab\n")).unwrap(),
+            AppPlan::Reuse {
+                id: "Iv1.ab".into(),
+                key_file: KEY.into(),
+                installation: None,
+            }
+        );
+        let pat = env("BOAT_API_KEY=bk\nGITHUB_TOKEN=t\n");
+        assert_eq!(plan_app(false, None, &pat).unwrap(), AppPlan::Create);
+        assert_eq!(
+            plan_app(false, None, &Existing::Absent).unwrap(),
+            AppPlan::Create
+        );
+        assert_eq!(
+            plan_app(false, None, &Existing::Unreadable).unwrap(),
+            AppPlan::Unknown
+        );
+        let bad = plan_app(false, None, &env("GITHUB_APP_ID=4 2\n")).unwrap_err();
+        assert!(bad.contains("--new-app"), "{bad}");
+        assert!(
+            plan_app(
+                false,
+                None,
+                &env("GITHUB_APP_ID=4\nGITHUB_APP_INSTALLATION_ID=x\n")
+            )
+            .is_err()
+        );
+        assert!(plan_app(false, Some("x;y"), &Existing::Absent).is_err());
+    }
+
+    #[test]
+    fn app_ids_are_digits_or_a_client_id() {
+        for ok in ["1", "123456", "Iv1.0123abcd", "Iv23liABC"] {
+            assert!(check_app_id("id", ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "Iv", "12a", "1 2", "Iv1/x", "x\nGITHUB_TOKEN=y", "-1"] {
+            assert!(check_app_id("id", bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_dry_run_says_where_the_app_comes_from() {
+        let (what, auth) = dry_run_app(
+            AppPlan::Reuse {
+                id: "42".into(),
+                key_file: KEY.into(),
+                installation: Some(77),
+            },
+            "o/r",
+        );
+        assert!(what.starts_with("Would reuse GitHub App 42"), "{what}");
+        assert!(matches!(auth, Auth::App { staged: None, .. }));
+        let (what, _) = dry_run_app(AppPlan::Shell("7".into()), "o/r");
+        assert!(what.starts_with("Would use GitHub App 7"), "{what}");
+        let (what, _) = dry_run_app(AppPlan::Unknown, "o/r");
+        assert!(what.contains("needs sudo"), "{what}");
+        let (what, auth) = dry_run_app(AppPlan::Create, "o/r");
+        assert!(
+            what.starts_with("Would create a private GitHub App"),
+            "{what}"
+        );
+        let Auth::App { staged, .. } = &auth else {
+            panic!()
+        };
+        assert_eq!(
+            staged.as_deref(),
+            Some("/etc/sw-boat-runner/github-app.pem.<app id>")
+        );
     }
 
     #[test]
@@ -1065,6 +1479,7 @@ mod tests {
             id: "42".into(),
             pem: Secret(test_pem()),
             installation: Some(77),
+            staged: None,
         };
         assert_eq!(
             env_file(&boat, &app).unwrap().expose(),
@@ -1079,6 +1494,18 @@ mod tests {
                 "{err}"
             );
         }
+        let bad_id = Auth::App {
+            id: "42\nGITHUB_TOKEN=x".into(),
+            pem: Secret(test_pem()),
+            installation: None,
+            staged: None,
+        };
+        assert!(
+            env_file(&boat, &bad_id)
+                .err()
+                .unwrap()
+                .contains("GITHUB_APP_ID")
+        );
     }
 
     #[test]
@@ -1120,6 +1547,7 @@ mod tests {
             id: "42".into(),
             pem: Secret(test_pem()),
             installation: None,
+            staged: None,
         };
         let env = env_file(&boat, &auth).unwrap();
         let app_steps = steps("repo = \"a/b\"\n", &env, &auth, Path::new("/tmp/sbr"));
@@ -1147,6 +1575,30 @@ mod tests {
                 .last()
                 .unwrap()
                 .contains("systemctl --no-pager status")
+        );
+
+        // A new App's key moves into place right after the env, not before.
+        let new = Auth::App {
+            id: "42".into(),
+            pem: Secret(test_pem()),
+            installation: Some(77),
+            staged: Some(staged_key("42")),
+        };
+        let env = env_file(&boat, &new).unwrap();
+        let shown: Vec<String> = steps("", &env, &new, Path::new("/tmp/sbr"))
+            .iter()
+            .map(Step::describe)
+            .collect();
+        let at = |prefix: &str| shown.iter().position(|s| s.starts_with(prefix)).unwrap();
+        assert_eq!(
+            at("+ mv -f /etc/sw-boat-runner/github-app.pem.42 /etc/sw-boat-runner/github-app.pem"),
+            at("+ write /etc/sw-boat-runner/env") + 1
+        );
+        assert!(at("+ mv") < at("+ systemctl restart"));
+        assert!(
+            !shown
+                .iter()
+                .any(|s| s.starts_with("+ write /etc/sw-boat-runner/github-app.pem"))
         );
 
         let pat = Auth::Pat(Secret("t".into()));

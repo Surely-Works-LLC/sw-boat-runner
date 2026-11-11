@@ -10,8 +10,9 @@ All notable changes to this project are documented here. The format follows
 
 - `sw-boat-runner setup`: writes a policy, creates a GitHub App from a manifest (or takes
   a personal token with `--pat`), stores the keys root-only and enables the systemd
-  service. `--dry-run` prints the steps. `examples/always-on/install.sh` now builds the
-  binary and runs it.
+  service. `--dry-run` prints the steps. Running it again reuses the App it stored;
+  `--new-app` makes another. `examples/always-on/install.sh` now builds the binary and
+  runs it.
 - A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
   `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
   put its keys at the top level, without `[[pool]]`.
