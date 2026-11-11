@@ -20,7 +20,8 @@ pub(crate) fn default_tick_s() -> u64 {
     15
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Declared in the one order `policy` accepts: a free slot before any start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
     Slot,
@@ -50,8 +51,13 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Whether `step` is in the pool's placement (spec `Has`).
+    pub fn has(&self, step: Placement) -> bool {
+        self.placement.contains(&step)
+    }
+
     /// A job goes to a pool when it names at least one label and each is one of the pool's.
-    /// GitHub matches runner labels case-insensitively.
+    /// GitHub matches runner labels case-insensitively. The only label match in the crate.
     pub(crate) fn serves(&self, job_labels: &[String]) -> bool {
         !job_labels.is_empty()
             && job_labels
@@ -87,6 +93,13 @@ pub struct Machine {
     pub last_busy: UnixSecs,
     /// The job an ephemeral (forked) machine was made for; `None` for a kept machine.
     pub job: Option<JobKey>,
+}
+
+impl Machine {
+    /// Forked for one job and deleted after it (spec `IsEph`); any other machine is kept.
+    pub fn is_ephemeral(&self) -> bool {
+        self.job.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

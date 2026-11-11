@@ -1,3 +1,4 @@
+# Pins: Delete: a pool without resume deletes a stopped kept machine, then forks a kept one for min_up.
 repo = "acme/app"
 
 [[pool]]

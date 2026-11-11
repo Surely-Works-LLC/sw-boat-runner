@@ -1,0 +1,10 @@
+# Pins: Delete: a fork past fork_ttl_s goes even with an Idle runner or while starting; a Busy runner keeps it.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "Linux", "pool-a"]
+machine_type = "xlarge"
+snapshot = "snap-1"
+preset = "fork"
+max_boxes = 8

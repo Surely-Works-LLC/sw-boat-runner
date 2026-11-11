@@ -1,3 +1,4 @@
+# Pins: Fork(none): a pool pool forks kept machines up to min_up and nothing for the jobs beyond their slots.
 repo = "acme/app"
 
 [[pool]]

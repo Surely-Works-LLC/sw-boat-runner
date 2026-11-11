@@ -1,3 +1,4 @@
+# Pins: Unregister: a runner on a machine that is not Up is unregistered.
 repo = "acme/app"
 
 [[pool]]

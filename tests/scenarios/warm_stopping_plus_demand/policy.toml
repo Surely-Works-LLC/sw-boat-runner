@@ -1,3 +1,4 @@
+# Pins: Fork(none): a stopping machine is no capacity for jobs, so a full warm pool forks a kept one.
 repo = "acme/app"
 
 [[pool]]
