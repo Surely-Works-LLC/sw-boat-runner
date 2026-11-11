@@ -21,6 +21,8 @@ use crate::github_app::App;
 use crate::policy;
 use crate::transport::{Transport, Ureq};
 
+mod remote;
+
 const DIR: &str = "/etc/sw-boat-runner";
 const POLICY: &str = "/etc/sw-boat-runner/policy.toml";
 const ENV: &str = "/etc/sw-boat-runner/env";
@@ -33,6 +35,8 @@ const HOMEPAGE: &str = "https://github.com/Surely-Works-LLC/sw-boat-runner";
 /// the browser back to it with the code to paste into setup.
 const NEW_APP_PAGE: &str = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
 const DEFAULT_LABELS: &str = "self-hosted, boat";
+/// The name offered for a snapshot setup builds when the account has none.
+const DEFAULT_SNAPSHOT: &str = "sbr-runner";
 /// How long `setup` waits for the new App to be installed on the repository.
 const INSTALL_WAIT: Duration = Duration::from_secs(30 * 60);
 const INSTALL_POLL: Duration = Duration::from_secs(5);
@@ -41,6 +45,8 @@ const HELP: &str = "\
 usage: sw-boat-runner setup [--repo owner/name] [--labels a,b] [--snapshot name]
                             [--policy file] [--pat] [--new-app] [--offline-link]
                             [--dry-run] [--bin path]
+       sw-boat-runner setup --remote [--repo, --labels, --snapshot, --policy, --pat,
+                            --offline-link, --paste, --dry-run]
 
 Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
 
@@ -63,6 +69,18 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
                                  of the short link to the project's GitHub Pages page
   --dry-run                      print what setup would do; asks no secret, changes nothing
   --bin PATH                     the binary to install (default: this one)
+  --remote                       run from your laptop: create the App here (the browser
+                                 comes back to a one-shot listener on 127.0.0.1), then a
+                                 small always-on boat machine, and install the daemon on
+                                 it over `boat ssh` (needs the boat CLI, logged in). Each
+                                 run creates a new machine. SBR_REF picks the release it
+                                 installs (default: this binary's version)
+  --paste                        with --remote: paste the code GitHub returns instead of
+                                 the 127.0.0.1 redirect
+
+When the snapshot named is not among your saved boat snapshots (or you answer `new`),
+setup offers to build one: a temporary noEnv machine gets the latest actions/runner,
+unconfigured, and is checked and saved as `sw-boat-runner snapshot` does.
 
 Secrets come from the environment or a prompt without echo, never from arguments:
 BOAT_API_KEY, GITHUB_TOKEN (with --pat), SBR_APP_CODE (the code GitHub returns after the
@@ -89,6 +107,8 @@ struct Options {
     offline_link: bool,
     dry_run: bool,
     bin: Option<PathBuf>,
+    remote: bool,
+    paste: bool,
 }
 
 fn parse_args(args: &[&str]) -> Result<Options, String> {
@@ -110,11 +130,24 @@ fn parse_args(args: &[&str]) -> Result<Options, String> {
             "--new-app" => o.new_app = true,
             "--offline-link" => o.offline_link = true,
             "--dry-run" => o.dry_run = true,
+            "--remote" => o.remote = true,
+            "--paste" => o.paste = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
     if o.policy.is_some() && (o.repo.is_some() || o.labels.is_some() || o.snapshot.is_some()) {
         return Err("--policy replaces --repo, --labels and --snapshot".into());
+    }
+    if o.remote && o.bin.is_some() {
+        return Err(
+            "--remote installs a release on the boat machine; --bin is for this one".into(),
+        );
+    }
+    if o.paste && !o.remote {
+        return Err("--paste goes with --remote".into());
+    }
+    if o.paste && o.offline_link {
+        return Err("--offline-link already pastes the code; drop --paste".into());
     }
     if o.pat && o.new_app {
         return Err("--new-app creates a GitHub App; --pat uses a token instead".into());
@@ -143,31 +176,124 @@ pub fn cli(args: &[&str]) -> ExitCode {
     }
 }
 
-fn setup(opts: &Options) -> Result<(), String> {
-    let policy_text = match &opts.policy {
-        Some(path) => {
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
-        }
-        None => {
-            let repo = value(
-                &opts.repo,
-                "SBR_REPO",
-                "Repository (owner/name)",
-                default_repo,
-            )?;
-            let labels = value(
-                &opts.labels,
-                "SBR_LABELS",
-                "Runner labels, comma-separated (self-hosted is added)",
-                || Some(DEFAULT_LABELS.into()),
-            )?;
-            let snapshot = match given(&opts.snapshot, "SBR_SNAPSHOT") {
-                Some(s) => s,
-                None => ask_snapshot()?,
-            };
-            policy_text(&repo, &split_labels(&labels), &snapshot)
-        }
+/// The policy: the file `--policy` names, or one from the three prompts. The snapshot
+/// prompt may build a snapshot, and leaves the boat key it asked for in `boat_key`.
+fn choose_policy(opts: &Options, boat_key: &mut Option<Secret>) -> Result<String, String> {
+    if let Some(path) = &opts.policy {
+        return std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    let repo = value(
+        &opts.repo,
+        "SBR_REPO",
+        "Repository (owner/name)",
+        default_repo,
+    )?;
+    let labels = value(
+        &opts.labels,
+        "SBR_LABELS",
+        "Runner labels, comma-separated (self-hosted is added)",
+        || Some(DEFAULT_LABELS.into()),
+    )?;
+    let snapshot = choose_snapshot(opts, boat_key)?;
+    Ok(policy_text(&repo, &split_labels(&labels), &snapshot))
+}
+
+/// The snapshot from `--snapshot`, `SBR_SNAPSHOT` or the prompt. When boat's list shows
+/// no snapshot by that name, or the answer is `new`, it offers to build one.
+fn choose_snapshot(opts: &Options, boat_key: &mut Option<Secret>) -> Result<String, String> {
+    if boat_key.is_none() {
+        *boat_key = given(&None, "BOAT_API_KEY").map(Secret);
+    }
+    let saved = boat_key.as_ref().and_then(|k| list_saved(k.expose()));
+    let typed = match given(&opts.snapshot, "SBR_SNAPSHOT") {
+        Some(s) => s,
+        None => ask_snapshot(saved.as_deref())?,
     };
+    let asked_new = typed == "new";
+    let name = if asked_new {
+        value(
+            &None,
+            "SBR_NEW_SNAPSHOT",
+            "Name for the new snapshot",
+            || Some(DEFAULT_SNAPSHOT.into()),
+        )?
+    } else {
+        typed
+    };
+    let exists = saved
+        .as_ref()
+        .map(|list| list.iter().any(|s| s.name == name));
+    match exists {
+        Some(true) => {}
+        // Without a list there is nothing to compare with: offer only when asked.
+        None if !asked_new => {}
+        _ => offer_build(&name, boat_key, opts.dry_run)?,
+    }
+    Ok(name)
+}
+
+/// Offers to build the missing snapshot `name` for the `default` machine type the policy
+/// setup writes uses.
+fn offer_build(name: &str, boat_key: &mut Option<Secret>, dry_run: bool) -> Result<(), String> {
+    if !crate::snapshot::valid_name(name) {
+        return Err(format!(
+            "{name:?} is not a boat snapshot name: 1-63 lowercase letters, digits or dashes"
+        ));
+    }
+    let question = format!(
+        "Build a runner snapshot named {name} now? (creates a temporary noEnv machine, ~5 min)"
+    );
+    println!("No saved boat snapshot is called {name}.");
+    if dry_run {
+        println!(
+            "A real run asks: {question}
+"
+        );
+        return Ok(());
+    }
+    if !crate::snapshot::ask_yes(&question) {
+        println!(
+            "Not building it. docs/design.md#snapshots shows how to make one; doctor checks it.
+"
+        );
+        return Ok(());
+    }
+    if boat_key.is_none() {
+        *boat_key = Some(secret("BOAT_API_KEY", "boat API key")?);
+    }
+    let key = boat_key.as_ref().expect("set above");
+    println!(
+        "It holds the runner only. For toolchains, install them in a sandbox from it \
+         (boat new --no-env --from {name}) and run `sw-boat-runner snapshot <id> {name}` again."
+    );
+    let t = Ureq::new(Duration::from_secs(60));
+    let mut io = crate::snapshot::Terminal::new();
+    if crate::snapshot::build(&t, key.expose(), name, "default", &mut io)? {
+        println!();
+        Ok(())
+    } else {
+        Err(format!("the snapshot {name} was not saved"))
+    }
+}
+
+/// The account's saved snapshots, newest first; `None` when boat could not list them.
+fn list_saved(key: &str) -> Option<Vec<crate::boat::SavedSnapshot>> {
+    let t = Ureq::new(Duration::from_secs(30));
+    match crate::boat::Client::new(&t, key.to_string()).saved_snapshots(None) {
+        Ok(list) => Some(list),
+        Err(e) => {
+            eprintln!("Could not list saved boat snapshots ({e}); type the name.");
+            None
+        }
+    }
+}
+
+fn setup(opts: &Options) -> Result<(), String> {
+    if opts.remote {
+        return remote::run(opts);
+    }
+    let mut boat_key = None;
+    let policy_text = choose_policy(opts, &mut boat_key)?;
     let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
     let bin = match &opts.bin {
         Some(b) => b.clone(),
@@ -212,7 +338,10 @@ fn setup(opts: &Options) -> Result<(), String> {
     }
 
     let t = Ureq::new(Duration::from_secs(30));
-    let boat_key = secret("BOAT_API_KEY", "boat API key")?;
+    let boat_key = match boat_key {
+        Some(k) => k,
+        None => secret("BOAT_API_KEY", "boat API key")?,
+    };
     let auth = if opts.pat {
         let token = secret(
             "GITHUB_TOKEN",
@@ -421,25 +550,19 @@ fn repo_ok(repo: &str) -> bool {
     policy::parse(&policy_text(repo, &["self-hosted".into()], "s")).is_ok()
 }
 
-/// The snapshot: a choice among the boat account's saved snapshots when `BOAT_API_KEY` is
-/// set and lists some, else a plain prompt.
-fn ask_snapshot() -> Result<String, String> {
+/// The snapshot: a choice among the boat account's saved snapshots when boat listed
+/// them (`saved`), else a plain prompt. `new` asks setup to build one.
+fn ask_snapshot(saved: Option<&[crate::boat::SavedSnapshot]>) -> Result<String, String> {
     const PROMPT: &str = "boat snapshot";
-    let saved = given(&None, "BOAT_API_KEY")
-        .and_then(|key| {
-            let t = Ureq::new(Duration::from_secs(30));
-            match crate::boat::Client::new(&t, key).saved_snapshots(None) {
-                Ok(list) => Some(list),
-                Err(e) => {
-                    eprintln!("Could not list saved boat snapshots ({e}); type the name.");
-                    None
-                }
-            }
-        })
-        .unwrap_or_default();
+    let Some(saved) = saved else {
+        return value(&None, "SBR_SNAPSHOT", PROMPT, || None);
+    };
     let names: Vec<String> = saved.iter().map(|s| s.name.clone()).collect();
     if names.is_empty() {
-        return value(&None, "SBR_SNAPSHOT", PROMPT, || None);
+        eprintln!("You have no saved boat snapshots; setup can build one.");
+        return value(&None, "SBR_SNAPSHOT", &format!("{PROMPT} to build"), || {
+            Some(DEFAULT_SNAPSHOT.into())
+        });
     }
     eprintln!("Saved boat snapshots, newest first:");
     for (i, s) in saved.iter().enumerate() {
@@ -453,7 +576,10 @@ fn ask_snapshot() -> Result<String, String> {
         .find(|s| s.status == "ready")
         .map(|s| s.name.clone());
     let typed = read_line(
-        &with_default(&format!("{PROMPT} (number or name)"), default.as_deref()),
+        &with_default(
+            &format!("{PROMPT} (number, name, or new to build one)"),
+            default.as_deref(),
+        ),
         false,
     )?;
     pick_snapshot(&typed, &names, default)
@@ -775,7 +901,7 @@ fn create_app(
         let page = manifest_page(&kind.new_app_url(owner), &manifest(repo, &app_name), &state);
         data_url(&page)
     } else {
-        pages_link(owner, &kind, name, &state, &app_name)
+        pages_link(owner, &kind, name, &state, &app_name, None)
     };
     println!(
         "Create the GitHub App: open this link in your browser, check what the page lists \
@@ -805,6 +931,14 @@ fn create_app(
         println!("{}", step.describe());
         step.execute(sudo)?;
     }
+    let note = print_install_link(repo, &kind, &created.slug);
+    Ok((created.id.to_string(), created.pem, note))
+}
+
+/// Prints where to install the new App; returns what the wait for the installation
+/// repeats, if anything.
+fn print_install_link(repo: &str, kind: &OwnerKind, slug: &str) -> String {
+    let (owner, _) = repo.split_once('/').expect("a checked repo");
     let note = match kind {
         OwnerKind::Organization if org_owner(owner) != Some(true) => format!(
             "If you are not an owner of {owner}, GitHub shows a \"Request\" screen instead: \
@@ -815,25 +949,40 @@ fn create_app(
     println!(
         "\nAdministration write can change {repo}'s settings or delete it, so install the app \
          on {repo} only:\nchoose 'Only select repositories' -> {repo}.{}\n\n\
-         https://github.com/apps/{}/installations/new\n",
+         https://github.com/apps/{slug}/installations/new\n",
         if note.is_empty() {
             String::new()
         } else {
             format!("\n{note}")
         },
-        created.slug
     );
-    Ok((created.id.to_string(), created.pem, note))
+    note
 }
 
 /// The short link to docs/new-app.html, which builds the same manifest as `manifest`.
-/// Every value is in the GitHub name charset or hex, so none needs escaping.
-fn pages_link(owner: &str, kind: &OwnerKind, repo_name: &str, state: &str, app: &str) -> String {
+/// Every value is in the GitHub name charset or hex, so none needs escaping. `redirect`,
+/// a loopback address `setup --remote` listens on, replaces the page as the manifest's
+/// `redirect_url`; the page takes only one that `remote::is_loopback_redirect` takes.
+fn pages_link(
+    owner: &str,
+    kind: &OwnerKind,
+    repo_name: &str,
+    state: &str,
+    app: &str,
+    redirect: Option<&str>,
+) -> String {
     let kind = match kind {
         OwnerKind::User => "user",
         OwnerKind::Organization => "org",
     };
-    format!("{NEW_APP_PAGE}#owner={owner}&kind={kind}&repo={repo_name}&state={state}&name={app}")
+    let mut link = format!(
+        "{NEW_APP_PAGE}#owner={owner}&kind={kind}&repo={repo_name}&state={state}&name={app}"
+    );
+    if let Some(r) = redirect {
+        link.push_str("&redirect=");
+        link.push_str(r);
+    }
+    link
 }
 
 /// Whether the `gh` user is an owner of the organization; `None` when `gh` cannot tell.
@@ -1397,6 +1546,11 @@ mod tests {
         assert!(parse_args(&["--policy", "p", "--repo", "a/b"]).is_err());
         assert!(parse_args(&["--new-app"]).unwrap().new_app);
         assert!(parse_args(&["--new-app", "--pat"]).is_err());
+        let o = parse_args(&["--remote", "--paste", "--dry-run"]).unwrap();
+        assert!(o.remote && o.paste && o.dry_run);
+        assert!(parse_args(&["--remote", "--bin", "/x"]).is_err());
+        assert!(parse_args(&["--paste"]).is_err());
+        assert!(parse_args(&["--remote", "--paste", "--offline-link"]).is_err());
     }
 
     #[test]
@@ -1832,13 +1986,25 @@ mod tests {
             "app.rs",
             state,
             "sbr-app.rs-01234567",
+            None,
         );
         assert_eq!(
             link,
             "https://surely-works-llc.github.io/sw-boat-runner/new-app.html#owner=acme&kind=org\
              &repo=app.rs&state=0123456789abcdef0123456789abcdef&name=sbr-app.rs-01234567"
         );
-        assert!(pages_link("me", &OwnerKind::User, "r", state, "n").contains("&kind=user&"));
+        assert!(pages_link("me", &OwnerKind::User, "r", state, "n", None).contains("&kind=user&"));
+        assert!(
+            pages_link(
+                "me",
+                &OwnerKind::User,
+                "r",
+                state,
+                "n",
+                Some("http://127.0.0.1:5000/callback")
+            )
+            .ends_with("&name=n&redirect=http://127.0.0.1:5000/callback")
+        );
         let name = app_name("app.rs", state);
         assert!(name.starts_with("sbr-app.rs-") && name.len() == "sbr-app.rs-".len() + 8);
     }
@@ -1846,7 +2012,7 @@ mod tests {
     /// docs/new-app.html builds the manifest in the browser; it must match `manifest`.
     #[test]
     fn the_pages_manifest_matches_setups() {
-        let page = include_str!("../docs/new-app.html");
+        let page = include_str!("../../docs/new-app.html");
         assert!(page.contains(&format!("const PAGE_URL = \"{NEW_APP_PAGE}\";")));
         assert!(page.contains(&format!("const HOMEPAGE = \"{HOMEPAGE}\";")));
         let m = manifest("acme/app", "n");
@@ -1886,7 +2052,7 @@ mod tests {
     #[test]
     fn the_pages_csp_hash_matches_its_script() {
         use base64::Engine;
-        let page = include_str!("../docs/new-app.html");
+        let page = include_str!("../../docs/new-app.html");
         let script = page
             .split_once("<script>")
             .and_then(|(_, rest)| rest.split_once("</script>"))

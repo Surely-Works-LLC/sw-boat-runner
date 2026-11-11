@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-tCOrchkR1NAUDQ/UYZZl5AW7Pvep8mE3jIw4Q5VjBXk='; style-src 'unsafe-inline'; form-action https://github.com; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-N5LYZY2hkDJn9j3DeWDtQUEc4EfDOvsvmvv5DnKty5M='; style-src 'unsafe-inline'; form-action https://github.com; base-uri 'none'">
 <meta name="referrer" content="no-referrer">
 <title>sw-boat-runner: new GitHub App</title>
 <style>
@@ -36,6 +36,8 @@ const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO = /^[A-Za-z0-9._-]{1,100}$/;
 const STATE = /^[0-9a-f]{32}$/;
 const APP_NAME = /^sbr-[A-Za-z0-9._-]{1,21}-[0-9a-f]{8}$/;
+// `setup --remote` listens here for the code; nothing else may replace PAGE_URL.
+const LOOPBACK = /^http:\/\/127\.0\.0\.1:[0-9]{2,5}\/callback$/;
 
 const main = document.getElementById("main");
 
@@ -61,8 +63,8 @@ function fail(message) {
   main.append(box);
 }
 
-function manifest(owner, repo, name) {
-  return {
+function manifest(owner, repo, name, redirect) {
+  const m = {
     "name": name,
     "url": HOMEPAGE,
     "description": "sw-boat-runner for " + owner + "/" + repo,
@@ -72,6 +74,8 @@ function manifest(owner, repo, name) {
     "default_permissions": PERMISSIONS,
     "default_events": []
   };
+  if (redirect) m["redirect_url"] = redirect;
+  return m;
 }
 
 function createForm(params) {
@@ -80,11 +84,13 @@ function createForm(params) {
   const repo = params.get("repo") || "";
   const state = params.get("state") || "";
   const name = params.get("name") || "";
+  const redirect = params.get("redirect");
   if (!OWNER.test(owner)) return fail("The link's owner is not a GitHub account name.");
   if (!REPO.test(repo) || repo === "." || repo === "..") return fail("The link's repository is not a GitHub repository name.");
   if (kind !== "user" && kind !== "org") return fail("The link's kind must be user or org.");
   if (!STATE.test(state)) return fail("The link's state is not one setup makes.");
   if (!APP_NAME.test(name)) return fail("The link's app name is not one setup makes.");
+  if (redirect !== null && !LOOPBACK.test(redirect)) return fail("The link's redirect is not one setup makes.");
 
   const full = owner + "/" + repo;
   const action = kind === "org"
@@ -99,7 +105,9 @@ function createForm(params) {
     el("li", "Permissions: Administration (read and write), Actions (read). Nothing else."),
     el("li", "No webhook and no events."),
     el("li", "Private: it can be installed only on " + owner + "'s repositories."),
-    el("li", "After you confirm, GitHub sends you back to this page with a one-time code to copy into the terminal.")
+    redirect
+      ? el("li", "After you confirm, GitHub sends your browser to " + redirect + ", where sw-boat-runner setup on this computer takes the one-time code.")
+      : el("li", "After you confirm, GitHub sends you back to this page with a one-time code to copy into the terminal.")
   );
   main.append(list);
   const warn = el("div");
@@ -117,7 +125,7 @@ function createForm(params) {
   const field = el("input");
   field.type = "hidden";
   field.name = "manifest";
-  field.value = JSON.stringify(manifest(owner, repo, name));
+  field.value = JSON.stringify(manifest(owner, repo, name, redirect));
   const button = el("button", "Create the GitHub App on GitHub");
   button.type = "submit";
   form.append(field, button);

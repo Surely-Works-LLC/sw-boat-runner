@@ -8,13 +8,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, IsTerminal, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::boat::{self, Client, Detail, SavedSnapshot};
 use crate::model::Pool;
 use crate::transport::{Transport, Ureq};
+
+mod build;
+pub(crate) use build::build;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Label of the fork, so a leftover one is easy to find. Not the pool label: the daemon
@@ -111,7 +114,7 @@ pub fn parse_args(args: &[&str]) -> Result<Options, String> {
     Ok(opts)
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
         && b.len() <= 63
@@ -131,21 +134,30 @@ pub(crate) trait Io {
     fn interrupted(&self) -> bool;
 }
 
-struct Terminal {
+pub(crate) struct Terminal {
     stop: Arc<AtomicBool>,
 }
 
 impl Terminal {
     /// Catches SIGINT and SIGTERM so the fork is deleted before exiting; a second
-    /// signal exits at once.
-    fn new() -> Terminal {
-        let stop = Arc::new(AtomicBool::new(false));
-        for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
-            // The shutdown hook goes first, so it sees the flag unset on the first signal.
-            let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
-            let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+    /// signal exits at once. The handlers are installed once per process: a second set
+    /// would see the first set's flag and exit on the first signal.
+    pub(crate) fn new() -> Terminal {
+        static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        let stop = STOP.get_or_init(|| {
+            let stop = Arc::new(AtomicBool::new(false));
+            for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                // The shutdown hook goes first, so it sees the flag unset on the first
+                // signal.
+                let _ =
+                    signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
+                let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+            }
+            stop
+        });
+        Terminal {
+            stop: Arc::clone(stop),
         }
-        Terminal { stop }
     }
 }
 
@@ -169,17 +181,23 @@ impl Io for Terminal {
     }
 
     fn confirm(&mut self, question: &str) -> bool {
-        let stdin = std::io::stdin();
-        if !stdin.is_terminal() {
-            println!("{question} [y/N] no (stdin is not a terminal; pass --yes)");
-            return false;
-        }
-        print!("{question} [y/N] ");
-        let _ = std::io::stdout().flush();
-        let mut answer = String::new();
-        stdin.lock().read_line(&mut answer).is_ok()
-            && matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+        ask_yes(question)
     }
+}
+
+/// A yes/no question on the terminal; anything but a yes is a no, and so is a stdin that
+/// is not a terminal.
+pub(crate) fn ask_yes(question: &str) -> bool {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        println!("{question} [y/N] no (stdin is not a terminal)");
+        return false;
+    }
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    stdin.lock().read_line(&mut answer).is_ok()
+        && matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 /// Runs the command with `BOAT_API_KEY`; `Ok(true)` when the snapshot was saved.
@@ -214,7 +232,7 @@ pub(crate) fn snapshot(
     }) {
         Ok(fork) => fork,
         Err(e) => {
-            delete_lost_forks(&boat, &run_id, io);
+            delete_labelled(&boat, RUN_LABEL, &run_id, io);
             return Err(e);
         }
     };
@@ -233,12 +251,11 @@ pub(crate) fn snapshot(
     result
 }
 
-/// After a fork call that failed without a definite answer, or was interrupted, deletes
-/// any fork this run made anyway.
-fn delete_lost_forks(boat: &Client, run_id: &str, io: &mut dyn Io) {
-    let by_hand =
-        format!("look for sandboxes labelled {RUN_LABEL}={run_id} and delete them by hand");
-    let forks = match cleanup_retry(io, "list forks", |_| boat.list_labelled(RUN_LABEL, run_id)) {
+/// After a fork or create call that failed without a definite answer, or was
+/// interrupted, deletes any sandbox this run made anyway: those labelled `key=run_id`.
+pub(crate) fn delete_labelled(boat: &Client, key: &str, run_id: &str, io: &mut dyn Io) {
+    let by_hand = format!("look for sandboxes labelled {key}={run_id} and delete them by hand");
+    let forks = match cleanup_retry(io, "list forks", |_| boat.list_labelled(key, run_id)) {
         Ok(forks) => forks,
         Err(e) => {
             io.say(&format!(
@@ -265,6 +282,17 @@ fn inspect_and_save(
     io: &mut dyn Io,
 ) -> Result<bool, String> {
     let detail = wait_until_hydrated(boat, fork, io)?;
+    check_and_save(boat, fork, &detail, opts, io)
+}
+
+/// Checks the sandbox `fork` and saves it as `opts.name` when every check passes.
+fn check_and_save(
+    boat: &Client,
+    fork: &str,
+    detail: &Detail,
+    opts: &Options,
+    io: &mut dyn Io,
+) -> Result<bool, String> {
     let machine_type = opts
         .machine_type
         .clone()
@@ -393,7 +421,7 @@ fn pause(io: &mut dyn Io, d: Duration) -> Result<(), String> {
 /// Calls `f` again after a refusal, an answerless failure (with the same idempotency
 /// key, for a create), or a conflict boat calls temporary.
 /// Stops early once a signal asked the command to stop.
-fn retry<T>(
+pub(crate) fn retry<T>(
     io: &mut dyn Io,
     what: &str,
     f: impl FnMut(u32) -> Result<T, boat::Error>,
@@ -402,7 +430,7 @@ fn retry<T>(
 }
 
 /// `retry` for cleaning up, which a signal does not stop.
-fn cleanup_retry<T>(
+pub(crate) fn cleanup_retry<T>(
     io: &mut dyn Io,
     what: &str,
     f: impl FnMut(u32) -> Result<T, boat::Error>,
@@ -443,6 +471,20 @@ fn retry_inner<T>(
         }
         io.sleep(wait);
     }
+}
+
+/// Waits until the sandbox runs, for at most 10 minutes.
+pub(crate) fn wait_until_up(boat: &Client, id: &str, io: &mut dyn Io) -> Result<Detail, String> {
+    for _ in 0..=READY_POLLS {
+        let d = retry(io, "read sandbox", |_| boat.detail(id))?;
+        match boat::machine_state(&d.state) {
+            crate::model::MachineState::Up => return Ok(d),
+            crate::model::MachineState::Gone => return Err(format!("sandbox {id} is {}", d.state)),
+            _ => {}
+        }
+        pause(io, POLL)?;
+    }
+    Err(format!("sandbox {id} did not start in 10 minutes"))
 }
 
 /// Waits for the fork to run, then for every file of its snapshot to be on its disk, so
@@ -1495,6 +1537,119 @@ mod tests {
         assert!(
             got[0].starts_with("pool a: snapshot big holds 92.8 GB"),
             "{got:?}"
+        );
+    }
+
+    /// A boat that creates `bx_55555555` from its base image, runs the build's commands,
+    /// and saves; `install_exit` is the install script's exit code.
+    fn build_world(install_exit: i64) -> Fake {
+        let last = RefCell::new(String::new());
+        let saved = RefCell::new(None::<String>);
+        Fake::failing(move |s| {
+            let ok = |body: String| Ok(respond(200, &[], &body));
+            if s.url == "https://api.github.com/repos/actions/runner/releases/latest" {
+                return ok(serde_json::json!({
+                    "tag_name": "v2.338.2",
+                    "assets": [{
+                        "name": "actions-runner-linux-x64-2.338.2.tar.gz",
+                        "digest": format!("sha256:{}", "a".repeat(64)),
+                        "browser_download_url": "https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz"
+                    }]
+                })
+                .to_string());
+            }
+            let path = s.url.trim_start_matches(boat::BASE);
+            match (s.method.as_str(), path) {
+                ("POST", "/sandboxes") => Ok(respond(
+                    201,
+                    &[],
+                    r#"{"ok":true,"sandbox":{"id":"bx_55555555","state":"provisioning"}}"#,
+                )),
+                ("GET", "/sandboxes/bx_55555555") => ok(r#"{"ok":true,"sandbox":{"id":"bx_55555555",
+                    "state":"running","type":"default","holdsCreatorLogins":false,"hydrated":false}}"#
+                    .into()),
+                ("POST", "/sandboxes/bx_55555555/commands") => {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(s.body.as_deref().unwrap()).unwrap();
+                    *last.borrow_mut() = body["command"].as_str().unwrap().to_string();
+                    ok(r#"{"ok":true,"processId":9}"#.into())
+                }
+                ("GET", "/sandboxes/bx_55555555/commands/9") => {
+                    let cmd = last.borrow().clone();
+                    let (out, code) = if cmd == "uname -m" {
+                        ("x86_64\n", 0)
+                    } else if cmd.starts_with("H=/home/user") {
+                        (CLEAN, 0)
+                    } else {
+                        ("", install_exit)
+                    };
+                    ok(serde_json::json!({"running": false, "status": "exited",
+                        "exitCode": code, "stdout": out, "stderr": "apt failed"})
+                    .to_string())
+                }
+                ("GET", p) if p.starts_with("/saved-snapshots?name=") => {
+                    let list = match &*saved.borrow() {
+                        Some(src) => serde_json::json!([{"name": "sbr-runner", "status": "ready",
+                            "sourceSandboxId": src, "sizeBytes": 3_000_000_000u64}]),
+                        None => serde_json::json!([]),
+                    };
+                    ok(format!(r#"{{"ok":true,"snapshots":{list}}}"#))
+                }
+                ("POST", "/saved-snapshots") => {
+                    *saved.borrow_mut() = Some("bx_55555555".into());
+                    Ok(respond(202, &[], r#"{"ok":true,"status":"saving"}"#))
+                }
+                ("DELETE", "/sandboxes/bx_55555555") => Ok(respond(202, &[], "{}")),
+                other => panic!("unexpected call {other:?}"),
+            }
+        })
+    }
+
+    #[test]
+    fn build_installs_the_runner_checks_saves_and_deletes_the_sandbox() {
+        let fake = build_world(0);
+        let mut io = TestIo::default();
+        assert_eq!(
+            build(&fake, "k", "sbr-runner", "default", &mut io),
+            Ok(true),
+            "{:#?}",
+            io.said
+        );
+        let sent = fake.sent();
+        let create: serde_json::Value =
+            serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(create["noEnv"], true);
+        assert_eq!(create["type"], "default");
+        assert!(create.get("from").is_none());
+        let calls = calls(&sent);
+        assert!(calls.contains(&"POST /saved-snapshots".to_string()));
+        assert_eq!(calls.last().unwrap(), "DELETE /sandboxes/bx_55555555");
+        // No fork: the fresh noEnv sandbox is checked and saved itself.
+        assert!(!calls.iter().any(|c| c.contains("/fork")));
+        assert!(io.said.iter().any(|l| l.starts_with("PASS  runner ")));
+        assert!(io.said.iter().any(|l| l.contains("actions/runner 2.338.2")));
+    }
+
+    #[test]
+    fn a_failed_or_interrupted_build_still_deletes_the_sandbox() {
+        let fake = build_world(1);
+        let mut io = TestIo::default();
+        let err = build(&fake, "k", "sbr-runner", "default", &mut io).unwrap_err();
+        assert!(err.contains("apt failed"), "{err}");
+        let failed = calls(&fake.sent());
+        assert!(!failed.iter().any(|c| c.contains("saved-snapshots")));
+        assert_eq!(failed.last().unwrap(), "DELETE /sandboxes/bx_55555555");
+
+        let fake = build_world(0);
+        let mut io = TestIo {
+            interrupt_at: Some(1),
+            ..TestIo::default()
+        };
+        let err = build(&fake, "k", "sbr-runner", "default", &mut io).unwrap_err();
+        assert!(err.contains("interrupted"), "{err}");
+        assert_eq!(
+            calls(&fake.sent()).last().unwrap(),
+            "DELETE /sandboxes/bx_55555555"
         );
     }
 }

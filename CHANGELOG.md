@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `sw-boat-runner setup --remote`, run on a laptop or workstation: it asks the usual
+  questions and `BOAT_API_KEY` without echo, creates the GitHub App with the browser
+  sent back to a one-shot listener on `127.0.0.1` (`docs/new-app.html` takes a
+  `redirect` only of the form `http://127.0.0.1:<port>/callback`; after 15 minutes, or
+  with `--paste`, you paste the code), creates a `small` boat machine with no auto-stop,
+  and installs the same release there with `install.sh` over `boat ssh`. The keys go
+  only through `boat ssh`'s stdin. `--remote --dry-run` prints the plan.
+- `setup` offers to build a missing snapshot (or one you call `new`): a temporary `noEnv`
+  sandbox gets the latest actions/runner release, checked against its published SHA-256,
+  unconfigured, and is checked and saved with the `snapshot` command's code. The sandbox
+  is deleted on every path, Ctrl-C included.
 - `sw-boat-runner setup`: writes a policy, creates a GitHub App from a manifest (or takes
   a personal token with `--pat`), stores the keys root-only and enables the systemd
   service. `--dry-run` prints the steps. Running it again reuses the App it stored;

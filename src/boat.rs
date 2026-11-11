@@ -466,6 +466,33 @@ pub(crate) struct CommandStatus {
     pub stderr: String,
 }
 
+/// A `POST /sandboxes` without `from`: a machine from boat's base image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewSandbox {
+    pub machine_type: String,
+    /// `None` sends `ttlSeconds: null`, which turns auto-stop off.
+    pub ttl_s: Option<u64>,
+    /// Withholds the account's secrets; a fresh sandbox then holds no creator logins.
+    pub no_env: bool,
+    pub labels: BTreeMap<&'static str, String>,
+    pub name: String,
+}
+
+impl NewSandbox {
+    fn body(&self) -> Value {
+        if let Some(ttl) = self.ttl_s {
+            assert!((1..=MAX_TTL_S).contains(&ttl), "ttl {ttl}");
+        }
+        json!({
+            "type": self.machine_type,
+            "ttlSeconds": self.ttl_s,
+            "noEnv": self.no_env,
+            "labels": self.labels,
+            "name": self.name,
+        })
+    }
+}
+
 /// The calls `snapshot` makes, which the tick loop never does.
 impl Client<'_> {
     /// `get` with the hydration progress and machine type.
@@ -501,6 +528,23 @@ impl Client<'_> {
         let key = [("Idempotency-Key", idempotency_key)];
         let path = format!("/sandboxes/{source}/fork");
         let created: Created = self.call("POST", &path, Some(&body), &key)?;
+        Ok(created.sandbox.id)
+    }
+
+    /// Creates a sandbox from boat's base image. `ttl_s` `None` turns auto-stop off. A
+    /// repeat with the same key and body returns the first sandbox.
+    pub(crate) fn create_sandbox(
+        &self,
+        spec: &NewSandbox,
+        idempotency_key: &str,
+    ) -> Result<String, Error> {
+        #[derive(Deserialize)]
+        struct Created {
+            sandbox: Sandbox,
+        }
+        let body = spec.body();
+        let key = [("Idempotency-Key", idempotency_key)];
+        let created: Created = self.call("POST", "/sandboxes", Some(&body), &key)?;
         Ok(created.sandbox.id)
     }
 
@@ -1065,6 +1109,33 @@ mod tests {
         assert_eq!(
             sent[1].url,
             "https://boat.dev/api/v1/sandboxes/bx_22222222/commands/17"
+        );
+    }
+
+    #[test]
+    fn creates_a_sandbox_from_the_base_image() {
+        let fake = Fake::new(|_| {
+            respond(
+                201,
+                &[],
+                r#"{"ok":true,"sandbox":{"id":"bx_44444444","state":"provisioning"}}"#,
+            )
+        });
+        let boat = Client::new(&fake, "k".into());
+        let spec = NewSandbox {
+            machine_type: "small".into(),
+            ttl_s: None,
+            no_env: false,
+            labels: BTreeMap::from([("a", "b".to_string())]),
+            name: "n".into(),
+        };
+        assert_eq!(boat.create_sandbox(&spec, "idem").unwrap(), "bx_44444444");
+        let sent = fake.sent();
+        assert_eq!(sent[0].url, "https://boat.dev/api/v1/sandboxes");
+        assert_eq!(sent[0].header("idempotency-key"), Some("idem"));
+        assert_eq!(
+            sent[0].body_text(),
+            r#"{"labels":{"a":"b"},"name":"n","noEnv":false,"ttlSeconds":null,"type":"small"}"#
         );
     }
 
