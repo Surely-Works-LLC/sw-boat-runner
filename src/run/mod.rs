@@ -355,9 +355,9 @@ mod tests {
             format!("PUT {BOAT}/sandboxes/bx_22222222/files"),
             format!("POST {BOAT}/sandboxes/bx_22222222/commands"),
             format!("POST {BOAT}/sandboxes/bx_33333333/resume"),
+            // The quote is read again before the next start, not after the last one.
             format!("GET {BOAT}/limits"),
             format!("POST {BOAT}/sandboxes"),
-            format!("GET {BOAT}/limits"),
         ]);
         assert_eq!(requests(&fake), expected);
 

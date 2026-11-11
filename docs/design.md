@@ -62,8 +62,8 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 `GET /limits` quotes one price, for the next start, so `decide` prices every start of a
 tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
 boat's minute, hour and day windows, because the price past them is not known until the
-next tick. After each accepted start the daemon reads `GET /limits` again and makes no
-more starts that tick if the price changed. One account serves every pool, so each pool's
+next tick. Before each start that follows an accepted one, the daemon reads `GET /limits`
+again and makes no more starts that tick if the price changed. One account serves every pool, so each pool's
 cap is checked against the account-wide spend, including the starts that pools earlier in
 the file planned in the same tick. Prices are counted in whole cents, and a positive price
 under half a cent counts as 1 cent, so a paid start is never counted as free.

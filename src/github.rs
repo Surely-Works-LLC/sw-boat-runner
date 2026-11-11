@@ -1,6 +1,6 @@
 //! GitHub REST client for one repository's self-hosted runners and queued jobs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -339,7 +339,8 @@ impl<'t> Client<'t> {
     }
 
     /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
-    /// in-progress run still queues its later jobs.
+    /// in-progress run still queues its later jobs. A run that moves from queued to in
+    /// progress between the two lists has its jobs read once.
     pub(crate) fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
         #[derive(Deserialize)]
         struct Runs {
@@ -361,11 +362,12 @@ impl<'t> Client<'t> {
             labels: Vec<String>,
         }
         let mut out = BTreeMap::new();
+        let mut read = HashSet::new();
         for status in ["queued", "in_progress"] {
             let runs: Runs = self.get(&format!(
                 "/actions/runs?status={status}&per_page={PER_PAGE}"
             ))?;
-            for run in runs.workflow_runs {
+            for run in runs.workflow_runs.into_iter().filter(|r| read.insert(r.id)) {
                 let jobs: Jobs = self.get(&format!(
                     "/actions/runs/{}/jobs?per_page={PER_PAGE}",
                     run.id
@@ -572,7 +574,8 @@ mod tests {
             let body = if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5, "run_attempt": 2}]})
             } else if s.url.contains("status=in_progress") {
-                json!({"workflow_runs": [{"id": 6, "run_attempt": 1}]})
+                // Run 5 started between the two lists, so both have it.
+                json!({"workflow_runs": [{"id": 6, "run_attempt": 1}, {"id": 5, "run_attempt": 2}]})
             } else if s.url.contains("/runs/5/jobs") {
                 json!({"jobs": [
                     {"id": 50, "run_attempt": 2, "status": "queued", "labels": ["self-hosted", "large"]},

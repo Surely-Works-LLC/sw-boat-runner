@@ -375,10 +375,7 @@ impl Loop<'_> {
                     price,
                     recheck: true,
                 };
-                match self.open_starts(t) {
-                    Err(e) if e.is_fatal() => Err(e),
-                    _ => Ok(v),
-                }
+                Ok(v)
             }
             Err(e @ boat::Error::Refused { retry_after_s, .. }) => {
                 self.ledger.block_until(t.now.saturating_add(retry_after_s));
