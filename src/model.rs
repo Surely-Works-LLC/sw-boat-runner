@@ -20,7 +20,8 @@ pub(crate) fn default_tick_s() -> u64 {
     15
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Declared in the one order `policy` accepts: a free slot before any start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Placement {
     Slot,
