@@ -12,7 +12,9 @@ All notable changes to this project are documented here. The format follows
   a personal token with `--pat`), stores the keys root-only and enables the systemd
   service. `--dry-run` prints the steps. Running it again reuses the App it stored;
   `--new-app` makes another. `examples/always-on/install.sh` now gets the binary and
-  runs it.
+  runs it. The App comes from a short link to `docs/new-app.html` on GitHub Pages
+  (`--offline-link` prints a `data:` URL instead), and the prompts offer the repository
+  from `gh` or `origin`, labels `self-hosted, boat` and the saved boat snapshots.
 - A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
   `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
   put its keys at the top level, without `[[pool]]`.
