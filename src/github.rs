@@ -1,6 +1,6 @@
 //! GitHub REST client for one repository's self-hosted runners and queued jobs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use serde::Deserialize;
@@ -16,6 +16,22 @@ pub(crate) const PREFIX: &str = "sbr-";
 /// Requests stop for the rest of the rate-limit window once fewer than this many remain,
 /// so a human with the same token keeps some budget.
 pub(crate) const RATE_FLOOR: u64 = 200;
+/// Under this many requests left the daemon observes only once every `PACE_MAX_S`, so
+/// the requests between here and `RATE_FLOOR` stay for runner registrations and deletes,
+/// `drain`, and whoever else uses the token.
+pub(crate) const RESERVE: u64 = 500;
+/// The share of the token's hourly limit (`X-RateLimit-Limit`) the daemon aims to use.
+const SHARE: f64 = 0.25;
+/// Assumed until GitHub reports the limit: a personal access token's 5,000 an hour.
+const DEFAULT_LIMIT: u64 = 5_000;
+/// The budget saves up at most this many seconds of its rate for a busy tick.
+const BURST_S: f64 = 60.0;
+/// While the budget allows, an in-progress run's jobs are read at least this often, even
+/// when the run looks unchanged.
+pub(crate) const RUN_MAX_AGE_S: u64 = 60;
+/// However low the budget, the daemon observes at least this often while GitHub still
+/// answers, so cleanup goes on.
+pub(crate) const PACE_MAX_S: u64 = 300;
 const PER_PAGE: usize = 100;
 const MAX_PAGES: u32 = 10;
 
@@ -128,6 +144,61 @@ pub(crate) fn runner_state(online: bool, busy: bool, seen_online: bool) -> Runne
     }
 }
 
+/// A token bucket over GitHub requests. It fills at `SHARE` of the hourly limit, or
+/// slower when the requests left above `RESERVE` would not last until the reset at that
+/// rate, and every request GitHub counts (anything but a 304) takes one token. Required
+/// reads and writes always go, down to `RATE_FLOOR`, and may take it below zero; optional
+/// reads wait for a token, and a tick observes only with a token in hand.
+struct Budget {
+    tokens: f64,
+    refilled: Option<UnixSecs>,
+    limit: u64,
+    /// The last `X-RateLimit-Remaining` and `X-RateLimit-Reset`.
+    left: Option<(u64, UnixSecs)>,
+    observed: Option<UnixSecs>,
+}
+
+impl Budget {
+    /// Tokens per second at `now`.
+    fn rate(&self, now: UnixSecs) -> f64 {
+        let share = self.limit as f64 * SHARE / 3_600.0;
+        match self.left {
+            Some((left, reset)) if now < reset => {
+                let spare = left.saturating_sub(RESERVE) as f64;
+                share.min(spare / (reset - now) as f64)
+            }
+            _ => share,
+        }
+    }
+
+    fn refill(&mut self, now: UnixSecs) {
+        let rate = self.rate(now);
+        let elapsed = self
+            .refilled
+            .map_or(BURST_S, |t| now.saturating_sub(t) as f64);
+        self.tokens = (self.tokens + rate * elapsed).min(rate * BURST_S);
+        self.refilled = Some(now);
+    }
+
+    fn has_token(&self) -> bool {
+        self.tokens >= 1.0
+    }
+}
+
+fn jobs_path(run: u64) -> String {
+    format!("/actions/runs/{run}/jobs?per_page={PER_PAGE}")
+}
+
+/// What the last read of an in-progress run's jobs found.
+struct RunJobs {
+    attempt: u32,
+    updated_at: String,
+    fetched: UnixSecs,
+    queued: Vec<(JobKey, Vec<String>)>,
+    /// Some queued job matched a pool, so the run is read again every tick.
+    wanted: bool,
+}
+
 struct Cached {
     etag: String,
     body: Vec<u8>,
@@ -144,6 +215,9 @@ pub(crate) struct Client<'t> {
     cache: HashMap<String, Cached>,
     /// Set once `X-RateLimit-Remaining` drops under `RATE_FLOOR`: (remaining, reset).
     limited: Option<(u64, UnixSecs)>,
+    budget: Budget,
+    /// In-progress runs by id.
+    runs: HashMap<u64, RunJobs>,
 }
 
 impl<'t> Client<'t> {
@@ -155,6 +229,14 @@ impl<'t> Client<'t> {
             now: 0,
             cache: HashMap::new(),
             limited: None,
+            budget: Budget {
+                tokens: 0.0,
+                refilled: None,
+                limit: DEFAULT_LIMIT,
+                left: None,
+                observed: None,
+            },
+            runs: HashMap::new(),
         }
     }
 
@@ -165,6 +247,31 @@ impl<'t> Client<'t> {
         self.cache.retain(|_, c| c.used);
         for c in self.cache.values_mut() {
             c.used = false;
+        }
+        self.budget.refill(now);
+    }
+
+    /// Whether this tick should observe: with a token in the budget, or when the last
+    /// observe was `PACE_MAX_S` ago. A tick that does not observe sends nothing to GitHub.
+    pub(crate) fn may_observe(&mut self) -> bool {
+        let due = self
+            .budget
+            .observed
+            .is_none_or(|t| self.now >= t.saturating_add(PACE_MAX_S));
+        let ok = self.budget.has_token() || due;
+        if ok {
+            self.budget.observed = Some(self.now);
+        }
+        ok
+    }
+
+    /// For the log line of a tick that does not observe.
+    pub(crate) fn budget_note(&self) -> String {
+        match self.budget.left {
+            Some((left, reset)) if self.now < reset => {
+                format!("GitHub request budget spent ({left} left until {reset})")
+            }
+            _ => "GitHub request budget spent".into(),
         }
     }
 
@@ -211,6 +318,15 @@ impl<'t> Client<'t> {
         let retry_after = num("retry-after");
         let a_minute = self.now.saturating_add(60);
         let reset = num("x-ratelimit-reset").unwrap_or(a_minute);
+        if resp.status != 304 {
+            self.budget.tokens -= 1.0;
+        }
+        if let Some(limit) = num("x-ratelimit-limit").filter(|&l| l > 0) {
+            self.budget.limit = limit;
+        }
+        if let Some(r) = remaining {
+            self.budget.left = Some((r, reset));
+        }
         if let Some(r) = remaining.filter(|&r| r < RATE_FLOOR) {
             self.limited = Some((r, reset));
         }
@@ -321,17 +437,8 @@ impl<'t> Client<'t> {
             .map(drop)
     }
 
-    /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
-    /// in-progress run still queues its later jobs.
-    pub(crate) fn queued_jobs(&mut self) -> Result<Vec<QueuedJob>, Error> {
-        #[derive(Deserialize)]
-        struct Runs {
-            workflow_runs: Vec<Run>,
-        }
-        #[derive(Deserialize)]
-        struct Run {
-            id: u64,
-        }
+    /// The queued jobs of one run's first 100 jobs.
+    fn run_jobs(&mut self, run: u64) -> Result<Vec<(JobKey, Vec<String>)>, Error> {
         #[derive(Deserialize)]
         struct Jobs {
             jobs: Vec<Job>,
@@ -343,24 +450,99 @@ impl<'t> Client<'t> {
             status: String,
             labels: Vec<String>,
         }
+        let jobs: Jobs = self.get(&jobs_path(run))?;
+        Ok(jobs
+            .jobs
+            .into_iter()
+            .filter(|j| j.status == "queued")
+            .map(|j| {
+                let key = JobKey {
+                    id: j.id,
+                    attempt: j.run_attempt,
+                };
+                (key, j.labels)
+            })
+            .collect())
+    }
+
+    /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
+    /// in-progress run still queues its later jobs. `wanted` tells whether a pool serves a
+    /// job's labels.
+    ///
+    /// A queued run's jobs are read every call; they rarely change, so most reads are
+    /// free 304s. An in-progress run's jobs change with every step, so they are read when
+    /// they can matter:
+    /// - every call, while the run is new or re-run, or its last read found a queued job
+    ///   a pool serves, so a job another runner took drops out at once;
+    /// - with a budget token, when the run's `updated_at` changed since its last read, or
+    ///   that read is `RUN_MAX_AGE_S` old, most changed and oldest first.
+    ///
+    /// Any other run keeps its last read, whose queued jobs no pool serves, so a stale read
+    /// never puts a taken job in front of `decide`. A job a run queued since its last read
+    /// is found by the next read, `RUN_MAX_AGE_S` later at most while the budget lasts.
+    pub(crate) fn queued_jobs(
+        &mut self,
+        wanted: &dyn Fn(&[String]) -> bool,
+    ) -> Result<Vec<QueuedJob>, Error> {
+        #[derive(Deserialize)]
+        struct Runs {
+            workflow_runs: Vec<Run>,
+        }
+        #[derive(Deserialize)]
+        struct Run {
+            id: u64,
+            #[serde(default)]
+            run_attempt: u32,
+            #[serde(default)]
+            updated_at: String,
+        }
         let mut out = BTreeMap::new();
-        for status in ["queued", "in_progress"] {
-            let runs: Runs = self.get(&format!(
-                "/actions/runs?status={status}&per_page={PER_PAGE}"
-            ))?;
-            for run in runs.workflow_runs {
-                let jobs: Jobs = self.get(&format!(
-                    "/actions/runs/{}/jobs?per_page={PER_PAGE}",
-                    run.id
-                ))?;
-                for job in jobs.jobs.into_iter().filter(|j| j.status == "queued") {
-                    let key = JobKey {
-                        id: job.id,
-                        attempt: job.run_attempt,
-                    };
-                    out.insert(key, job.labels);
+        let queued: Runs = self.get(&format!("/actions/runs?status=queued&per_page={PER_PAGE}"))?;
+        for run in queued.workflow_runs {
+            out.extend(self.run_jobs(run.id)?);
+        }
+
+        let runs: Runs = self.get(&format!(
+            "/actions/runs?status=in_progress&per_page={PER_PAGE}"
+        ))?;
+        let listed: HashSet<u64> = runs.workflow_runs.iter().map(|r| r.id).collect();
+        self.runs.retain(|id, _| listed.contains(id));
+        // (0 required, 1 changed, 2 old; last read; run)
+        let mut todo: Vec<(u8, UnixSecs, &Run)> = Vec::new();
+        for run in &runs.workflow_runs {
+            let rank = match self.runs.get(&run.id) {
+                None => (0, 0),
+                Some(c) if c.attempt != run.run_attempt || c.wanted => (0, c.fetched),
+                Some(c) if c.updated_at != run.updated_at => (1, c.fetched),
+                Some(c) if self.now >= c.fetched.saturating_add(RUN_MAX_AGE_S) => (2, c.fetched),
+                Some(_) => {
+                    // Keep its ETag, so its next read may be a free 304.
+                    let url = format!("{API}/repos/{}{}", self.repo, jobs_path(run.id));
+                    if let Some(c) = self.cache.get_mut(&url) {
+                        c.used = true;
+                    }
+                    continue;
                 }
+            };
+            todo.push((rank.0, rank.1, run));
+        }
+        todo.sort_by_key(|&(rank, fetched, run)| (rank, fetched, run.id));
+        for (rank, _, run) in todo {
+            if rank > 0 && !self.budget.has_token() {
+                break;
             }
+            let queued = self.run_jobs(run.id)?;
+            let read = RunJobs {
+                attempt: run.run_attempt,
+                updated_at: run.updated_at.clone(),
+                fetched: self.now,
+                wanted: queued.iter().any(|(_, labels)| wanted(labels)),
+                queued,
+            };
+            self.runs.insert(run.id, read);
+        }
+        for read in self.runs.values() {
+            out.extend(read.queued.iter().cloned());
         }
         Ok(out
             .into_iter()
@@ -483,7 +665,7 @@ mod tests {
         gh.begin_tick(1000);
         assert!(gh.runners().unwrap().is_empty());
         assert_eq!(
-            gh.queued_jobs(),
+            gh.queued_jobs(&|_| true),
             Err(Error::RateLimited {
                 remaining: 150,
                 reset: 2000
@@ -541,7 +723,7 @@ mod tests {
             reset: 160,
         };
         assert_eq!(gh.runners().unwrap_err(), limited);
-        assert_eq!(gh.queued_jobs().unwrap_err(), limited);
+        assert_eq!(gh.queued_jobs(&|_| true).unwrap_err(), limited);
         assert_eq!(fake.sent().len(), 1);
 
         let fake = Fake::new(|_| respond(429, &[], "{}"));
@@ -570,7 +752,7 @@ mod tests {
             respond(200, &[], &body.to_string())
         });
         let mut gh = Client::new(&fake, "t".into(), "o/r".into());
-        let jobs = gh.queued_jobs().unwrap();
+        let jobs = gh.queued_jobs(&|_| true).unwrap();
         assert_eq!(
             jobs,
             vec![
@@ -610,5 +792,202 @@ mod tests {
             body,
             json!({"name": "sbr-ci-bx_22222222-0-1", "runner_group_id": 1, "labels": ["self-hosted"]})
         );
+    }
+
+    /// A repository with `runs` in-progress runs, each with one running job. `queued_in`
+    /// adds a queued job a pool serves to a run, `touched` changes a run's `updated_at`.
+    struct Busy {
+        fake: Fake,
+        state: std::rc::Rc<std::cell::RefCell<BusyState>>,
+    }
+
+    #[derive(Default)]
+    struct BusyState {
+        queued_in: Option<u64>,
+        touched: Option<u64>,
+    }
+
+    const T0: UnixSecs = 1_000_000;
+    const TICK_S: UnixSecs = 15;
+
+    impl Busy {
+        fn new(runs: u64, left: u64) -> Self {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(BusyState::default()));
+            let st = state.clone();
+            let fake = Fake::new(move |s| {
+                let st = st.borrow();
+                let body = if s.url.contains("status=queued") {
+                    json!({"workflow_runs": []})
+                } else if s.url.contains("status=in_progress") {
+                    let list: Vec<Value> = (1..=runs)
+                        .map(|id| {
+                            let at = if st.touched == Some(id) { "t2" } else { "t1" };
+                            json!({"id": id, "run_attempt": 1, "updated_at": at})
+                        })
+                        .collect();
+                    json!({ "workflow_runs": list })
+                } else {
+                    let id: u64 = s.url.split('/').nth(8).unwrap().parse().unwrap();
+                    let mut jobs = vec![json!({"id": id * 10, "run_attempt": 1,
+                        "status": "in_progress", "labels": ["self-hosted", "large"]})];
+                    if st.queued_in == Some(id) {
+                        jobs.push(json!({"id": id * 10 + 1, "run_attempt": 1,
+                            "status": "queued", "labels": ["self-hosted", "large"]}));
+                    }
+                    json!({ "jobs": jobs })
+                };
+                let left = left.to_string();
+                let reset = (T0 + 7_200).to_string();
+                let headers = [
+                    ("X-RateLimit-Limit", "5000"),
+                    ("X-RateLimit-Remaining", left.as_str()),
+                    ("X-RateLimit-Reset", reset.as_str()),
+                ];
+                respond(200, &headers, &body.to_string())
+            });
+            Busy { fake, state }
+        }
+
+        /// One tick as the loop runs it: the requests it sent and the queued job ids found,
+        /// or `None` when the budget skipped the observe.
+        fn tick(&self, gh: &mut Client, t: u64) -> (usize, Option<Vec<u64>>) {
+            let before = self.fake.sent().len();
+            gh.begin_tick(T0 + t * TICK_S);
+            let found = gh.may_observe().then(|| {
+                let large = |l: &[String]| l.iter().any(|l| l == "large");
+                let jobs = gh.queued_jobs(&large).unwrap();
+                jobs.iter().map(|j| j.key.id).collect()
+            });
+            (self.fake.sent().len() - before, found)
+        }
+    }
+
+    /// The old loop read all 30 runs' jobs every tick: 32 requests a tick, 7,680 an hour at
+    /// `tick_s` 15. Now the first tick reads them all once, and after that the budget holds
+    /// the hour to a quarter of the 5,000 limit.
+    #[test]
+    fn thirty_in_progress_runs_stay_in_budget() {
+        let busy = Busy::new(30, 4_000);
+        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let per_tick: Vec<usize> = (0..240).map(|t| busy.tick(&mut gh, t).0).collect();
+        assert_eq!(per_tick[0], 32);
+        let hour: usize = per_tick.iter().sum();
+        eprintln!("first ticks {:?}, hour {hour}", &per_tick[..12]);
+        // 1,250 an hour, the 60 s the bucket starts with, and the first tick's required reads.
+        assert!(hour <= 1_250 + 21 + 32, "{hour} requests in an hour");
+        assert!(hour >= 1_100, "{hour} requests in an hour");
+    }
+
+    /// Ticks until a job queued in `run` after `settle` ticks is found, for a run that
+    /// looks unchanged.
+    fn ticks_to_find(runs: u64, run: u64, settle: u64) -> u64 {
+        let busy = Busy::new(runs, 4_000);
+        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        for t in 0..settle {
+            busy.tick(&mut gh, t);
+        }
+        busy.state.borrow_mut().queued_in = Some(run);
+        let found = (settle..settle + 100)
+            .find(|&t| busy.tick(&mut gh, t).1.is_some_and(|f| f == [run * 10 + 1]))
+            .expect("found");
+        found - settle + 1
+    }
+
+    /// The most ticks over every run and every phase of the budget.
+    fn worst_ticks_to_find(runs: u64) -> u64 {
+        (1..=runs)
+            .flat_map(|run| (40..52).map(move |settle| ticks_to_find(runs, run, settle)))
+            .max()
+            .unwrap()
+    }
+
+    /// An in-progress run whose `updated_at` does not move still has its newly queued job
+    /// found: on the first tick `RUN_MAX_AGE_S` after its last read when few runs share the budget, and within
+    /// the time the budget takes to read every run when 30 do.
+    #[test]
+    fn a_newly_queued_job_in_a_seen_run_is_found() {
+        let one = worst_ticks_to_find(1);
+        assert_eq!(one, RUN_MAX_AGE_S / TICK_S);
+        let thirty = worst_ticks_to_find(30);
+        eprintln!("worst ticks to find: 1 run {one}, 30 runs {thirty}");
+        assert!(thirty <= 12, "{thirty} ticks");
+    }
+
+    /// A changed `updated_at` is read on the next tick, and a run with a queued job a pool
+    /// serves is read every tick, so the job drops out once it is taken.
+    #[test]
+    fn changed_and_wanted_runs_are_read_at_once() {
+        let busy = Busy::new(30, 4_000);
+        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        for t in 0..40 {
+            busy.tick(&mut gh, t);
+        }
+        busy.state.borrow_mut().queued_in = Some(7);
+        busy.state.borrow_mut().touched = Some(7);
+        let mut t = 40;
+        while busy.tick(&mut gh, t).1.is_none() {
+            t += 1;
+        }
+        assert_eq!(t, 40);
+        let reads = |busy: &Busy| {
+            busy.fake
+                .sent()
+                .iter()
+                .filter(|s| s.url.contains("/runs/7/jobs"))
+                .count()
+        };
+        for t in 41..45 {
+            let before = reads(&busy);
+            let (_, found) = busy.tick(&mut gh, t);
+            if found.is_some() {
+                assert_eq!(reads(&busy), before + 1);
+            }
+        }
+        busy.state.borrow_mut().queued_in = None;
+        let found = (45..60).find_map(|t| busy.tick(&mut gh, t).1).unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// Under `RESERVE` requests left the daemon observes once every `PACE_MAX_S`, so
+    /// cleanup goes on, until `RATE_FLOOR` stops every request.
+    #[test]
+    fn a_low_budget_stretches_observation() {
+        let busy = Busy::new(30, 450);
+        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let observed: Vec<u64> = (0..80)
+            .filter(|&t| busy.tick(&mut gh, t).1.is_some())
+            .collect();
+        let pace = PACE_MAX_S / TICK_S;
+        assert_eq!(observed, [0, pace, 2 * pace, 3 * pace]);
+    }
+
+    /// A run left unread keeps its ETag, so its next read is a free 304 when nothing changed.
+    #[test]
+    fn an_unread_run_keeps_its_etag() {
+        let fake = Fake::new(|s| {
+            if s.url.contains("/jobs") && s.header("if-none-match") == Some("\"j\"") {
+                return respond(304, &[], "");
+            }
+            let body = if s.url.contains("status=in_progress") {
+                json!({"workflow_runs": [{"id": 1, "run_attempt": 1, "updated_at": "t1"}]})
+            } else if s.url.contains("status=queued") {
+                json!({"workflow_runs": []})
+            } else {
+                json!({"jobs": [{"id": 10, "run_attempt": 1, "status": "in_progress", "labels": []}]})
+            };
+            respond(200, &[("ETag", "\"j\"")], &body.to_string())
+        });
+        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        for t in 0..=RUN_MAX_AGE_S / TICK_S {
+            gh.begin_tick(T0 + t * TICK_S);
+            gh.queued_jobs(&|_| true).unwrap();
+        }
+        let reads: Vec<_> = fake
+            .sent()
+            .into_iter()
+            .filter(|s| s.url.contains("/runs/1/jobs"))
+            .map(|s| s.header("if-none-match").map(str::to_string))
+            .collect();
+        assert_eq!(reads, [None, Some("\"j\"".to_string())]);
     }
 }

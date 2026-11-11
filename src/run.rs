@@ -203,6 +203,8 @@ fn drain_with(
     now: UnixSecs,
 ) -> Result<usize, Error> {
     let mut tick_loop = Loop::new(cfg, t, boat_key, token, now);
+    // `delete_everything` ignores queued jobs, so drain does not spend requests on them.
+    tick_loop.read_jobs = false;
     tick_loop.tick(now, delete_everything)?;
     tick_loop.gh.begin_tick(now);
     let (after, _) = tick_loop.observe(now)?;
@@ -402,6 +404,10 @@ pub struct Loop<'a> {
     pending: Vec<Pending>,
     /// Starts that failed last time they were sent, by pool and kind; see `Failing`.
     failing: HashMap<(String, &'static str), Failing>,
+    /// False for `drain`, which needs no queued jobs.
+    read_jobs: bool,
+    /// The last tick skipped its observe to stay in the GitHub request budget.
+    paced: bool,
 }
 
 /// The last error of a kind of start in a pool. When the next one fails the same way, the
@@ -452,6 +458,8 @@ impl<'a> Loop<'a> {
             restarted: true,
             pending: Vec::new(),
             failing: HashMap::new(),
+            read_jobs: true,
+            paced: false,
         }
     }
 
@@ -467,6 +475,16 @@ impl<'a> Loop<'a> {
         }
         self.spent_day = Some(day);
         self.gh.begin_tick(now);
+        // A tick without budget acts on nothing rather than on a stale snapshot; see
+        // docs/design.md#github-requests.
+        if !self.gh.may_observe() {
+            if !self.paced {
+                eprintln!("observe: {}; observing less often", self.gh.budget_note());
+                self.paced = true;
+            }
+            return Ok(());
+        }
+        self.paced = false;
         let (snapshot, mut runner_ids) = match self.observe(now) {
             Ok(v) => v,
             Err(e) if e.is_fatal() => return Err(e),
@@ -567,7 +585,13 @@ impl<'a> Loop<'a> {
             }
         }
         let gh_runners = self.gh.runners()?;
-        let queued = self.gh.queued_jobs()?;
+        let queued = if self.read_jobs {
+            let pools = &self.cfg.pools;
+            self.gh
+                .queued_jobs(&|labels| pools.iter().any(|p| p.serves(labels)))?
+        } else {
+            Vec::new()
+        };
         let limits = self.boat.limits()?;
 
         let mut runner_ids = HashMap::new();
@@ -1422,6 +1446,8 @@ mod tests {
         // The fake lists the same three machines afterwards.
         let left = drain_with(&cfg, &fake, "k".into(), "t".into(), NOW).unwrap();
         assert_eq!(left, 3);
+        // Queued jobs do not matter to drain, so it spends no requests on them.
+        assert!(!requests(&fake).iter().any(|r| r.contains("/runs")));
         let writes: Vec<String> = requests(&fake)
             .into_iter()
             .filter(|r| !r.starts_with("GET"))

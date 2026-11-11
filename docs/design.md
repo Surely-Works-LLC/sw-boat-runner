@@ -89,6 +89,9 @@ The daemon keeps no database. Each tick it reads:
   jobs. Before `decide` runs, each queued job goes only to the first pool in the file
   whose labels match it.
 
+[GitHub requests](#github-requests) describes how the daemon keeps these reads inside the
+API's rate limit.
+
 Runner names carry what the daemon needs to know about them:
 `sbr-<pool>-<machine id>-<slot>-<registered unix time>`. A machine forked for a job
 carries the label `sw-boat-runner-job=<job id>-<attempt>`, which `decide` matches to make
@@ -106,7 +109,8 @@ second fork for one job; the listing-lag, lost-create and restart rules below do
 
 The daemon keeps a few facts in memory only: when each machine changed state and last had
 a busy or registered runner, which runners it has seen online, the forks boat has not
-listed yet, the cents spent on starts today, and the time before which it makes no start.
+listed yet, the cents spent on starts today, the time before which it makes no start, and
+the GitHub request budget with the last read of each in-progress run's jobs.
 A machine first seen counts as never busy, which can only delay a stop. The rules below
 keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in `spec/BoatRunner.tla`, and
 [spec/README.md](../spec/README.md#fix-flags) describes the counterexample TLC finds
@@ -138,6 +142,43 @@ without it.
 - Lost spend (`FixLostSpend`): such a create also adds its quoted price to today's spend,
   because boat may have charged for it. A refusal adds nothing.
 - Restart spend (`FixCrashSpend`): see [Start budget](#start-budget).
+
+## GitHub requests
+
+The REST API allows a token a number of requests an hour: 5,000 for a personal access
+token, shared with everything else its owner runs, and at least 5,000 of its own for a
+GitHub App installation token. The daemon keeps its own use well inside that with a
+token bucket in `src/github.rs`:
+
+- It fills at a quarter of `X-RateLimit-Limit` an hour, or slower when the requests left
+  above 500 (`RESERVE`) would not last until `X-RateLimit-Reset` at that rate. It holds
+  at most 60 s of its rate. Every request GitHub counts takes a token; a 304 answer to a
+  read with the cached ETag takes none.
+- A tick observes only with a token in hand. A tick without one sends nothing and acts on
+  nothing, rather than act on a stale snapshot, so a short budget stretches the time
+  between observes. Even with no budget, the daemon observes once every 5 minutes
+  (`PACE_MAX_S`), so finished machines are still deleted.
+- Once an observe starts, its reads and the writes `decide` asks for always go, so a
+  tick never acts on half a snapshot. Under 200 requests left (`RATE_FLOOR`) nothing is
+  sent until the reset, leaving the rest to whoever else uses the token.
+- `drain` does not read queued jobs, so it needs only the runner list and its deletes.
+
+The runner list and the queued runs' jobs rarely change, so most of those reads are 304s.
+An in-progress run's jobs change with every step, and such a run can still queue a later
+job (`needs`), so the daemon keeps its last read of each and reads it again:
+
+- every tick while the run is new or re-run, or its last read found a queued job a pool
+  serves, so a job that a runner took leaves the snapshot at once;
+- with a token, when its `updated_at` changed since its last read, or when that read is
+  60 s old (`RUN_MAX_AGE_S`), changed runs first, then the oldest reads.
+
+A run that is not read keeps its last read, whose queued jobs no pool serves, so `decide`
+never sees a job that may have been taken. GitHub does not promise that `updated_at`
+moves when a run queues a job, so the 60 s age is what bounds the delay: a job queued in a
+run that looks unchanged is found within 60 s while the budget covers every run, and
+later when it does not. The tests in `src/github.rs` count the requests: 30 in-progress
+runs cost 32 requests a tick before this budget, 7,680 an hour at `tick_s` 15, and about
+1,270 an hour with it, and a job one of them queues is found within 10 ticks (150 s).
 
 ## State machine
 

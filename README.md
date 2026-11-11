@@ -137,6 +137,26 @@ A preset sets `placement`, the ways to find a runner for a queued job, tried in 
 Use `fork` for untrusted code such as pull requests from forks.
 [docs/design.md](docs/design.md) has the full design.
 
+## GitHub API requests
+
+A fine-grained personal access token shares its owner's limit of 5,000 REST requests an
+hour with everything else the owner runs. A GitHub App installation token has its own
+limit, at least 5,000 an hour, but it expires after an hour and the daemon reads
+`GITHUB_TOKEN` only at start.
+
+The daemon aims to use at most a quarter of the limit GitHub reports
+(`X-RateLimit-Limit`), 1,250 requests an hour for a personal token. When fewer requests
+are left, it spreads those above 500 evenly until the limit resets. A 304 answer to a
+cached read is free and not counted. Each tick reads the runner list, the queued and the
+in-progress runs, and the jobs of every queued run. An in-progress run's jobs are read
+when the run is new, while it has a queued job a pool serves, when its `updated_at`
+changes, and at least every 60 s while the budget allows. On a quiet repository that is
+a few requests a tick, mostly 304s. With 30 in-progress runs the old loop sent 32
+requests a tick, 7,680 an hour; it now sends about 1,270 an hour, and a job that such a
+run queues is found within 150 s. Under 500 requests left the daemon observes once every
+5 minutes, so cleanup goes on, and under 200 it sends nothing until the reset.
+[docs/design.md](docs/design.md#github-requests) has the details.
+
 ## Verification
 
 [spec/BoatRunner.tla](spec/BoatRunner.tla) models the loop together with boat, GitHub,
