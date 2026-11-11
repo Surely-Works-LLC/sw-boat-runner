@@ -285,8 +285,12 @@ fn parse_job_label(v: &str) -> Option<JobKey> {
     })
 }
 
+/// Whole cents, at least 1 for any price above 0, so the 0 that marks an included start
+/// never stands for a paid one.
 fn cents(dollars: Option<f64>) -> Cents {
-    dollars.map_or(0, |d| (d * 100.0).round().max(0.0) as Cents)
+    dollars
+        .filter(|&d| d > 0.0)
+        .map_or(0, |d| ((d * 100.0).round() as Cents).max(1))
 }
 
 /// Whether boat's limits actually let a start through: a null price means boat would
@@ -1874,7 +1878,16 @@ mod tests {
         let job = JobKey { id: 9, attempt: 3 };
         assert_eq!(parse_job_label(&job_label(job)), Some(job));
         assert_eq!(parse_job_label("9"), None);
+    }
+
+    /// Only a start boat quotes at exactly 0 is included; a fraction of a cent is paid.
+    #[test]
+    fn cents_never_round_a_paid_start_to_free() {
         assert_eq!(cents(Some(0.29)), 29);
+        assert_eq!(cents(Some(0.07)), 7);
+        assert_eq!(cents(Some(0.004)), 1);
+        assert_eq!(cents(Some(0.0)), 0);
+        assert_eq!(cents(Some(-1.0)), 0);
         assert_eq!(cents(None), 0);
     }
 }
