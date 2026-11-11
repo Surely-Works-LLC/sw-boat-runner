@@ -170,8 +170,8 @@ token bucket in `src/github.rs`:
 - A tick observes only with a token in hand. A tick without one sends nothing and acts on
   nothing, rather than act on a stale snapshot, so a short budget stretches the time
   between observes. Even with no budget, the daemon observes once every 5 minutes
-  (`PACE_MAX_S`), so finished machines are still deleted. The "budget spent" line is
-  logged at most once a minute.
+  (`PACE_MAX_S`), so finished machines are still deleted. The "pacing" line is
+  logged at most once every 10 minutes.
 - Once an observe starts, its reads and the writes `decide` asks for always go, so a
   tick never acts on half a snapshot. Under 200 requests left (`RATE_FLOOR`) nothing is
   sent until the reset, leaving the rest to whoever else uses the token.

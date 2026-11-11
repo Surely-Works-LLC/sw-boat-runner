@@ -325,9 +325,12 @@ impl<'t> Client<'t> {
     pub(crate) fn budget_note(&self) -> String {
         match self.budget.left {
             Some((left, reset)) if self.now < reset => {
-                format!("GitHub request budget spent ({left} left until {reset})")
+                format!(
+                    "pacing GitHub requests ({left} left, reset in {}s)",
+                    reset.saturating_sub(self.now)
+                )
             }
-            _ => "GitHub request budget spent".into(),
+            _ => "pacing GitHub requests".into(),
         }
     }
 
