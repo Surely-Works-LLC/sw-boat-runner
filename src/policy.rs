@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::boat::MAX_TTL_S;
 use crate::model::{Cents, Config, Placement, Pool};
+use crate::run::HOME_WAIT_S;
 
 const MACHINE_TYPES: [&str; 4] = ["small", "default", "large", "xlarge"];
 
@@ -68,6 +69,21 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         tick_s: raw.tick_s,
         pools,
     })
+}
+
+/// Settings that are valid but likely to waste starts, for `check` to print.
+pub fn warnings(cfg: &Config) -> Vec<String> {
+    cfg.pools
+        .iter()
+        .filter(|p| p.register_timeout_s <= HOME_WAIT_S)
+        .map(|p| {
+            format!(
+                "pool {:?}: register_timeout_s ({}) is not above the {HOME_WAIT_S}s a runner \
+                 may wait for boat's snapshot copy, so a slow copy unregisters it",
+                p.name, p.register_timeout_s
+            )
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -140,7 +156,8 @@ impl RawPool {
             // safer, but most starts are included; see docs/design.md#start-budget.
             idle_stop_s: self.idle_stop_s.unwrap_or(1800),
             min_up_s: self.min_up_s.unwrap_or(600),
-            register_timeout_s: self.register_timeout_s.unwrap_or(300),
+            // The runner may wait `HOME_WAIT_S` for boat's snapshot copy, then boots.
+            register_timeout_s: self.register_timeout_s.unwrap_or(HOME_WAIT_S + 300),
             fork_ttl_s: self.fork_ttl_s.unwrap_or(3600),
             paid_start_cents_per_day: self.paid_start_cents_per_day.unwrap_or(0),
         }
@@ -274,7 +291,7 @@ max_boxes = 4
                 slots_per_box: 1,
                 idle_stop_s: 1800,
                 min_up_s: 600,
-                register_timeout_s: 300,
+                register_timeout_s: 900,
                 fork_ttl_s: 3600,
                 paid_start_cents_per_day: 0,
             }]
@@ -315,6 +332,22 @@ max_boxes = 4
         assert_eq!(pool.idle_stop_s, 3600);
         assert_eq!(pool.slots_per_box, 2);
         assert_eq!(pool.paid_start_cents_per_day, 50);
+    }
+
+    /// A fresh machine's runner waits up to `HOME_WAIT_S` for boat's snapshot copy; a
+    /// timeout under that would unregister it and fork the job again.
+    #[test]
+    fn register_timeout_outlasts_the_home_wait() {
+        let pool = &parse(&policy("")).unwrap().pools[0];
+        assert!(pool.register_timeout_s > HOME_WAIT_S);
+        assert!(warnings(&parse(&policy("")).unwrap()).is_empty());
+        let short = parse(&policy("register_timeout_s = 300")).unwrap();
+        let w = warnings(&short);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("pool \"ci\"") && w[0].contains("600"),
+            "{w:?}"
+        );
     }
 
     #[test]

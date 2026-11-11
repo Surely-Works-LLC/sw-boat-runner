@@ -310,9 +310,14 @@ fn jit_path(slot: u32) -> String {
 /// swap sees its files change identity, so the runner starts only after it. The wait
 /// gives up after 300 tries 2 s apart and deletes the jit config at `$f`; `decide` then
 /// unregisters the runner that never came online. Without `findmnt` it does not wait.
+/// `HOME_WAIT_S` is that bound.
 const WAIT_FOR_HOME: &str = "n=0; \
      while findmnt -no FSTYPE -T /home/user 2>/dev/null | grep -q '^fuse'; do \
      n=$((n+1)); [ \"$n\" -lt 300 ] || { rm -f \"$f\"; exit 1; }; sleep 2; done";
+/// The longest `WAIT_FOR_HOME` waits before a runner starts. A `register_timeout_s` at or
+/// under it unregisters a runner that is still waiting for the copy, and a fork then gets
+/// deleted and forked again.
+pub(crate) const HOME_WAIT_S: u64 = 300 * 2;
 
 /// Starts slot `slot`'s runner from the snapshot's `/home/user/actions-runner`, in its own
 /// directory because a runner keeps its state files next to `run.sh`. boat stores every
@@ -1236,6 +1241,8 @@ mod tests {
         // A mount that never settles stops the start instead of running a job on it, and
         // leaves no jit config behind.
         assert_eq!(wait_for_home(u32::MAX), (false, 300, false));
+        assert!(WAIT_FOR_HOME.contains("-lt 300 ]") && WAIT_FOR_HOME.contains("sleep 2;"));
+        assert_eq!(HOME_WAIT_S, 300 * 2);
         assert!(start_command(1).starts_with(&format!(
             "set -eu; f=/home/user/.sbr-jit-1; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; "
         )));
