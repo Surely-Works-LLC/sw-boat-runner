@@ -49,7 +49,13 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    `/home/user/actions-runner`, its dependencies, and whatever your jobs expect to find.
    Leave the runner unconfigured. Keep logins and tokens out: a job can read every file
    in the snapshot. Remove cleanup timers, because machines keep the snapshot's systemd
-   timers.
+   timers. With the `boat` CLI:
+
+   ```sh
+   boat new --no-env --type large   # the pool's machine_type; prints the machine's id
+   boat ssh <id>                    # extract the runner, run its bin/installdependencies.sh
+   boat snapshot <id> snap-1        # the name goes in the policy's `snapshot`
+   ```
 
 3. Set two environment variables:
 
@@ -101,8 +107,15 @@ The daemon creates machines with `noEnv`, so boat adds none of the account's sec
 labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
 ignores every other machine and runner. To update the runner, rebuild the snapshot.
 
-This repository runs its own tests through the first option, in its
-[`self-hosted` workflow](.github/workflows/self-hosted.yml).
+The [`self-hosted` workflow](.github/workflows/self-hosted.yml) is a working example of
+the first option. It is skipped in this repository, because its snapshot variable and
+secrets are not set here; a fork that sets them runs its tests on boat.
+
+To stop using the daemon, stop the process and run `sw-boat-runner drain policy.toml`
+with the same keys. It deletes the pools' machines and runners, and leaves every other
+machine and runner alone. It fails while a machine is left, for example one whose runner
+is still running a job, so run it again until it succeeds. Then point `runs-on` back at
+another runner.
 
 ## Policy
 
@@ -121,7 +134,7 @@ This repository runs its own tests through the first option, in its
 | `slots_per_box` | 1 | Runners per kept machine. |
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
-| `register_timeout_s` | 300 | How long a registered runner may take to come online. Keep it above the time boat takes to copy the snapshot to a new machine's disk: the runner waits up to 10 minutes for that copy before it starts. |
+| `register_timeout_s` | 300 | How long a registered runner may take to come online. A new machine's runner first waits up to 10 minutes for boat to copy the snapshot to its disk, and a runner still waiting at the timeout is unregistered. 300 suits a snapshot that copies in well under 5 minutes; for a larger one, set 900. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only starts the plan includes. |
 
@@ -150,10 +163,17 @@ safety properties, and the loop is tested against a fake transport.
 
 ## Status
 
-In November 2026 a `fork` pool ran against a production repository: it forked machines up
-to `max_boxes`, each machine's runner took one job, and the daemon deleted the machines
-and their runners afterwards. [eval/](eval/) measures a repository's move from
-`runs-on: boat` to persistent boat runners, which is the setup this daemon automates.
+In November 2026 the authors ran a `fork` pool against one of their private
+repositories: it forked machines up to `max_boxes`, each machine's runner took one job,
+and the daemon deleted the machines and their runners afterwards. This repository links
+no log of that run; the tests, the bench and the TLA+ model are what you can check.
+
+The queue times at the top are simulated. The only real measurement,
+[eval/results/example-2026-11.md](eval/results/example-2026-11.md), is slower: queue p50
+5.6 min and p90 27.8 min. It measured the setup this daemon replaces: four long-lived
+runners registered once on always-on machines, too few for peak load and with no way to
+grow with the queue. It shows the starts saved by keeping machines up, not the daemon's
+queue times, which have not been measured on a real repository yet.
 
 ## License
 
