@@ -1042,10 +1042,10 @@ mod tests {
                 prop_assert!(actions.is_empty(), "{actions:?}");
             }
 
-            /// Spec `NoLeak` for kept machines (the last clause of `DeleteGuard`): a pool
-            /// without slot never registers a runner on one, so it deletes every kept
-            /// machine that is up or starting and holds no busy or registered runner, and
-            /// leaves the others.
+            /// `NoLeak` for kept machines, the design's last `Delete` clause, which the spec
+            /// leaves out (spec/README.md): a pool without slot never registers a runner on
+            /// one, so it deletes every kept machine that is up or starting and holds no
+            /// busy or registered runner, and leaves the others.
             #[test]
             fn no_leak_of_kept_machines(
                 snap in arb_snapshot(),

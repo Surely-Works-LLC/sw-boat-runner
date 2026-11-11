@@ -40,6 +40,7 @@ ASSUME
     /\ Placement \subseteq {"slot", "resume", "fork"}
     /\ Placement # {}
     /\ MinUp > 0 => "slot" \in Placement
+    /\ "resume" \in Placement => "slot" \in Placement
     /\ BoxCap \in Nat /\ MinUp \in Nat /\ Included \in Nat
     /\ PaidBudget \in Nat /\ MaxFaults \in Nat
     /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct,
