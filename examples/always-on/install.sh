@@ -6,7 +6,18 @@
 # For a GitHub App instead of GITHUB_TOKEN, set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE
 # and, if you like, GITHUB_APP_INSTALLATION_ID in the environment; the key file is copied
 # into /etc/sw-boat-runner.
+# SBR_REF picks what to build: a branch (default main), a tag starting with v and a digit,
+# or a commit hash. Pin a commit for production.
 set -euo pipefail
+
+ref=${SBR_REF:-main}
+if [[ $ref =~ ^[0-9a-f]{7,40}$ ]]; then
+    from=(--rev "$ref")
+elif [[ $ref =~ ^v[0-9] ]]; then
+    from=(--tag "$ref")
+else
+    from=(--branch "$ref")
+fi
 
 policy=${1:?usage: install.sh policy.toml}
 
@@ -33,7 +44,7 @@ if ! command -v cargo >/dev/null; then
     # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
 fi
-cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.1.0
+cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner "${from[@]}"
 bin=$(command -v sw-boat-runner)
 "$bin" check "$policy"
 

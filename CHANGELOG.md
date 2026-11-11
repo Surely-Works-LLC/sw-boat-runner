@@ -40,6 +40,12 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   the whole next day.
 - `register_timeout_s` defaults to 900 s, above the runner's 600 s wait for the snapshot
   copy, and 0 is rejected. `repo` rejects `.` and `..`.
+- The GitHub request budget paces itself on the requests actually left until the reset,
+  up to the whole limit for an App installation token and a quarter for a personal token,
+  and saves up more for a busy tick. A job queued in one of 30 in-progress runs is found
+  within 60 s with an App instead of 150 s. "Budget spent" is logged at most once a minute.
+- `examples/always-on/install.sh` builds `SBR_REF` (default `main`) instead of a tag that
+  did not exist.
 
 ### Security
 

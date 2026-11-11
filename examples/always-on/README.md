@@ -12,9 +12,18 @@ boat ssh <id>
 Inside the machine, write your `policy.toml` ([policy.toml](policy.toml) is a start), then:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.1.0/examples/always-on/install.sh
+curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/main/examples/always-on/install.sh
 bash install.sh policy.toml    # asks for BOAT_API_KEY and GITHUB_TOKEN
 ```
+
+The script builds the `main` branch. For production, pin a commit, in both the `curl` URL
+and `SBR_REF`, so a reinstall builds what you tested:
+
+```sh
+SBR_REF=<commit hash> bash install.sh policy.toml
+```
+
+`SBR_REF` also takes another branch name, or a tag such as `v0.2.0` once there are tags.
 
 To use a GitHub App instead of a personal token, copy its private key to the machine
 (over `boat scp`, or paste it into a file over `boat ssh`) and set the App variables
@@ -26,9 +35,6 @@ export GITHUB_APP_PRIVATE_KEY_FILE=$HOME/app.pem   # GITHUB_APP_INSTALLATION_ID 
 bash install.sh policy.toml    # asks for BOAT_API_KEY only
 rm "$HOME/app.pem"
 ```
-
-The App variables need a release after 0.1.0. Until one is out, change `--tag v0.1.0` in
-the script to `--branch main`.
 
 [install.sh](install.sh) asks for the two keys without echoing them, builds the daemon,
 and stores the policy in `/etc/sw-boat-runner` and the keys in `/etc/sw-boat-runner/env`
@@ -60,5 +66,6 @@ sudo systemctl disable --now sw-boat-runner
 sudo sh -c 'set -a; . /etc/sw-boat-runner/env; /usr/local/bin/sw-boat-runner drain /etc/sw-boat-runner/policy.toml'
 ```
 
-The script has been checked with `bash -n` and `shellcheck` only. It has not been run on a
-boat machine.
+The script has been run on a boat `small` machine with a GitHub App: the policy, the
+unit it writes, `LoadCredential` for the App's key and `DynamicUser`. The service starts
+and runs.
