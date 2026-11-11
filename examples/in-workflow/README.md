@@ -5,11 +5,15 @@ builds the daemon and runs it for the length of the calling workflow run. Add on
 change `runs-on`:
 
 ```yaml
+on:
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
   runners:
-    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.1.0
     with:
       snapshot: snap-1
     secrets:
@@ -17,6 +21,7 @@ jobs:
       RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
 
   test:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, "boat-${{ github.run_id }}-${{ github.run_attempt }}"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -25,8 +30,14 @@ jobs:
       - run: make test
 ```
 
-The `runners` job needs only `contents: read` from the run's token. `@main` follows this
-repository; for anything you rely on, put a commit SHA there and in `ref`.
+The trigger and the `if:` on both jobs keep the pool to pushes to `main`. Keep the `if:`
+if you add triggers: in a `pull_request_target` run `github.ref` is still the base branch,
+so only the event check stops it. [Pull requests](#pull-requests) says why.
+
+The `runners` job needs only `contents: read` from the run's token. `@v0.1.0` pins the
+workflow and `ref` (default `v0.1.0`) pins the daemon it builds. GitHub tells a called
+workflow nothing reliable about its own ref, so the two are separate: change both
+together, to a later tag or to one commit SHA.
 
 `snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
 describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section; the
@@ -38,7 +49,7 @@ describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section;
 | `max_boxes` | 4 | |
 | `pool` | `preset = "fork"` | More policy lines for the pool, such as `preset = "warm"`. |
 | `name` | none | Set it when one run calls the workflow more than once. The label is then `boat-<run id>-<attempt>-<name>`. |
-| `ref` | `main` | The sw-boat-runner commit to build. Pin one for anything you rely on. |
+| `ref` | `v0.1.0` | The sw-boat-runner tag or commit to build. Keep it the same as the `@` ref of `uses:`. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never
 share a daemon. The `runners` job ends once every other job of the run is done, and then
@@ -54,10 +65,11 @@ What this costs compared with a daemon that stays up:
   all, and the `runners` job uses GitHub-hosted minutes for the whole run.
 - It makes only starts the plan includes. A job past them waits.
 
-This repository uses it on itself:
-[self-hosted.yml](../../.github/workflows/self-hosted.yml) runs `cargo test` on a machine
-the daemon forks. Both of its jobs are skipped until the repository variable
-`BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) and the two secrets are set.
+[self-hosted.yml](../../.github/workflows/self-hosted.yml) in this repository is a
+working caller that runs `cargo test` on a machine the daemon forks. Its jobs are skipped
+unless the repository variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) and the
+two secrets are set, and they are not set here, so it does not run in this repository. A
+fork that sets them runs it.
 
 ## Pull requests
 
@@ -68,5 +80,5 @@ is going, and a pull request can add a job with that label to any workflow, a fo
 included once its run is approved. The machine is forked for that one job and deleted
 after it, and the job gets none of the daemon's secrets, but it does run that pull
 request's code on a boat machine. Call the workflow only from runs you trust, such as
-pushes to your default branch (this repository's self-hosted.yml checks for `main`), and
-approve fork pull request runs only after reading their workflow changes.
+pushes to your default branch, as the example above does, and approve fork pull request
+runs only after reading their workflow changes.

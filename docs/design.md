@@ -38,8 +38,9 @@ next tick tries again. Presets:
 | `hybrid` | `slot, resume, fork` | `min_up` always up; a job their slots cannot take gets its own fork | bursts above `min_up` |
 
 `hybrid` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
-only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
-`min_up` need `slot`, the only step that registers runners on kept machines.
+only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps
+keep the order `slot`, `resume`, `fork`, and `resume` and `min_up` need `slot`, the only
+step that registers runners on kept machines.
 
 Every runner is a just-in-time runner: it is registered through GitHub's JIT config,
 takes one job and exits. A long-lived runner would need a registration token on the
@@ -61,11 +62,11 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 `GET /limits` quotes one price, for the next start, so `decide` prices every start of a
 tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
 boat's minute, hour and day windows, because the price past them is not known until the
-next tick. After each accepted
-start the daemon reads `GET /limits` again and makes no more starts that tick if the
-price changed. One account serves every pool, so each pool's cap is checked against the
-account-wide spend, including the starts that pools earlier in the file planned in the
-same tick.
+next tick. After each accepted start the daemon reads `GET /limits` again and makes no
+more starts that tick if the price changed. One account serves every pool, so each pool's
+cap is checked against the account-wide spend, including the starts that pools earlier in
+the file planned in the same tick. Prices are counted in whole cents, and a positive price
+under half a cent counts as 1 cent, so a paid start is never counted as free.
 
 The cents spent today are counted in memory. A restart cannot recover them, so after a
 restart the daemon sets them to the largest pool cap: every pool makes only included
@@ -108,9 +109,9 @@ The daemon keeps a few facts in memory only: when each machine changed state and
 a busy or registered runner, which runners it has seen online, the forks boat has not
 listed yet, the cents spent on starts today, and the time before which it makes no start.
 A machine first seen counts as never busy, which can only delay a stop. The rules below
-keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in `spec/BoatRunner.tla`, and
-[spec/README.md](../spec/README.md#fix-flags) describes the counterexample TLC finds
-without it.
+keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in
+`spec/BoatRunner.tla`, and [spec/README.md](../spec/README.md#fix-flags) describes the
+counterexample TLC finds without it.
 
 - Stale act (`FixStaleAct`): `Stop` and `Delete` first delete the machine's GitHub
   runners. GitHub refuses while a runner runs a job, which it may have taken since the
@@ -136,7 +137,8 @@ without it.
   or never existed. A refused start waits its `Retry-After` instead, and any other 4xx
   does not wait.
 - Lost spend (`FixLostSpend`): such a create also adds its quoted price to today's spend,
-  because boat may have charged for it. A refusal adds nothing.
+  because boat may have charged for it. So does a resume that fails without a definite
+  answer, and the daemon makes no more starts that tick. A refusal adds nothing.
 - Restart spend (`FixCrashSpend`): see [Start budget](#start-budget).
 
 ## State machine
@@ -175,7 +177,7 @@ process saw it online is `Registered` until that timeout.
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
@@ -187,6 +189,9 @@ pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects 
 without it. A job that matches several pools counts only for the first one in the file.
 
 Stop needs `resume` in placement because without it a stopped machine never comes back.
+A pool without `slot` keeps no kept machine: one is left only when the pool's placement
+changed after it was made, and without this rule it would hold a `max_boxes` box until
+boat's 30-day TTL. A `Stopping` one is deleted once it is `Stopped`.
 A `Busy` runner keeps its machine even past `fork_ttl_s`, which counts from the machine's
 last state change. The policy accepts `fork_ttl_s` from 1 to 2592000 (30 days, boat's
 longest TTL) and rejects anything else rather than clamping it.

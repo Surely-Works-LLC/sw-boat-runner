@@ -1,0 +1,10 @@
+repo = "acme/app"
+
+# Was `warm`; switched to `fork`, so no step uses its kept machines any more.
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "Linux", "pool-a"]
+machine_type = "xlarge"
+snapshot = "snap-1"
+preset = "fork"
+max_boxes = 4

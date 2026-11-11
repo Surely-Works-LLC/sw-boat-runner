@@ -9,3 +9,4 @@ preset = "warm"
 slots_per_box = 2
 min_up = 2
 max_boxes = 4
+register_timeout_s = 300

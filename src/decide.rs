@@ -79,8 +79,9 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         .iter()
         .filter(|m| m.job.is_some() && m.state != MachineState::Gone)
     {
-        let busy = runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy);
-        let live = runners_on(snap, &m.id).any(|r| r.state != RunnerState::Offline);
+        let on: Vec<&Runner> = runners_on(snap, &m.id).collect();
+        let busy = on.iter().any(|r| r.state == RunnerState::Busy);
+        let live = on.iter().any(|r| r.state != RunnerState::Offline);
         let seen = m.last_busy >= m.since;
         let age = now.saturating_sub(m.since);
         let finished = match m.state {
@@ -93,7 +94,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             actions.push(Action::Delete {
                 machine: m.id.clone(),
             });
-        } else if m.state == MachineState::Up && !seen && runners_on(snap, &m.id).next().is_none() {
+        } else if m.state == MachineState::Up && !seen && on.is_empty() {
             fresh.push(*m);
         }
     }
@@ -101,6 +102,24 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     if !has(Placement::Resume) {
         for m in kept_in(MachineState::Stopped) {
             if runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy) {
+                continue;
+            }
+            deleted.insert(m.id.as_str());
+            actions.push(Action::Delete {
+                machine: m.id.clone(),
+            });
+        }
+    }
+    // Only `slot` registers runners on kept machines, so in a pool without it (one whose
+    // placement changed) a kept machine up or starting would hold a box until boat's TTL.
+    // A stopping one becomes stopped, which the rule above deletes; policy ties `resume`
+    // and `min_up` to `slot`, so nothing here resumes or keeps one.
+    if !has(Placement::Slot) {
+        let orphans = kept_in(MachineState::Up).chain(kept_in(MachineState::Starting));
+        for m in orphans {
+            if runners_on(snap, &m.id)
+                .any(|r| matches!(r.state, RunnerState::Busy | RunnerState::Registered))
+            {
                 continue;
             }
             deleted.insert(m.id.as_str());
@@ -471,6 +490,26 @@ mod tests {
             decide(&busy, &pool("pool", "min_up = 0")),
             std::slice::from_ref(&unregister)
         );
+    }
+
+    /// A pool switched to `fork` keeps kept machines that no step would use again.
+    #[test]
+    fn a_pool_without_slot_deletes_its_unused_kept_machines() {
+        let p = pool("fork", "");
+        let s = snap(
+            vec![
+                machine("m1", Ms::Up),
+                machine("m2", Ms::Starting),
+                machine("m3", Ms::Stopping),
+                machine("m4", Ms::Up),
+                machine("m5", Ms::Up),
+            ],
+            vec![runner("m4", 0, Rs::Busy), runner("m5", 0, Rs::Registered)],
+            &[],
+        );
+        assert_eq!(decide(&s, &p), [delete("m1"), delete("m2")]);
+        // A pool with slot still uses them.
+        assert_eq!(decide(&s, &pool("pool", "min_up = 0")), NOTHING);
     }
 
     #[test]
@@ -864,8 +903,11 @@ mod tests {
             /// A settled pool, every action of the last tick applied, gets no more actions.
             #[test]
             fn applied_tick_settles(pool in arb_pool(), up in 0u32..5, idle in 0u64..200) {
-                // Machines above min_up are settled only while they have been busy recently.
-                let up = if pool.idle_stop_s == 0 {
+                // Machines above min_up are settled only while they have been busy recently,
+                // and a pool without slot keeps no kept machine at all.
+                let up = if !pool.placement.contains(&Placement::Slot) {
+                    0
+                } else if pool.idle_stop_s == 0 {
                     pool.min_up
                 } else {
                     up.clamp(pool.min_up, pool.max_boxes)
@@ -889,6 +931,26 @@ mod tests {
                 };
                 let actions = decide(&snap, &pool);
                 prop_assert!(actions.is_empty(), "{actions:?}");
+            }
+
+            /// NoLeak for kept machines: a pool without slot never registers a runner on
+            /// one, so it deletes every kept machine that is up or starting and holds no
+            /// busy or registered runner, and leaves the others.
+            #[test]
+            fn a_pool_without_slot_keeps_no_unused_kept_machine(
+                snap in arb_snapshot(),
+                pool in arb_pool(),
+            ) {
+                prop_assume!(!pool.placement.contains(&Placement::Slot));
+                let actions = decide(&snap, &pool);
+                let kept = snap.machines.iter().filter(|m| m.pool == pool.name && m.job.is_none());
+                for m in kept.filter(|m| matches!(m.state, Ms::Up | Ms::Starting)) {
+                    let held = snap.runners.iter().any(|r| {
+                        r.machine == m.id && matches!(r.state, Rs::Busy | Rs::Registered)
+                    });
+                    let deleted = actions.contains(&Action::Delete { machine: m.id.clone() });
+                    prop_assert_eq!(deleted, !held, "{:?}", m);
+                }
             }
 
             #[test]

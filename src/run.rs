@@ -12,6 +12,7 @@ use crate::model::{
     Action, Cents, Config, JobKey, Limits, Machine, MachineState, Pool, Runner, RunnerState,
     Snapshot, UnixSecs,
 };
+use crate::transport::{Transport, Ureq};
 
 const DAY_S: u64 = 86_400;
 /// boat's 409 code for a resume of a machine whose disk it has deleted, which it may do
@@ -24,89 +25,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 /// the most it doubles to.
 const BACKOFF_MIN_S: u64 = 15;
 const BACKOFF_MAX_S: u64 = 600;
-
-pub struct NetworkError(pub String);
-
-pub struct Response {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-impl Response {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        find_header(&self.headers, name)
-    }
-}
-
-fn find_header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
-/// The one seam between both clients and the network, so tests run without one.
-pub trait Transport {
-    fn send(
-        &self,
-        method: &str,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: Option<&[u8]>,
-    ) -> Result<Response, NetworkError>;
-}
-
-pub(crate) struct Ureq(ureq::Agent);
-
-impl Ureq {
-    pub(crate) fn new(timeout: Duration) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            // Both clients map every status themselves.
-            .http_status_as_error(false)
-            .build();
-        Ureq(ureq::Agent::new_with_config(config))
-    }
-}
-
-impl Transport for Ureq {
-    fn send(
-        &self,
-        method: &str,
-        url: &str,
-        headers: &[(&str, &str)],
-        body: Option<&[u8]>,
-    ) -> Result<Response, NetworkError> {
-        let mut req = ureq::http::Request::builder().method(method).uri(url);
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        let sent = match body {
-            Some(b) => req.body(b.to_vec()).map(|r| self.0.run(r)),
-            None => req.body(()).map(|r| self.0.run(r)),
-        };
-        // These errors name the URL at most, never headers or bodies.
-        let mut resp = sent
-            .map_err(|e| NetworkError(e.to_string()))?
-            .map_err(|e| NetworkError(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-            .collect();
-        let body = resp
-            .body_mut()
-            .read_to_vec()
-            .map_err(|e| NetworkError(e.to_string()))?;
-        Ok(Response {
-            status,
-            headers,
-            body,
-        })
-    }
-}
 
 #[derive(Debug)]
 pub enum Error {
@@ -285,8 +203,12 @@ fn parse_job_label(v: &str) -> Option<JobKey> {
     })
 }
 
+/// Whole cents, at least 1 for any price above 0, so the 0 that marks an included start
+/// never stands for a paid one.
 fn cents(dollars: Option<f64>) -> Cents {
-    dollars.map_or(0, |d| (d * 100.0).round().max(0.0) as Cents)
+    dollars
+        .filter(|&d| d > 0.0)
+        .map_or(0, |d| ((d * 100.0).round() as Cents).max(1))
 }
 
 /// Whether boat's limits actually let a start through: a null price means boat would
@@ -306,9 +228,14 @@ fn jit_path(slot: u32) -> String {
 /// swap sees its files change identity, so the runner starts only after it. The wait
 /// gives up after 300 tries 2 s apart and deletes the jit config at `$f`; `decide` then
 /// unregisters the runner that never came online. Without `findmnt` it does not wait.
+/// `HOME_WAIT_S` is that bound.
 const WAIT_FOR_HOME: &str = "n=0; \
      while findmnt -no FSTYPE -T /home/user 2>/dev/null | grep -q '^fuse'; do \
      n=$((n+1)); [ \"$n\" -lt 300 ] || { rm -f \"$f\"; exit 1; }; sleep 2; done";
+/// The longest `WAIT_FOR_HOME` waits before a runner starts. A `register_timeout_s` at or
+/// under it unregisters a runner that is still waiting for the copy, and a fork then gets
+/// deleted and forked again.
+pub(crate) const HOME_WAIT_S: u64 = 300 * 2;
 
 /// Starts slot `slot`'s runner from the snapshot's `/home/user/actions-runner`, in its own
 /// directory because a runner keeps its state files next to `run.sh`. boat stores every
@@ -400,6 +327,9 @@ pub struct Loop<'a> {
     restarted: bool,
     /// Forks this process created that boat has not listed yet.
     pending: Vec<Pending>,
+    /// Stopped machines this process resumed, with when, that boat may still list as
+    /// stopped; `decide` sees them as `Starting` for the same window as `pending`.
+    resumed: Vec<(String, UnixSecs)>,
     /// Starts that failed last time they were sent, by pool and kind; see `Failing`.
     failing: HashMap<(String, &'static str), Failing>,
 }
@@ -451,6 +381,7 @@ impl<'a> Loop<'a> {
             starts_blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             restarted: true,
             pending: Vec::new(),
+            resumed: Vec::new(),
             failing: HashMap::new(),
         }
     }
@@ -628,13 +559,13 @@ impl<'a> Loop<'a> {
                 job,
             });
         }
-        self.machines
-            .retain(|id, _| machines.iter().any(|m| &m.id == id));
+        let listed: HashSet<&str> = machines.iter().map(|m| m.id.as_str()).collect();
+        self.machines.retain(|id, _| listed.contains(id.as_str()));
         self.restarted = false;
         // A create that answered has had its full request timeout and a tick to show up.
         let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
         self.pending.retain(|p| {
-            if machines.iter().any(|m| m.id == p.id) {
+            if listed.contains(p.id.as_str()) {
                 return false;
             }
             let keep = now.saturating_sub(p.sent) <= lag_s;
@@ -646,6 +577,23 @@ impl<'a> Loop<'a> {
             }
             keep
         });
+        // A resume boat accepted holds its box from then on, though the listing may still
+        // show the machine stopped; resumed again, it would cost a second start.
+        self.resumed.retain(|(id, sent)| {
+            let stale = machines
+                .iter()
+                .any(|m| m.id == *id && m.state == MachineState::Stopped);
+            let keep = stale && now.saturating_sub(*sent) <= lag_s;
+            if stale && !keep {
+                eprintln!("warn: resume of {id} was never listed; dropped");
+            }
+            keep
+        });
+        for m in &mut machines {
+            if self.resumed.iter().any(|(id, _)| *id == m.id) {
+                m.state = MachineState::Starting;
+            }
+        }
         machines.extend(self.pending.iter().map(|p| Machine {
             id: p.id.clone(),
             pool: p.pool.clone(),
@@ -655,13 +603,14 @@ impl<'a> Loop<'a> {
             job: p.job,
         }));
 
+        let price = cents(limits.next_start_dollars);
         let limits = Limits {
             can_start: boat_can_start(&limits) && now >= self.starts_blocked_until,
-            next_start_cents: cents(limits.next_start_dollars),
+            next_start_cents: price,
             spent_today_cents: self.spent_cents,
             free_starts_left: limits
                 .starts_left
-                .filter(|_| cents(limits.next_start_dollars) == 0)
+                .filter(|_| price == 0)
                 .map(|left| u32::try_from(left).unwrap_or(u32::MAX)),
         };
         let snapshot = Snapshot {
@@ -689,13 +638,7 @@ impl<'a> Loop<'a> {
                 }
                 Ok(())
             }
-            Action::Delete { machine } => {
-                self.remove_runners(machine, runner_ids)?;
-                match self.boat.delete(machine) {
-                    Err(boat::Error::NotFound) => Ok(()),
-                    r => r.map_err(Error::from),
-                }
-            }
+            Action::Delete { machine } => self.delete_machine(machine, runner_ids),
             Action::Stop { machine } => {
                 self.remove_runners(machine, runner_ids)?;
                 self.boat.stop(machine).map_err(Error::from)
@@ -713,11 +656,10 @@ impl<'a> Loop<'a> {
                     if code == DISK_EXPIRED)
                 {
                     eprintln!("warn: {machine} lost its disk; deleting it");
-                    self.remove_runners(machine, runner_ids)?;
-                    return match self.boat.delete(machine) {
-                        Err(boat::Error::NotFound) => Ok(()),
-                        r => r.map_err(Error::from),
-                    };
+                    return self.delete_machine(machine, runner_ids);
+                }
+                if result.is_ok() {
+                    self.resumed.push((machine.clone(), now));
                 }
                 result
             }
@@ -754,17 +696,14 @@ impl<'a> Loop<'a> {
                         sent: now,
                     });
                 }
-                // boat may have started, and charged for, a machine this process never heard
-                // about, and the next fork's fresh key would not find it. Count the quote as
-                // spent and wait as after a restart: by then the machine is listed with its
-                // job label, or it never existed.
+                // boat may have started a machine this process never heard about, and the
+                // next fork's fresh key would not find it. Wait as after a restart: by then
+                // the machine is listed with its job label, or it never existed.
                 if matches!(&result, Err(Error::Boat(e)) if e.may_have_applied()) {
-                    self.spent_cents = self.spent_cents.saturating_add(starts.price);
                     let wait = now
                         .saturating_add(HTTP_TIMEOUT.as_secs())
                         .saturating_add(self.cfg.tick_s);
                     self.starts_blocked_until = self.starts_blocked_until.max(wait);
-                    starts.open = false;
                 }
                 result
             }
@@ -810,6 +749,18 @@ impl<'a> Loop<'a> {
         Ok(())
     }
 
+    fn delete_machine(
+        &mut self,
+        machine: &str,
+        runner_ids: &mut HashMap<String, u64>,
+    ) -> Result<(), Error> {
+        self.remove_runners(machine, runner_ids)?;
+        match self.boat.delete(machine) {
+            Err(boat::Error::NotFound) => Ok(()),
+            r => r.map_err(Error::from),
+        }
+    }
+
     /// If the file write or the command fails, the GitHub runner stays `Registered` and
     /// `decide` unregisters it after `register_timeout_s`.
     fn register(
@@ -834,7 +785,9 @@ impl<'a> Loop<'a> {
     }
 
     /// Runs one paid-or-free start. An accepted start adds the price `decide` saw to
-    /// today's spend; a refused one closes starts until boat's `Retry-After` passes.
+    /// today's spend; a refused one closes starts until boat's `Retry-After` passes. A
+    /// start without a definite answer may have been charged and may have moved the quote,
+    /// so it adds the price too and closes starts for this tick.
     fn start(
         &mut self,
         now: UnixSecs,
@@ -864,103 +817,24 @@ impl<'a> Loop<'a> {
                 starts.open = false;
                 Err(e.into())
             }
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod fake {
-    use std::cell::RefCell;
-
-    use super::{NetworkError, Response, Transport, find_header};
-
-    #[derive(Debug, Clone)]
-    pub(crate) struct Sent {
-        pub method: String,
-        pub url: String,
-        pub headers: Vec<(String, String)>,
-        pub body: Option<Vec<u8>>,
-    }
-
-    impl Sent {
-        pub(crate) fn header(&self, name: &str) -> Option<&str> {
-            find_header(&self.headers, name)
-        }
-
-        pub(crate) fn body_text(&self) -> String {
-            String::from_utf8_lossy(self.body.as_deref().unwrap_or_default()).into_owned()
-        }
-    }
-
-    /// What the network gives back for one request.
-    pub(crate) type Reply = Result<Response, NetworkError>;
-
-    /// Answers every request with `reply` and records what was sent.
-    pub(crate) struct Fake {
-        reply: Box<dyn Fn(&Sent) -> Reply>,
-        sent: RefCell<Vec<Sent>>,
-    }
-
-    impl Fake {
-        pub(crate) fn new(reply: impl Fn(&Sent) -> Response + 'static) -> Self {
-            Fake::failing(move |s| Ok(reply(s)))
-        }
-
-        /// Like `new`, but `reply` may fail as the network would.
-        pub(crate) fn failing(reply: impl Fn(&Sent) -> Reply + 'static) -> Self {
-            Fake {
-                reply: Box::new(reply),
-                sent: RefCell::new(Vec::new()),
+            Err(e) => {
+                if e.may_have_applied() {
+                    self.spent_cents = self.spent_cents.saturating_add(starts.price);
+                    starts.open = false;
+                }
+                Err(e.into())
             }
-        }
-
-        pub(crate) fn sent(&self) -> Vec<Sent> {
-            self.sent.borrow().clone()
-        }
-    }
-
-    impl Transport for Fake {
-        fn send(
-            &self,
-            method: &str,
-            url: &str,
-            headers: &[(&str, &str)],
-            body: Option<&[u8]>,
-        ) -> Result<Response, NetworkError> {
-            let sent = Sent {
-                method: method.to_string(),
-                url: url.to_string(),
-                headers: headers
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-                body: body.map(<[u8]>::to_vec),
-            };
-            let resp = (self.reply)(&sent);
-            self.sent.borrow_mut().push(sent);
-            resp
-        }
-    }
-
-    pub(crate) fn respond(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
-        Response {
-            status,
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: body.as_bytes().to_vec(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{Fake, Reply, Sent, respond};
     use super::*;
     use crate::decide::decide;
     use crate::model::{Placement, QueuedJob};
+    use crate::transport::fake::{Fake, Reply, Sent, respond};
+    use crate::transport::{NetworkError, Response};
 
     const BOAT: &str = "https://boat.dev/api/v1";
     const GH: &str = "https://api.github.com/repos/o/r/actions";
@@ -1227,6 +1101,8 @@ mod tests {
         // A mount that never settles stops the start instead of running a job on it, and
         // leaves no jit config behind.
         assert_eq!(wait_for_home(u32::MAX), (false, 300, false));
+        assert!(WAIT_FOR_HOME.contains("-lt 300 ]") && WAIT_FOR_HOME.contains("sleep 2;"));
+        assert_eq!(HOME_WAIT_S, 300 * 2);
         assert!(start_command(1).starts_with(&format!(
             "set -eu; f=/home/user/.sbr-jit-1; {WAIT_FOR_HOME}; chmod 600 \"$f\" || true; "
         )));
@@ -1286,6 +1162,35 @@ mod tests {
         assert_eq!(resumes, 1);
         assert!(!reqs.contains(&format!("POST {BOAT}/sandboxes")));
         assert_eq!(tick_loop.spent_cents, 100);
+    }
+
+    /// The resume timed out after boat may have started, and charged for, the machine.
+    #[test]
+    fn a_resume_without_an_answer_counts_its_quote_and_closes_starts() {
+        let cfg = config();
+        let fake = Fake::failing(|s| {
+            if s.url.ends_with("/resume") {
+                Err(NetworkError("timed out reading response".into()))
+            } else {
+                Ok(reply(s))
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop
+            .tick(NOW, |_, _| {
+                vec![
+                    Action::Resume {
+                        machine: "bx_33333333".into(),
+                    },
+                    Action::Fork {
+                        pool: "ci".into(),
+                        job: Some(JobKey { id: 70, attempt: 1 }),
+                    },
+                ]
+            })
+            .unwrap();
+        assert!(forks(&fake).is_empty(), "{:?}", requests(&fake));
+        assert_eq!(tick_loop.spent_cents, 125);
     }
 
     #[test]
@@ -1658,6 +1563,49 @@ mod tests {
         );
     }
 
+    const ARCHIVED_33: &str =
+        r#"{"id":"bx_33333333","state":"archived","labels":{"sw-boat-runner":"ci"}}"#;
+    const RESUMING_33: &str =
+        r#"{"id":"bx_33333333","state":"provisioning","labels":{"sw-boat-runner":"ci"}}"#;
+
+    fn resumes(fake: &Fake) -> usize {
+        requests(fake)
+            .iter()
+            .filter(|r| r.ends_with("/resume"))
+            .count()
+    }
+
+    /// boat still lists the resumed machine as archived on the next ticks. Until it lists
+    /// the resume or the listing window passes, the machine counts as Starting: it is not
+    /// resumed again, and it holds the pool's one box, so job 71 gets no fork.
+    #[test]
+    fn a_resume_boat_has_not_listed_is_not_resumed_again() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume, Placement::Fork];
+        cfg.pools[0].slots_per_box = 1;
+        cfg.pools[0].max_boxes = 1;
+        let fake = lagging(
+            |t| if t < 4 { ARCHIVED_33 } else { RESUMING_33 },
+            |_| JOBS_70_71,
+        );
+        let mut tick_loop = started(&cfg, &fake);
+        for k in 0..4 {
+            tick_loop.tick(NOW + 15 * k, decide).unwrap();
+        }
+        assert_eq!((resumes(&fake), forks(&fake).len()), (1, 0));
+        assert!(tick_loop.resumed.is_empty());
+
+        // A resume boat never lists is forgotten after the window, like a fork.
+        let fake = lagging(|_| ARCHIVED_33, |_| JOB_70);
+        let mut tick_loop = started(&cfg, &fake);
+        let lag_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop.tick(NOW + lag_s, decide).unwrap();
+        assert_eq!(resumes(&fake), 1);
+        tick_loop.tick(NOW + lag_s + 1, decide).unwrap();
+        assert_eq!(resumes(&fake), 2);
+    }
+
     #[test]
     fn a_pending_fork_clears_once_boat_lists_it() {
         let cfg = config();
@@ -1840,7 +1788,16 @@ mod tests {
         let job = JobKey { id: 9, attempt: 3 };
         assert_eq!(parse_job_label(&job_label(job)), Some(job));
         assert_eq!(parse_job_label("9"), None);
+    }
+
+    /// Only a start boat quotes at exactly 0 is included; a fraction of a cent is paid.
+    #[test]
+    fn cents_never_round_a_paid_start_to_free() {
         assert_eq!(cents(Some(0.29)), 29);
+        assert_eq!(cents(Some(0.07)), 7);
+        assert_eq!(cents(Some(0.004)), 1);
+        assert_eq!(cents(Some(0.0)), 0);
+        assert_eq!(cents(Some(-1.0)), 0);
         assert_eq!(cents(None), 0);
     }
 }
