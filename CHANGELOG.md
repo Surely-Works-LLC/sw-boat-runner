@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-11
+
 ### Added
 
 - `sw-boat-runner setup`: writes a policy, creates a GitHub App from a manifest (or takes
@@ -91,4 +93,6 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/releases/tag/v0.1.0
