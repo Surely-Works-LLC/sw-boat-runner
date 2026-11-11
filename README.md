@@ -89,6 +89,9 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to stop using them
    ```
 
+   `check` also warns on stderr about a pool whose `register_timeout_s` is 600 or less.
+   `sw-boat-runner --help` lists the commands and `--version` prints the version.
+
    `plan policy.toml snapshot.json` plans for a saved snapshot instead, with no
    credentials; [tests/scenarios](tests/scenarios/) has snapshots to start from.
 
@@ -119,7 +122,8 @@ another runner.
 
 ## Policy
 
-`repo` and `tick_s` (default 15) sit at the top level. Each `[[pool]]` takes:
+`repo` (`owner/name`; neither part may be `.` or `..`) and `tick_s` (default 15) sit at
+the top level. Each `[[pool]]` takes:
 
 | Field | Default | Meaning |
 | - | - | - |
@@ -134,7 +138,7 @@ another runner.
 | `slots_per_box` | 1 | Runners per kept machine. |
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
-| `register_timeout_s` | 300 | How long a registered runner may take to come online. A new machine's runner first waits up to 10 minutes for boat to copy the snapshot to its disk, and a runner still waiting at the timeout is unregistered. 300 suits a snapshot that copies in well under 5 minutes; for a larger one, set 900. |
+| `register_timeout_s` | 900 | How long a registered runner may take to come online; after it, the runner is unregistered. A new machine's runner first waits up to 600 s for boat to copy the snapshot to its disk, then boots, so `check` warns at 600 or less. Lower it only for a small snapshot that copies quickly. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only starts the plan includes. |
 
