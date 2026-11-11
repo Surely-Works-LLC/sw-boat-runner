@@ -20,6 +20,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   outlast.
 - A reusable `runners` workflow that runs the daemon for one workflow run, and an install
   script for a daemon on a small boat machine.
+- A GitHub request budget: on a busy repository the daemon paces its reads to stay
+  inside the token's hourly rate limit.
 - A TLA+ model of the daemon's safety and liveness rules, checked with TLC.
 
 ### Fixed
