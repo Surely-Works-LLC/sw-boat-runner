@@ -1,7 +1,7 @@
 ----------------------------- MODULE BoatRunner -----------------------------
 (***************************************************************************)
 (* One sw-boat-runner pool: GitHub's queue and runners, boat's machines,   *)
-(* and the daemon of docs/design.md as src/decide.rs and src/run.rs        *)
+(* and the daemon of docs/design.md as src/decide.rs and src/run/          *)
 (* implement it. Stop and Delete are decided from one snapshot and         *)
 (* executed later, because run::execute does not look again; every other   *)
 (* daemon action reads the current state. The Fix* constants switch on the *)

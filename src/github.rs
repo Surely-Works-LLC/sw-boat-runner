@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::boat;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
-use crate::transport::Transport;
+use crate::transport::{Transport, redact};
 
 pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
@@ -42,6 +42,17 @@ pub enum Error {
 impl Error {
     pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::Unauthorized { .. })
+    }
+
+    /// This error with every copy of `secret` in its text replaced.
+    fn redact(mut self, secret: &str) -> Self {
+        match &mut self {
+            Error::Network(text) | Error::Status { message: text, .. } | Error::Parse(text) => {
+                redact(text, secret)
+            }
+            Error::RateLimited { .. } | Error::Unauthorized { .. } | Error::NotFound => {}
+        }
+        self
     }
 }
 
@@ -168,12 +179,19 @@ impl<'t> Client<'t> {
         }
     }
 
+    /// The one request path: auth, the rate-limit floor, ETag reuse and status mapping.
+    /// No error carries the token.
     fn request(
         &mut self,
         method: &str,
         path: &str,
         body: Option<&Value>,
     ) -> Result<Vec<u8>, Error> {
+        let result = self.send(method, path, body);
+        result.map_err(|e| e.redact(&self.token))
+    }
+
+    fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Vec<u8>, Error> {
         if let Some((remaining, reset)) = self.limited {
             if self.now < reset {
                 return Err(Error::RateLimited { remaining, reset });
@@ -206,11 +224,10 @@ impl<'t> Client<'t> {
             .send(method, &url, &headers, bytes.as_deref())
             .map_err(|e| Error::Network(e.0))?;
 
-        let num = |name: &str| resp.header(name).and_then(|v| v.trim().parse::<u64>().ok());
-        let remaining = num("x-ratelimit-remaining");
-        let retry_after = num("retry-after");
+        let remaining = resp.number("x-ratelimit-remaining");
+        let retry_after = resp.number("retry-after");
         let a_minute = self.now.saturating_add(60);
-        let reset = num("x-ratelimit-reset").unwrap_or(a_minute);
+        let reset = resp.number("x-ratelimit-reset").unwrap_or(a_minute);
         if let Some(r) = remaining.filter(|&r| r < RATE_FLOOR) {
             self.limited = Some((r, reset));
         }
@@ -584,6 +601,12 @@ mod tests {
                 },
             ]
         );
+        let run_5 = fake
+            .sent()
+            .iter()
+            .filter(|s| s.url.contains("/runs/5/jobs"))
+            .count();
+        assert_eq!(run_5, 1);
     }
 
     #[test]

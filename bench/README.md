@@ -48,7 +48,7 @@ the queue columns as waiting until the simulation ends, four hours after the day
 at a full limit. boat counts starts over rolling windows. The bench counts them per clock
 minute, hour and day, which reproduces the daily bill of the worked example on boat's CI
 page. Faults are not modelled: the mocked boat and GitHub answer every call, and boat
-lists a machine as soon as it is created. The TLA+ model and the tests in `src/run.rs`
+lists a machine as soon as it is created. The TLA+ model and the tests in `src/run/`
 cover those.
 
 Pushes arrive as a Poisson process, six times as often from 08:00 to 20:00 UTC as at
