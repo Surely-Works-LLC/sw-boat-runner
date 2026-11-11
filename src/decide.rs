@@ -893,6 +893,7 @@ mod tests {
         }
 
         proptest! {
+            /// Spec `NoBusyStop`: no `Stop` or `Delete` of a machine with a `Busy` runner.
             #[test]
             fn no_busy_stop(snap in arb_snapshot(), pool in arb_pool()) {
                 for a in decide(&snap, &pool) {
@@ -906,6 +907,7 @@ mod tests {
                 }
             }
 
+            /// Spec `MaxBoxes`: starts never take the pool past `max_boxes`.
             #[test]
             fn max_boxes(snap in arb_snapshot(), pool in arb_pool()) {
                 let started = starts(&decide(&snap, &pool));
@@ -917,6 +919,7 @@ mod tests {
                 prop_assert!(started == 0 || boxes + started <= pool.max_boxes as usize);
             }
 
+            /// Spec `StartBudget`: starts stay within the quote and the daily cap.
             #[test]
             fn start_budget(snap in arb_snapshot(), pool in arb_pool()) {
                 let started = starts(&decide(&snap, &pool)) as u64;
@@ -931,7 +934,7 @@ mod tests {
                 }
             }
 
-            /// NoDoubleFork, for job forks; a kept fork carries no job.
+            /// Spec `NoDoubleFork`, for job forks; a kept fork carries no job.
             #[test]
             fn no_double_fork(snap in arb_snapshot(), pool in arb_pool()) {
                 let mut taken: BTreeSet<JobKey> = snap
@@ -947,10 +950,11 @@ mod tests {
                 }
             }
 
-            /// Settles: with nothing queued, nothing is registered or forked for a job, and
-            /// a resume or kept fork only brings the pool's kept machines up to `min_up`.
+            /// Spec `Settles`, first half: with nothing queued, nothing is registered or
+            /// forked for a job, and a resume or kept fork only brings the pool's kept
+            /// machines up to `min_up`.
             #[test]
-            fn no_queue_no_starts(mut snap in arb_snapshot(), pool in arb_pool()) {
+            fn settles_with_nothing_queued(mut snap in arb_snapshot(), pool in arb_pool()) {
                 snap.queued.clear();
                 let mut held = snap
                     .machines
@@ -969,7 +973,7 @@ mod tests {
                 }
             }
 
-            /// MinUp: with starts allowed and free, a pool ends the tick with `min_up` kept
+            /// `min_up` (spec `Short` in `ResumeGuard` and `ForkKeptGuard`): with starts allowed and free, a pool ends the tick with `min_up` kept
             /// machines up, starting, or (in a pool that can resume) stopping, as far as
             /// `max_boxes` leaves room.
             #[test]
@@ -1004,9 +1008,10 @@ mod tests {
                 prop_assert!(held + brought + stopping >= reachable);
             }
 
-            /// A settled pool, every action of the last tick applied, gets no more actions.
+            /// Spec `Settles`, second half: a settled pool, every action of the last tick
+            /// applied, gets no more actions.
             #[test]
-            fn applied_tick_settles(pool in arb_pool(), up in 0u32..5, idle in 0u64..200) {
+            fn settles_once_applied(pool in arb_pool(), up in 0u32..5, idle in 0u64..200) {
                 // Machines above min_up are settled only while they have been busy recently,
                 // and a pool without slot keeps no kept machine at all.
                 let up = if !pool.placement.contains(&Placement::Slot) {
@@ -1037,11 +1042,12 @@ mod tests {
                 prop_assert!(actions.is_empty(), "{actions:?}");
             }
 
-            /// NoLeak for kept machines: a pool without slot never registers a runner on
-            /// one, so it deletes every kept machine that is up or starting and holds no
-            /// busy or registered runner, and leaves the others.
+            /// Spec `NoLeak` for kept machines (the last clause of `DeleteGuard`): a pool
+            /// without slot never registers a runner on one, so it deletes every kept
+            /// machine that is up or starting and holds no busy or registered runner, and
+            /// leaves the others.
             #[test]
-            fn a_pool_without_slot_keeps_no_unused_kept_machine(
+            fn no_leak_of_kept_machines(
                 snap in arb_snapshot(),
                 pool in arb_pool(),
             ) {
@@ -1057,6 +1063,7 @@ mod tests {
                 }
             }
 
+            /// Spec `UnregisterGuard`: an `Idle` or `Busy` runner on an `Up` machine stays.
             #[test]
             fn unregister_spares_healthy_runners(snap in arb_snapshot(), pool in arb_pool()) {
                 for a in decide(&snap, &pool) {
@@ -1070,6 +1077,7 @@ mod tests {
                 }
             }
 
+            /// Not in the spec, which models one pool: a pool acts only on its own.
             #[test]
             fn actions_stay_in_their_pool(snap in arb_snapshot(), pool in arb_pool()) {
                 for a in decide(&snap, &pool) {
@@ -1090,11 +1098,11 @@ mod tests {
                 }
             }
 
-            /// Register only fills a free slot on an `Up` machine, and an ephemeral machine
-            /// only once (EphemeralIsolation). A slot is free on a kept machine when every
-            /// runner in it is unregistered in the same tick.
+            /// Spec `EphemeralIsolation` and `ForkIsolation`: a `Register` fills only a
+            /// free slot of an `Up` machine, and an ephemeral machine only once. A slot is
+            /// free on a kept machine when every runner in it is unregistered this tick.
             #[test]
-            fn register_fills_free_slots(snap in arb_snapshot(), pool in arb_pool()) {
+            fn ephemeral_isolation(snap in arb_snapshot(), pool in arb_pool()) {
                 let actions = decide(&snap, &pool);
                 let gone = |name: &str| {
                     actions
@@ -1119,6 +1127,72 @@ mod tests {
                 }
             }
 
+            /// Spec `NoLeak`: every ephemeral machine whose job finished (spec `Finished`)
+            /// or that is past `fork_ttl_s` is deleted, unless a runner on it is `Busy`;
+            /// no other ephemeral machine is.
+            #[test]
+            fn no_leak(snap in arb_snapshot(), pool in arb_pool()) {
+                let actions = decide(&snap, &pool);
+                let own = snap.machines.iter().filter(|m| m.pool == pool.name);
+                for m in own.filter(|m| m.job.is_some() && m.state != Ms::Gone) {
+                    let mut on = snap.runners.iter().filter(|r| r.machine == m.id);
+                    let busy = on.clone().any(|r| r.state == Rs::Busy);
+                    let age = snap.now.saturating_sub(m.since);
+                    let finished = match m.state {
+                        Ms::Stopped => true,
+                        Ms::Up => {
+                            on.all(|r| r.state == Rs::Offline)
+                                && (m.last_busy >= m.since || age > pool.register_timeout_s)
+                        }
+                        _ => false,
+                    };
+                    let leaked = finished || age > pool.fork_ttl_s;
+                    let deleted = actions.contains(&Action::Delete { machine: m.id.clone() });
+                    prop_assert_eq!(deleted, leaked && !busy, "{:?}", m);
+                }
+            }
+
+            /// Spec `IdleStops`: with nothing queued, a pool with resume stops idle kept
+            /// machines, those up for `min_up_s` and idle for `idle_stop_s` with no `Busy`
+            /// or `Registered` runner, until `min_up` are left up.
+            #[test]
+            fn idle_stops(mut snap in arb_snapshot(), pool in arb_pool()) {
+                prop_assume!(pool.placement.contains(&Placement::Resume));
+                snap.queued.clear();
+                let kept_up: Vec<&Machine> = snap
+                    .machines
+                    .iter()
+                    .filter(|m| m.pool == pool.name && m.job.is_none() && m.state == Ms::Up)
+                    .collect();
+                let idle = kept_up.iter().filter(|m| {
+                    let held = snap.runners.iter().any(|r| {
+                        r.machine == m.id && matches!(r.state, Rs::Busy | Rs::Registered)
+                    });
+                    !held
+                        && snap.now.saturating_sub(m.last_busy) >= pool.idle_stop_s
+                        && snap.now.saturating_sub(m.since) >= pool.min_up_s
+                });
+                let above = kept_up.len().saturating_sub(pool.min_up as usize);
+                let stops = decide(&snap, &pool)
+                    .iter()
+                    .filter(|a| matches!(a, Action::Stop { .. }))
+                    .count();
+                prop_assert_eq!(stops, idle.count().min(above));
+            }
+
+            /// Spec `NoStarvation`, for one tick: a pool with no machine, budget and room
+            /// starts one for a queued job it serves when `fork` or `resume` allows it.
+            #[test]
+            fn no_starvation(mut snap in arb_snapshot(), pool in arb_pool()) {
+                prop_assume!(pool.placement.contains(&Placement::Fork)
+                    || pool.placement.contains(&Placement::Resume));
+                snap.machines.clear();
+                snap.limits = Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None };
+                prop_assume!(snap.queued.iter().any(|j| pool.serves(&j.labels)));
+                prop_assert!(starts(&decide(&snap, &pool)) > 0);
+            }
+
+            /// Not in the spec, which has no input order: the snapshot's order is ignored.
             #[test]
             fn input_order_does_not_matter(snap in arb_snapshot(), pool in arb_pool()) {
                 let mut reversed = snap.clone();
