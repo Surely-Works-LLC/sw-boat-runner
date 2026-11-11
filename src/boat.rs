@@ -253,6 +253,11 @@ impl<'t> Client<'t> {
 
     /// Every sandbox of `pool`, in any state, following `pageInfo.nextCursor`.
     pub(crate) fn list(&self, pool: &str) -> Result<Vec<Sandbox>, Error> {
+        self.list_labelled(POOL_LABEL, pool)
+    }
+
+    /// Every sandbox labelled `key=value`, in any state, following `pageInfo.nextCursor`.
+    pub(crate) fn list_labelled(&self, key: &str, value: &str) -> Result<Vec<Sandbox>, Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
@@ -265,7 +270,7 @@ impl<'t> Client<'t> {
             next_cursor: Option<String>,
             has_more: bool,
         }
-        let label = encode(&format!("{POOL_LABEL}={pool}"));
+        let label = encode(&format!("{key}={value}"));
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
@@ -284,7 +289,7 @@ impl<'t> Client<'t> {
         Err(Error::Other {
             status: 0,
             code: "too_many_pages".into(),
-            message: format!("more than {MAX_PAGES} pages of sandboxes for pool {pool}"),
+            message: format!("more than {MAX_PAGES} pages of sandboxes labelled {key}={value}"),
         })
     }
 
@@ -531,6 +536,15 @@ impl Client<'_> {
     pub(crate) fn save_snapshot(&self, sandbox: &str, name: &str) -> Result<(), Error> {
         let body = json!({ "sandboxId": sandbox, "name": name });
         self.send("POST", "/saved-snapshots", &body)
+    }
+
+    /// Removes the saved snapshot called `name`; one already gone counts as removed.
+    pub(crate) fn delete_saved_snapshot(&self, name: &str) -> Result<(), Error> {
+        let path = format!("/saved-snapshots/{}", encode(name));
+        match self.call::<IgnoredAny>("DELETE", &path, None, &[]) {
+            Ok(_) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Saved snapshots, newest first; only the one called `name` when given.

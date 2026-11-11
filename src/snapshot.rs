@@ -8,6 +8,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::boat::{self, Client, Detail, SavedSnapshot};
@@ -18,6 +20,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Label of the fork, so a leftover one is easy to find. Not the pool label: the daemon
 /// must never adopt it.
 const FORK_LABEL: &str = "sw-boat-runner-snapshot";
+/// Label holding this run's id, so a fork whose create got no answer can be found.
+const RUN_LABEL: &str = "sw-boat-runner-snapshot-run";
+/// Prefix of the name a replacement is first saved under, to measure it.
+const TEMP_PREFIX: &str = "sbr-tmp-";
+const INTERRUPTED: &str = "interrupted";
 /// The fork stops itself after this even if this process dies.
 const FORK_TTL_S: u64 = 4 * 3600;
 const POLL: Duration = Duration::from_secs(5);
@@ -120,13 +127,41 @@ pub(crate) trait Io {
     fn say(&mut self, line: &str);
     /// A yes/no question; anything but a yes is a no.
     fn confirm(&mut self, question: &str) -> bool;
+    /// True once a SIGINT or SIGTERM asked the command to stop.
+    fn interrupted(&self) -> bool;
 }
 
-struct Terminal;
+struct Terminal {
+    stop: Arc<AtomicBool>,
+}
+
+impl Terminal {
+    /// Catches SIGINT and SIGTERM so the fork is deleted before exiting; a second
+    /// signal exits at once.
+    fn new() -> Terminal {
+        let stop = Arc::new(AtomicBool::new(false));
+        for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+            // The shutdown hook goes first, so it sees the flag unset on the first signal.
+            let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
+            let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+        }
+        Terminal { stop }
+    }
+}
 
 impl Io for Terminal {
     fn sleep(&mut self, d: Duration) {
-        std::thread::sleep(d);
+        let step = Duration::from_millis(200);
+        let mut left = d;
+        while !left.is_zero() && !self.interrupted() {
+            let s = left.min(step);
+            std::thread::sleep(s);
+            left -= s;
+        }
+    }
+
+    fn interrupted(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
     }
 
     fn say(&mut self, line: &str) {
@@ -154,7 +189,7 @@ pub fn run(opts: &Options) -> Result<bool, String> {
         .filter(|k| !k.is_empty())
         .ok_or("BOAT_API_KEY is not set")?;
     let transport = Ureq::new(HTTP_TIMEOUT);
-    snapshot(&transport, key, opts, &mut Terminal)
+    snapshot(&transport, key, opts, &mut Terminal::new())
 }
 
 pub(crate) fn snapshot(
@@ -164,10 +199,11 @@ pub(crate) fn snapshot(
     io: &mut dyn Io,
 ) -> Result<bool, String> {
     let boat = Client::new(t, key);
-    let labels = BTreeMap::from([(FORK_LABEL, opts.name.clone())]);
-    let idempotency_key = format!("sw-boat-runner-snapshot-{}", uuid::Uuid::new_v4());
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let labels = BTreeMap::from([(FORK_LABEL, opts.name.clone()), (RUN_LABEL, run_id.clone())]);
+    let idempotency_key = format!("sw-boat-runner-snapshot-{run_id}");
     io.say(&format!("forking {} with noEnv", opts.source));
-    let fork = retry(io, "fork", |_| {
+    let fork = match retry(io, "fork", |_| {
         boat.fork_sandbox(
             &opts.source,
             opts.machine_type.as_deref(),
@@ -175,13 +211,19 @@ pub(crate) fn snapshot(
             FORK_TTL_S,
             &idempotency_key,
         )
-    })?;
+    }) {
+        Ok(fork) => fork,
+        Err(e) => {
+            delete_lost_forks(&boat, &run_id, io);
+            return Err(e);
+        }
+    };
     io.say(&format!("fork {fork}"));
     let result = inspect_and_save(&boat, &fork, opts, io);
     if opts.keep_fork {
         io.say(&format!("keeping fork {fork}"));
     } else {
-        match retry(io, "delete fork", |_| boat.delete(&fork)) {
+        match cleanup_retry(io, "delete fork", |_| boat.delete(&fork)) {
             Ok(()) => io.say(&format!("deleted fork {fork}")),
             Err(e) => io.say(&format!(
                 "could not delete fork {fork}: {e}; delete it by hand"
@@ -189,6 +231,31 @@ pub(crate) fn snapshot(
         }
     }
     result
+}
+
+/// After a fork call that failed without a definite answer, or was interrupted, deletes
+/// any fork this run made anyway.
+fn delete_lost_forks(boat: &Client, run_id: &str, io: &mut dyn Io) {
+    let by_hand =
+        format!("look for sandboxes labelled {RUN_LABEL}={run_id} and delete them by hand");
+    let forks = match cleanup_retry(io, "list forks", |_| boat.list_labelled(RUN_LABEL, run_id)) {
+        Ok(forks) => forks,
+        Err(e) => {
+            io.say(&format!(
+                "could not check for a leftover fork ({e}); {by_hand}"
+            ));
+            return;
+        }
+    };
+    for f in forks {
+        match cleanup_retry(io, "delete fork", |_| boat.delete(&f.id)) {
+            Ok(()) => io.say(&format!("deleted leftover fork {}", f.id)),
+            Err(e) => io.say(&format!(
+                "could not delete leftover fork {}: {e}; {by_hand}",
+                f.id
+            )),
+        }
+    }
 }
 
 fn inspect_and_save(
@@ -238,7 +305,8 @@ fn inspect_and_save(
     let existing = retry(io, "list saved snapshots", |_| {
         boat.saved_snapshots(Some(&opts.name))
     })?;
-    if existing.iter().any(|s| s.name == opts.name)
+    let replacing = existing.iter().any(|s| s.name == opts.name);
+    if replacing
         && !opts.yes
         && !io.confirm(&format!(
             "a saved snapshot called {} exists; replace it?",
@@ -248,36 +316,111 @@ fn inspect_and_save(
         io.say("nothing saved");
         return Ok(false);
     }
+    if io.interrupted() {
+        return Err(INTERRUPTED.into());
+    }
+    if replacing {
+        // boat replaces a name as soon as the new save is ready, so the real size is
+        // measured under a name of its own before the old snapshot is touched.
+        let temp = temp_name();
+        io.say(&format!("saving {fork} as {temp} first, to measure it"));
+        let measured = save(boat, fork, &temp, io).map(|s| fits(&temp, &s, &machine_type, io));
+        if measured != Ok(true) {
+            if measured == Ok(false) {
+                io.say(&format!("{} left as it was", opts.name));
+            }
+            delete_saved(boat, &temp, io);
+            return measured;
+        }
+        io.say(&format!("saving {fork} as {}", opts.name));
+        let saved = save(boat, fork, &opts.name, io);
+        delete_saved(boat, &temp, io);
+        return saved.map(|s| fits(&opts.name, &s, &machine_type, io));
+    }
     io.say(&format!("saving {fork} as {}", opts.name));
     let saved = save(boat, fork, &opts.name, io)?;
+    Ok(fits(&opts.name, &saved, &machine_type, io))
+}
+
+/// A name no one else uses: the temporary prefix and 12 random hex digits.
+fn temp_name() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("{TEMP_PREFIX}{}", &id[..12])
+}
+
+/// Prints the size boat reports for the saved `name`; false when it is larger than
+/// `machine_type` can start.
+fn fits(name: &str, saved: &SavedSnapshot, machine_type: &str, io: &mut dyn Io) -> bool {
     let size = saved.size_bytes;
     io.say(&format!(
-        "saved {} ({})",
-        opts.name,
+        "saved {name} ({})",
         size.map_or("size unknown".into(), gb)
     ));
-    if let (Some(size), Some(budget)) = (size, boat::disk_budget_bytes(&machine_type)) {
+    if let (Some(size), Some(budget)) = (size, boat::disk_budget_bytes(machine_type)) {
         if size > budget {
             io.say(&format!(
                 "FAIL  the saved snapshot is larger than {machine_type}'s {} disk; \
                  boat will refuse to start it there (409 deploy_failed)",
                 gb(budget)
             ));
-            return Ok(false);
+            return false;
         }
     }
-    Ok(true)
+    true
+}
+
+fn delete_saved(boat: &Client, name: &str, io: &mut dyn Io) {
+    match cleanup_retry(io, "delete saved snapshot", |_| {
+        boat.delete_saved_snapshot(name)
+    }) {
+        Ok(()) => io.say(&format!("deleted saved snapshot {name}")),
+        Err(e) => io.say(&format!(
+            "could not delete saved snapshot {name}: {e}; delete it by hand"
+        )),
+    }
+}
+
+/// Sleeps; `Err` once a signal asked the command to stop.
+fn pause(io: &mut dyn Io, d: Duration) -> Result<(), String> {
+    io.sleep(d);
+    if io.interrupted() {
+        Err(INTERRUPTED.into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Calls `f` again after a refusal, an answerless failure (with the same idempotency
 /// key, for a create), or a conflict boat calls temporary.
+/// Stops early once a signal asked the command to stop.
 fn retry<T>(
     io: &mut dyn Io,
     what: &str,
+    f: impl FnMut(u32) -> Result<T, boat::Error>,
+) -> Result<T, String> {
+    retry_inner(io, what, true, f)
+}
+
+/// `retry` for cleaning up, which a signal does not stop.
+fn cleanup_retry<T>(
+    io: &mut dyn Io,
+    what: &str,
+    f: impl FnMut(u32) -> Result<T, boat::Error>,
+) -> Result<T, String> {
+    retry_inner(io, what, false, f)
+}
+
+fn retry_inner<T>(
+    io: &mut dyn Io,
+    what: &str,
+    stoppable: bool,
     mut f: impl FnMut(u32) -> Result<T, boat::Error>,
 ) -> Result<T, String> {
     let mut attempt = 0;
     loop {
+        if stoppable && io.interrupted() {
+            return Err(format!("{what}: {INTERRUPTED}"));
+        }
         let wait = match f(attempt) {
             Ok(v) => return Ok(v),
             Err(boat::Error::Refused { retry_after_s, .. }) => {
@@ -314,7 +457,9 @@ fn wait_until_hydrated(boat: &Client, fork: &str, io: &mut dyn Io) -> Result<Det
                 return Err(format!("fork {fork} is {}", d.state));
             }
             crate::model::MachineState::Up => {
-                if d.hydrated != Some(false) {
+                // A missing `hydrated` is not taken as done: `du` would measure a
+                // half-copied disk.
+                if d.hydrated == Some(true) {
                     return Ok(d);
                 }
                 let percent = d.hydration.as_ref().and_then(|h| h.percent);
@@ -336,7 +481,7 @@ fn wait_until_hydrated(boat: &Client, fork: &str, io: &mut dyn Io) -> Result<Det
             _ => {}
         }
         polls += 1;
-        io.sleep(POLL);
+        pause(io, POLL)?;
     }
 }
 
@@ -354,7 +499,7 @@ fn exec(boat: &Client, fork: &str, script: &str, io: &mut dyn Io) -> Result<Stri
         })
     })?;
     for _ in 0..EXEC_POLLS {
-        io.sleep(POLL);
+        pause(io, POLL)?;
         let st = retry(io, "read command", |_| boat.command_status(fork, pid))?;
         if st.running {
             continue;
@@ -387,13 +532,14 @@ fn save(boat: &Client, fork: &str, name: &str, io: &mut dyn Io) -> Result<SavedS
         }
     })?;
     for _ in 0..SAVE_POLLS {
-        io.sleep(POLL);
+        pause(io, POLL)?;
         let list = retry(io, "list saved snapshots", |_| {
             boat.saved_snapshots(Some(name))
         })?;
-        let Some(s) = list.into_iter().find(|s| {
-            s.name == name && s.source_sandbox_id.as_deref().is_none_or(|src| src == fork)
-        }) else {
+        let Some(s) = list
+            .into_iter()
+            .find(|s| s.name == name && s.source_sandbox_id.as_deref() == Some(fork))
+        else {
             continue;
         };
         match s.status.as_str() {
@@ -420,8 +566,10 @@ t() { printf '%s\t%s\n' "$1" "$2"; }
 [ -f "$R/run.sh" ] && t run_sh "$R/run.sh"
 for f in .runner .credentials .credentials_rsaparams; do [ -e "$R/$f" ] && t runner_config "$R/$f"; done
 for l in /etc/systemd/system/*.wants/actions.runner.* $H/.config/systemd/user/*.wants/actions.runner.*; do [ -e "$l" ] || [ -L "$l" ] && t unit "$l"; done
-for f in $H/.config/gh/hosts.yml $H/.git-credentials $H/.codex/auth.json $H/.claude/.credentials.json $H/.netrc; do [ -s "$f" ] && t cred "$f"; done
+for f in $H/.config/gh/hosts.yml $H/.git-credentials $H/.codex/auth.json $H/.claude/.credentials.json $H/.netrc $H/.aws/credentials $H/.config/gcloud/credentials.db $H/.config/gcloud/access_tokens.db $H/.config/gcloud/application_default_credentials.json $H/.config/gcloud/legacy_credentials/*/*; do [ -s "$f" ] && t cred "$f"; done
 for f in $H/.ssh/id_*; do case "$f" in *.pub) ;; *) [ -f "$f" ] && t cred "$f" ;; esac; done
+N=$H/.npmrc
+[ -f "$N" ] && grep -Eq '_auth|_password' "$N" && t cred "$N"
 D=$H/.docker/config.json
 [ -f "$D" ] && tr -d ' \t\r\n' < "$D" | grep -Eq '"(auth|identitytoken)":"[^"]' && t cred "$D"
 [ -f "$R/.env" ] && t env_file "$R/.env"
@@ -789,10 +937,18 @@ mod tests {
         said: Vec<String>,
         answers: VecDeque<bool>,
         asked: Vec<String>,
+        sleeps: u32,
+        /// A signal arrives during this sleep.
+        interrupt_at: Option<u32>,
     }
 
     impl Io for TestIo {
-        fn sleep(&mut self, _: Duration) {}
+        fn sleep(&mut self, _: Duration) {
+            self.sleeps += 1;
+        }
+        fn interrupted(&self) -> bool {
+            self.interrupt_at.is_some_and(|n| self.sleeps >= n)
+        }
         fn say(&mut self, line: &str) {
             self.said.push(line.to_string());
         }
@@ -833,16 +989,22 @@ mod tests {
         }
     }
 
-    /// A boat that forks `bx_44444444`, hydrates it on the second read, answers each
+    /// A boat that forks `bx_44444444`, hydrates it on the third read, answers each
     /// check command from `outputs` in turn, and saves.
     struct Boat {
         outputs: RefCell<VecDeque<String>>,
         current: RefCell<String>,
         reads: RefCell<u32>,
-        saved: RefCell<bool>,
+        /// Saved snapshots: name to (source sandbox, size).
+        saved: RefCell<BTreeMap<String, (String, Option<u64>)>>,
         holds: &'static str,
-        existing: bool,
         size: u64,
+        /// `hydrated` once running; `None` leaves the field out.
+        hydrated: Option<&'static str>,
+        /// Reads of a saved name, once saved, that first answer with a ready entry
+        /// without a source.
+        unsourced_reads: RefCell<u32>,
+        fork_fails: bool,
     }
 
     fn boat(outputs: &[&str]) -> Boat {
@@ -850,10 +1012,21 @@ mod tests {
             outputs: RefCell::new(outputs.iter().map(|s| s.to_string()).collect()),
             current: RefCell::new(String::new()),
             reads: RefCell::new(0),
-            saved: RefCell::new(false),
+            saved: RefCell::new(BTreeMap::new()),
             holds: "false",
-            existing: false,
             size: 15_900_000_000,
+            hydrated: Some("true"),
+            unsourced_reads: RefCell::new(0),
+            fork_fails: false,
+        }
+    }
+
+    impl Boat {
+        fn with_existing(self) -> Boat {
+            self.saved
+                .borrow_mut()
+                .insert("ci-2".into(), ("bx_33333333".into(), Some(10_000_000_000)));
+            self
         }
     }
 
@@ -861,9 +1034,17 @@ mod tests {
         let path = s.url.trim_start_matches(boat::BASE);
         let ok = |body: String| Ok(respond(200, &[], &body));
         match (s.method.as_str(), path) {
+            ("POST", "/sandboxes/bx_22222222/fork") if b.fork_fails => {
+                Ok(respond(500, &[], r#"{"ok":false,"error":"oops"}"#))
+            }
             ("POST", "/sandboxes/bx_22222222/fork") => {
                 ok(r#"{"ok":true,"sandbox":{"id":"bx_44444444","state":"provisioning"}}"#.into())
             }
+            ("GET", p) if p.starts_with("/sandboxes?label=sw-boat-runner-snapshot-run%3D") => ok(
+                r#"{"ok":true,"sandboxes":[{"id":"bx_44444444","state":"running"}],
+                    "pageInfo":{"nextCursor":null,"hasMore":false}}"#
+                    .into(),
+            ),
             ("GET", "/sandboxes/bx_44444444") => {
                 let n = {
                     let mut r = b.reads.borrow_mut();
@@ -871,13 +1052,14 @@ mod tests {
                     *r
                 };
                 let (state, hydrated) = match n {
-                    1 => ("provisioning", "false"),
-                    2 => ("running", "false"),
-                    _ => ("running", "true"),
+                    1 => ("provisioning", Some("false")),
+                    2 => ("running", Some("false")),
+                    _ => ("running", b.hydrated),
                 };
+                let hydrated = hydrated.map_or(String::new(), |h| format!(r#""hydrated":{h},"#));
                 ok(format!(
                     r#"{{"ok":true,"sandbox":{{"id":"bx_44444444","state":"{state}",
-                        "type":"large","holdsCreatorLogins":{},"hydrated":{hydrated},
+                        "type":"large","holdsCreatorLogins":{},{hydrated}
                         "hydration":{{"phase":"hydrating","percent":40}}}}}}"#,
                     b.holds
                 ))
@@ -899,25 +1081,37 @@ mod tests {
                 "running": false, "exitCode": 0, "stdout": *b.current.borrow(), "stderr": ""
             })
             .to_string()),
-            ("GET", "/saved-snapshots?name=ci-2") => {
-                let list = if *b.saved.borrow() {
-                    format!(
-                        r#"[{{"name":"ci-2","status":"ready","sourceSandboxId":"bx_44444444",
-                            "sizeBytes":{},"createdAt":"t"}}]"#,
-                        b.size
-                    )
-                } else if b.existing {
-                    r#"[{"name":"ci-2","status":"ready","sourceSandboxId":"bx_33333333",
-                        "createdAt":"t"}]"#
-                        .into()
-                } else {
-                    "[]".into()
+            ("GET", p) if p.starts_with("/saved-snapshots?name=") => {
+                let name = &p["/saved-snapshots?name=".len()..];
+                let list = {
+                    let mut unsourced = b.unsourced_reads.borrow_mut();
+                    if *unsourced > 0 && b.saved.borrow().contains_key(name) {
+                        *unsourced -= 1;
+                        serde_json::json!([{"name": name, "status": "ready"}])
+                    } else {
+                        match b.saved.borrow().get(name) {
+                            Some((src, size)) => serde_json::json!([{
+                                "name": name, "status": "ready", "sourceSandboxId": src,
+                                "sizeBytes": size, "createdAt": "t"
+                            }]),
+                            None => serde_json::json!([]),
+                        }
+                    }
                 };
                 ok(format!(r#"{{"ok":true,"snapshots":{list}}}"#))
             }
             ("POST", "/saved-snapshots") => {
-                *b.saved.borrow_mut() = true;
+                let body: serde_json::Value =
+                    serde_json::from_slice(s.body.as_deref().unwrap()).unwrap();
+                b.saved.borrow_mut().insert(
+                    body["name"].as_str().unwrap().into(),
+                    (body["sandboxId"].as_str().unwrap().into(), Some(b.size)),
+                );
                 Ok(respond(202, &[], r#"{"ok":true,"status":"saving"}"#))
+            }
+            ("DELETE", p) if p.starts_with("/saved-snapshots/") => {
+                b.saved.borrow_mut().remove(&p["/saved-snapshots/".len()..]);
+                ok(r#"{"ok":true,"status":"deleted"}"#.into())
             }
             ("DELETE", "/sandboxes/bx_44444444") => Ok(respond(202, &[], "{}")),
             other => panic!("unexpected call {other:?}"),
@@ -925,11 +1119,18 @@ mod tests {
     }
 
     fn drive(b: Boat, o: &Options, io: &mut TestIo) -> (Result<bool, String>, Vec<Sent>) {
-        let b = Rc::new(b);
-        let b2 = Rc::clone(&b);
+        drive_rc(&Rc::new(b), o, io)
+    }
+
+    fn drive_rc(b: &Rc<Boat>, o: &Options, io: &mut TestIo) -> (Result<bool, String>, Vec<Sent>) {
+        let b2 = Rc::clone(b);
         let fake = Fake::failing(move |s| reply(&b2, s));
         let r = snapshot(&fake, "k".into(), o, io);
         (r, fake.sent())
+    }
+
+    fn saved_source(b: &Boat, name: &str) -> Option<String> {
+        b.saved.borrow().get(name).map(|(src, _)| src.clone())
     }
 
     fn calls(sent: &[Sent]) -> Vec<String> {
@@ -1034,20 +1235,126 @@ mod tests {
     #[test]
     fn replacing_a_name_needs_a_yes() {
         let mut io = TestIo::default();
-        let mut b = boat(&[CLEAN]);
-        b.existing = true;
+        let b = boat(&[CLEAN]).with_existing();
         let (r, sent) = drive(b, &opts(false, false), &mut io);
         assert_eq!(r, Ok(false));
         assert_eq!(io.asked.len(), 1);
         assert!(!calls(&sent).contains(&"POST /saved-snapshots".to_string()));
 
+        // A yes saves under a temporary name, then the real one, and removes the first.
         let mut io = TestIo {
             answers: VecDeque::from([true]),
             ..TestIo::default()
         };
+        let b = Rc::new(boat(&[CLEAN]).with_existing());
+        let (r, sent) = drive_rc(&b, &opts(false, false), &mut io);
+        assert_eq!(r, Ok(true), "{:#?}", io.said);
+        let names: Vec<String> = sent
+            .iter()
+            .filter(|s| s.method == "POST" && s.url.ends_with("/saved-snapshots"))
+            .map(|s| {
+                serde_json::from_str::<serde_json::Value>(&s.body_text()).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].starts_with(TEMP_PREFIX) && valid_name(&names[0]));
+        assert_eq!(names[1], "ci-2");
+        assert!(calls(&sent).contains(&format!("DELETE /saved-snapshots/{}", names[0])));
+        assert_eq!(saved_source(&b, "ci-2").as_deref(), Some("bx_44444444"));
+        assert_eq!(b.saved.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_replacement_leaves_the_old_snapshot() {
+        let mut io = TestIo::default();
+        let mut b = boat(&[CLEAN]).with_existing();
+        b.size = 120_000_000_000;
+        let b = Rc::new(b);
+        let (r, sent) = drive_rc(&b, &opts(false, true), &mut io);
+        assert_eq!(r, Ok(false));
+        assert!(io.said.iter().any(|l| l.contains("deploy_failed")));
+        assert!(io.said.iter().any(|l| l == "ci-2 left as it was"));
+        // Only the temporary name was saved, and it is gone again.
+        let saves = sent
+            .iter()
+            .filter(|s| s.method == "POST" && s.url.ends_with("/saved-snapshots"))
+            .count();
+        assert_eq!(saves, 1);
+        assert!(
+            !sent
+                .iter()
+                .any(|s| s.body_text().contains(r#""name":"ci-2""#))
+        );
+        assert_eq!(saved_source(&b, "ci-2").as_deref(), Some("bx_33333333"));
+        assert_eq!(b.saved.borrow().len(), 1);
+        assert_eq!(
+            calls(&sent).last().unwrap(),
+            "DELETE /sandboxes/bx_44444444"
+        );
+    }
+
+    #[test]
+    fn a_save_without_a_source_is_not_taken_for_ours() {
+        let mut io = TestIo::default();
+        let b = boat(&[CLEAN]);
+        *b.unsourced_reads.borrow_mut() = 3;
+        let (r, _) = drive(b, &opts(false, false), &mut io);
+        assert_eq!(r, Ok(true));
+        assert!(
+            io.said.iter().any(|l| l == "saved ci-2 (15.9 GB)"),
+            "{:#?}",
+            io.said
+        );
+        assert!(!io.said.iter().any(|l| l.contains("size unknown")));
+    }
+
+    #[test]
+    fn a_missing_hydrated_is_not_done() {
+        let mut io = TestIo::default();
         let mut b = boat(&[CLEAN]);
-        b.existing = true;
-        assert_eq!(drive(b, &opts(false, false), &mut io).0, Ok(true));
+        b.hydrated = None;
+        let (r, sent) = drive(b, &opts(false, false), &mut io);
+        assert!(r.unwrap_err().contains("did not finish hydrating"));
+        let calls = calls(&sent);
+        assert!(!calls.iter().any(|c| c.contains("/commands")));
+        assert_eq!(calls.last().unwrap(), "DELETE /sandboxes/bx_44444444");
+    }
+
+    #[test]
+    fn a_signal_deletes_the_fork() {
+        let mut io = TestIo {
+            interrupt_at: Some(1),
+            ..TestIo::default()
+        };
+        let (r, sent) = drive(boat(&[CLEAN]), &opts(false, false), &mut io);
+        assert_eq!(r, Err(INTERRUPTED.into()));
+        let calls = calls(&sent);
+        assert!(!calls.iter().any(|c| c.contains("/commands")));
+        assert_eq!(calls.last().unwrap(), "DELETE /sandboxes/bx_44444444");
+    }
+
+    #[test]
+    fn a_failed_fork_is_looked_up_by_label_and_deleted() {
+        let mut io = TestIo::default();
+        let mut b = boat(&[CLEAN]);
+        b.fork_fails = true;
+        let (r, sent) = drive(b, &opts(false, false), &mut io);
+        assert!(r.unwrap_err().contains("gave up"));
+        let calls = calls(&sent);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("GET /sandboxes?label=sw-boat-runner-snapshot-run%3D"))
+        );
+        assert_eq!(calls.last().unwrap(), "DELETE /sandboxes/bx_44444444");
+        assert!(
+            io.said
+                .iter()
+                .any(|l| l == "deleted leftover fork bx_44444444")
+        );
     }
 
     #[test]
