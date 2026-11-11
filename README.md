@@ -26,6 +26,25 @@ mocked boat and GitHub API. Under the included starts, `runs-on: boat` is cheape
 starts jobs sooner. Past them, its jobs are extra starts at $0.03 to $0.07 each.
 [bench/](bench/) has the assumptions, the other presets and the machine-time cost.
 
+## Setup on a boat machine
+
+On a `small` boat machine (Ubuntu, about $13 a month) with a `--no-env` runner snapshot
+(step 2 below), `setup` does the rest:
+
+```sh
+cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --branch main
+sw-boat-runner setup          # --dry-run prints what it would do; --pat for a personal token
+```
+
+It asks for the repository, labels and snapshot, writes a three-line policy and checks
+it. It then prints a link that creates a private GitHub App with Administration (write)
+and Actions (read) and no webhook, takes back the address GitHub redirects to, prints the
+link to install the App on the repository and waits until it is. It asks for the boat
+key without echo, stores the policy and the keys in `/etc/sw-boat-runner` (keys root
+only), installs the binary and enables a hardened systemd service. Every prompt also
+reads a flag or an environment variable; `sw-boat-runner setup --help` lists them.
+Secrets come only from the environment or a prompt, never from arguments.
+
 ## Connect a repository
 
 The daemon is one process for one repository. It keeps no database and can be restarted
@@ -184,16 +203,25 @@ snapshot is larger than its machine type's disk.
 ## Policy
 
 `repo` (`owner/name`; neither part may be `.` or `..`) and `tick_s` (default 15) sit at
-the top level. Each `[[pool]]` takes:
+the top level. Each `[[pool]]` takes the keys below. A policy with one pool can put them
+at the top level instead, with no `[[pool]]`:
+
+```toml
+repo = "acme/app"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+```
+
+Each pool takes:
 
 | Field | Default | Meaning |
 | - | - | - |
-| `name` | required | Lowercase letters, digits and `_`. |
 | `labels` | required | Runner labels. Must include `self-hosted`. |
-| `machine_type` | required | `small`, `default`, `large` or `xlarge`. |
 | `snapshot` | required | The boat snapshot machines start from. Its disk must fit `machine_type`'s disk budget, or boat refuses each fork with 409 `deploy_failed`; pick a larger `machine_type` for a large snapshot. |
-| `max_boxes` | required | Most machines up or starting at once. |
-| `preset` | `hybrid` | See below. |
+| `name` | from the labels | Lowercase letters, digits and `_`. Without it, the labels other than `self-hosted`, joined with `_`, or `default`. |
+| `machine_type` | `default` | `small`, `default`, `large` or `xlarge`. |
+| `max_boxes` | 2 | Most machines up or starting at once. |
+| `preset` | `warm` | See below. |
 | `placement` | from the preset | Overrides the preset's steps. |
 | `min_up` | 1 for `pool`, else 0 | Kept machines that stay up without jobs. |
 | `slots_per_box` | 1 | Runners per kept machine. |

@@ -8,4 +8,5 @@ pub mod model;
 pub mod policy;
 pub mod run;
 pub mod snapshot;
+pub mod setup;
 pub mod transport;

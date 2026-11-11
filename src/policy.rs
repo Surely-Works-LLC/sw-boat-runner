@@ -37,7 +37,11 @@ pub fn load(path: &Path) -> Result<Config, Error> {
 }
 
 pub fn parse(text: &str) -> Result<Config, Error> {
-    let raw: RawConfig = toml::from_str(text).map_err(Error::Parse)?;
+    let raw: RawConfig = match single_pool(text)? {
+        Some(table) => toml::Value::Table(table).try_into(),
+        None => toml::from_str(text),
+    }
+    .map_err(Error::Parse)?;
     if !valid_repo(&raw.repo) {
         return Err(Error::Invalid(format!(
             "repo {:?} must look like owner/name",
@@ -71,6 +75,57 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     })
 }
 
+/// The keys of the policy itself; every other top-level key belongs to a pool.
+const TOP_KEYS: [&str; 3] = ["repo", "tick_s", "pool"];
+
+/// A policy with pool keys at the top level and no `[[pool]]` is one pool: its keys are
+/// moved into a `[[pool]]` table. `None` for every other policy, which is parsed as
+/// written so its errors keep their line numbers.
+fn single_pool(text: &str) -> Result<Option<toml::Table>, Error> {
+    let mut table: toml::Table = text.parse().map_err(Error::Parse)?;
+    let keys: Vec<String> = table
+        .keys()
+        .filter(|k| !TOP_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    if table.contains_key("pool") || keys.is_empty() {
+        return Ok(None);
+    }
+    let pool: toml::Table = keys
+        .iter()
+        .filter_map(|k| Some((k.clone(), table.remove(k)?)))
+        .collect();
+    table.insert("pool".into(), toml::Value::Array(vec![pool.into()]));
+    Ok(Some(table))
+}
+
+/// A pool name from its labels: those other than `self-hosted`, lowercased, with every
+/// character a name may not hold replaced by `_`, or `default` when none is left.
+fn name_from(labels: &[String]) -> String {
+    let parts: Vec<String> = labels
+        .iter()
+        .filter(|l| !l.eq_ignore_ascii_case("self-hosted"))
+        .map(|l| {
+            l.chars()
+                .map(|c| match c.to_ascii_lowercase() {
+                    c @ ('a'..='z' | '0'..='9') => c,
+                    _ => '_',
+                })
+                .collect()
+        })
+        .collect();
+    // Runner names are `sbr-<pool>-<machine>-<slot>-<time>`, so the name stays short.
+    let name: String = parts.join("_").chars().take(MAX_DERIVED_NAME).collect();
+    let name = name.trim_matches('_');
+    if name.is_empty() {
+        "default".into()
+    } else {
+        name.into()
+    }
+}
+
+const MAX_DERIVED_NAME: usize = 24;
+
 /// Settings that are valid but likely to waste starts, for `check` to print.
 pub fn warnings(cfg: &Config) -> Vec<String> {
     cfg.pools
@@ -99,11 +154,11 @@ struct RawConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPool {
-    name: String,
+    name: Option<String>,
     labels: Vec<String>,
-    machine_type: String,
     snapshot: String,
-    max_boxes: u32,
+    machine_type: Option<String>,
+    max_boxes: Option<u32>,
     #[serde(default)]
     preset: Preset,
     placement: Option<Vec<Placement>>,
@@ -122,9 +177,9 @@ struct RawPool {
 #[serde(rename_all = "kebab-case")]
 enum Preset {
     Pool,
+    #[default]
     Warm,
     Fork,
-    #[default]
     Hybrid,
 }
 
@@ -145,13 +200,13 @@ impl RawPool {
     fn into_pool(self) -> Pool {
         let (placement, min_up) = self.preset.shape();
         Pool {
-            name: self.name,
+            name: self.name.unwrap_or_else(|| name_from(&self.labels)),
             labels: self.labels,
-            machine_type: self.machine_type,
+            machine_type: self.machine_type.unwrap_or_else(|| "default".into()),
             snapshot: self.snapshot,
             placement: self.placement.unwrap_or_else(|| placement.to_vec()),
             min_up: self.min_up.unwrap_or(min_up),
-            max_boxes: self.max_boxes,
+            max_boxes: self.max_boxes.unwrap_or(2),
             slots_per_box: self.slots_per_box.unwrap_or(1),
             // Above the 58 min break-even of a large machine at a $0.07 start would be
             // safer, but most starts are included; see docs/design.md#start-budget.
@@ -264,6 +319,10 @@ snapshot = "snap-1"
 max_boxes = 4
 "#;
 
+    /// A policy with only the required keys.
+    const MINIMAL: &str =
+        "repo = \"acme/app\"\n[[pool]]\nlabels = [\"self-hosted\"]\nsnapshot = \"s\"\n";
+
     fn policy(extra: &str) -> String {
         format!("{REPO}{POOL}{extra}\n")
     }
@@ -273,7 +332,7 @@ max_boxes = 4
     }
 
     #[test]
-    fn hybrid_is_the_default_preset() {
+    fn warm_is_the_default_preset() {
         let cfg = parse(&policy("")).unwrap();
         assert_eq!(cfg.repo, "acme/app");
         assert_eq!(cfg.tick_s, 15);
@@ -284,7 +343,7 @@ max_boxes = 4
                 labels: vec!["self-hosted".into(), "large".into()],
                 machine_type: "large".into(),
                 snapshot: "snap-1".into(),
-                placement: vec![Placement::Slot, Placement::Resume, Placement::Fork],
+                placement: vec![Placement::Slot, Placement::Resume],
                 min_up: 0,
                 max_boxes: 4,
                 slots_per_box: 1,
@@ -295,6 +354,71 @@ max_boxes = 4
                 paid_start_cents_per_day: 0,
             }]
         );
+    }
+
+    /// `repo`, `labels` and `snapshot` are all a policy needs.
+    #[test]
+    fn a_minimal_policy_takes_the_defaults() {
+        let pool = parse(MINIMAL).unwrap().pools.remove(0);
+        assert_eq!(
+            pool,
+            Pool {
+                name: "default".into(),
+                labels: vec!["self-hosted".into()],
+                machine_type: "default".into(),
+                snapshot: "s".into(),
+                placement: vec![Placement::Slot, Placement::Resume],
+                min_up: 0,
+                max_boxes: 2,
+                slots_per_box: 1,
+                idle_stop_s: 1800,
+                min_up_s: 600,
+                register_timeout_s: 900,
+                fork_ttl_s: 3600,
+                paid_start_cents_per_day: 0,
+            }
+        );
+    }
+
+    /// Pool keys at the top level, with no `[[pool]]`, are one pool.
+    #[test]
+    fn top_level_pool_keys_are_one_pool() {
+        let short = "repo = \"acme/app\"\ntick_s = 30\nlabels = [\"self-hosted\", \"large\"]\n\
+                     snapshot = \"snap-1\"\nmachine_type = \"large\"\nmax_boxes = 4\n";
+        let cfg = parse(short).unwrap();
+        let full = parse(&format!("tick_s = 30\n{}", policy(""))).unwrap();
+        assert_eq!(cfg.tick_s, 30);
+        assert_eq!(cfg.pools.len(), 1);
+        let mut pool = cfg.pools[0].clone();
+        assert_eq!(pool.name, "large");
+        pool.name = "ci".into();
+        assert_eq!(pool, full.pools[0]);
+        // Both forms at once is an error, as is a misspelt key in either.
+        assert!(error(&format!("labels = [\"self-hosted\"]\n{}", policy(""))).contains("labels"));
+        assert!(error(&format!("{short}colour = 1\n")).contains("unknown field `colour`"));
+        assert!(
+            error("repo = \"acme/app\"\nsnapshot = \"s\"\n").contains("missing field `labels`")
+        );
+    }
+
+    #[test]
+    fn names_come_from_the_labels() {
+        let name =
+            |labels: &[&str]| name_from(&labels.iter().map(|l| l.to_string()).collect::<Vec<_>>());
+        assert_eq!(name(&["self-hosted"]), "default");
+        assert_eq!(name(&["Self-Hosted", "large"]), "large");
+        assert_eq!(name(&["self-hosted", "Linux", "pool-a"]), "linux_pool_a");
+        assert_eq!(name(&["self-hosted", "-"]), "default");
+        assert_eq!(
+            name(&["self-hosted", &"x".repeat(40)]).len(),
+            MAX_DERIVED_NAME
+        );
+        // Two pools whose labels give one name must name themselves.
+        let two = format!(
+            "{REPO}[[pool]]\nlabels = [\"self-hosted\", \"a-b\"]\nsnapshot = \"s\"\n\
+             [[pool]]\nlabels = [\"self-hosted\", \"a_b\"]\nsnapshot = \"s\"\n"
+        );
+        assert!(error(&two).contains("defined twice"));
     }
 
     #[test]
@@ -367,7 +491,7 @@ max_boxes = 4
     fn docs_state_the_presets_and_defaults() {
         let readme = include_str!("../README.md");
         let design = include_str!("../docs/design.md");
-        let defaults = serde_json::to_value(&parse(&policy("")).unwrap().pools[0]).unwrap();
+        let defaults = serde_json::to_value(&parse(MINIMAL).unwrap().pools[0]).unwrap();
         let mut checked = 0;
         for row in table_rows(readme) {
             let field = row[0].trim_matches('`');
@@ -376,6 +500,8 @@ max_boxes = 4
             };
             let default = row[1];
             match field {
+                "name" => assert_eq!(default, "from the labels"),
+                "machine_type" => assert_eq!(default, format!("`{}`", value.as_str().unwrap())),
                 "placement" => assert_eq!(default, "from the preset"),
                 "min_up" => assert_eq!(default, "1 for `pool`, else 0"),
                 "fork_ttl_s" => {
@@ -394,9 +520,9 @@ max_boxes = 4
         }
         // Every field of `Pool` has a row.
         assert_eq!(checked, defaults.as_object().unwrap().len());
-        let hybrid = parse(&policy("preset = \"hybrid\"")).unwrap().pools[0].clone();
-        assert!(readme.contains("| `preset` | `hybrid` |"));
-        assert_eq!(parse(&policy("")).unwrap().pools[0], hybrid);
+        let warm = parse(&policy("preset = \"warm\"")).unwrap().pools[0].clone();
+        assert!(readme.contains("| `preset` | `warm` |"));
+        assert_eq!(parse(&policy("")).unwrap().pools[0], warm);
 
         let presets = [
             (Preset::Pool, "pool"),
@@ -432,7 +558,7 @@ max_boxes = 4
             }
             assert_eq!(seen, presets.len());
         }
-        assert!(design.contains("`hybrid` is the default."));
+        assert!(design.contains("`warm` is the default."));
         assert!(readme.contains(&format!(
             "`tick_s` (default {})",
             crate::model::default_tick_s()

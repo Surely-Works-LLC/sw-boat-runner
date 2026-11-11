@@ -1,0 +1,1161 @@
+//! `sw-boat-runner setup`: installs the daemon as a systemd service on the machine it runs
+//! on, usually a boat `small` machine. It writes a policy, creates a GitHub App from a
+//! manifest (or takes a personal token with `--pat`), stores the keys root-only and
+//! enables the service.
+//!
+//! Secrets (the boat key, a personal token, the manifest code, the App's private key) are
+//! read from the environment or a prompt without echo, never from argv, and are held in
+//! `Secret`, which has no `Debug` or `Display`. They reach root-owned files through a
+//! command's stdin, never its arguments.
+
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::github::API;
+use crate::github_app::App;
+use crate::policy;
+use crate::transport::{Transport, Ureq};
+
+const DIR: &str = "/etc/sw-boat-runner";
+const POLICY: &str = "/etc/sw-boat-runner/policy.toml";
+const ENV: &str = "/etc/sw-boat-runner/env";
+const KEY: &str = "/etc/sw-boat-runner/github-app.pem";
+const BIN: &str = "/usr/local/bin/sw-boat-runner";
+const UNIT: &str = "/etc/systemd/system/sw-boat-runner.service";
+const SERVICE: &str = "sw-boat-runner";
+const HOMEPAGE: &str = "https://github.com/Surely-Works-LLC/sw-boat-runner";
+/// How long `setup` waits for the new App to be installed on the repository.
+const INSTALL_WAIT: Duration = Duration::from_secs(30 * 60);
+const INSTALL_POLL: Duration = Duration::from_secs(5);
+
+const HELP: &str = "\
+usage: sw-boat-runner setup [--repo owner/name] [--labels a,b] [--snapshot name]
+                            [--policy file] [--pat] [--dry-run] [--bin path]
+
+Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
+
+  1. writes a policy for the repository, labels and snapshot, and checks it
+  2. creates a private GitHub App from a manifest (Administration write, Actions read,
+     no webhook) and waits until it is installed on the repository
+  3. asks for the boat key without echo
+  4. writes /etc/sw-boat-runner/{policy.toml,env,github-app.pem}, installs the binary
+     to /usr/local/bin and enables the sw-boat-runner service
+
+  --repo, --labels, --snapshot   skip the prompt; or set SBR_REPO, SBR_LABELS, SBR_SNAPSHOT
+  --policy FILE                  use this policy instead of the three prompts
+  --pat                          a fine-grained personal token (GITHUB_TOKEN) instead of an App
+  --dry-run                      print what setup would do; asks no secret, changes nothing
+  --bin PATH                     the binary to install (default: this one)
+
+Secrets come from the environment or a prompt without echo, never from arguments:
+BOAT_API_KEY, GITHUB_TOKEN (with --pat), SBR_APP_CODE (the code GitHub returns after the
+App is created). An existing App: set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE and,
+optionally, GITHUB_APP_INSTALLATION_ID.";
+
+/// A credential. It has no `Debug` or `Display`, so it cannot be printed by accident.
+pub struct Secret(String);
+
+impl Secret {
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Options {
+    repo: Option<String>,
+    labels: Option<String>,
+    snapshot: Option<String>,
+    policy: Option<PathBuf>,
+    pat: bool,
+    dry_run: bool,
+    bin: Option<PathBuf>,
+}
+
+fn parse_args(args: &[&str]) -> Result<Options, String> {
+    let mut o = Options::default();
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        let mut value = || {
+            it.next()
+                .map(|v| v.to_string())
+                .ok_or(format!("{arg} needs a value"))
+        };
+        match arg {
+            "--repo" => o.repo = Some(value()?),
+            "--labels" => o.labels = Some(value()?),
+            "--snapshot" => o.snapshot = Some(value()?),
+            "--policy" => o.policy = Some(value()?.into()),
+            "--bin" => o.bin = Some(value()?.into()),
+            "--pat" => o.pat = true,
+            "--dry-run" => o.dry_run = true,
+            _ => return Err(format!("unknown argument {arg:?}")),
+        }
+    }
+    if o.policy.is_some() && (o.repo.is_some() || o.labels.is_some() || o.snapshot.is_some()) {
+        return Err("--policy replaces --repo, --labels and --snapshot".into());
+    }
+    Ok(o)
+}
+
+pub fn cli(args: &[&str]) -> ExitCode {
+    if matches!(args, ["-h" | "--help"]) {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let opts = match parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("setup: {e}\n\n{HELP}");
+            return ExitCode::from(2);
+        }
+    };
+    match setup(&opts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("setup: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn setup(opts: &Options) -> Result<(), String> {
+    let policy_text = match &opts.policy {
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
+        }
+        None => {
+            let repo = value(&opts.repo, "SBR_REPO", "Repository (owner/name)")?;
+            let labels = value(
+                &opts.labels,
+                "SBR_LABELS",
+                "Runner labels, comma-separated (self-hosted is added)",
+            )?;
+            let snapshot = value(&opts.snapshot, "SBR_SNAPSHOT", "boat snapshot")?;
+            policy_text(&repo, &split_labels(&labels), &snapshot)
+        }
+    };
+    let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
+    let bin = match &opts.bin {
+        Some(b) => b.clone(),
+        None => std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?,
+    };
+    println!("Policy:\n\n{policy_text}");
+    show_check(&policy_text)?;
+
+    let app_env = std::env::var("GITHUB_APP_ID").is_ok_and(|v| !v.is_empty());
+    let token_env = std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.is_empty());
+    if token_env && !opts.pat {
+        return Err(
+            "GITHUB_TOKEN is set: pass --pat to use it, or unset it for a GitHub App".into(),
+        );
+    }
+    if opts.pat && app_env {
+        return Err("set GITHUB_TOKEN or GITHUB_APP_*, not both".into());
+    }
+
+    if opts.dry_run {
+        return dry_run(opts, &cfg.repo, &policy_text, &bin);
+    }
+
+    let t = Ureq::new(Duration::from_secs(30));
+    let sudo = !is_root();
+    let boat_key = secret("BOAT_API_KEY", "boat API key")?;
+    let auth = if opts.pat {
+        let token = secret(
+            "GITHUB_TOKEN",
+            &format!(
+                "GitHub fine-grained token for {} (Administration write, Actions read)",
+                cfg.repo
+            ),
+        )?;
+        Auth::Pat(token)
+    } else if app_env {
+        existing_app()?
+    } else {
+        let (id, pem) = create_app(&t, &cfg.repo, sudo)?;
+        let app = App::new(id.clone(), None, pem.expose().as_bytes())?;
+        println!(
+            "Waiting until the app is installed on {} (up to {} min)...",
+            cfg.repo,
+            INSTALL_WAIT.as_secs() / 60
+        );
+        let installation = wait_installed(&t, &app, &cfg.repo, INSTALL_WAIT, std::thread::sleep)?;
+        println!("Installed (installation {installation}).");
+        Auth::App {
+            id,
+            pem,
+            installation: Some(installation),
+        }
+    };
+    for step in steps(&policy_text, &env_file(&boat_key, &auth)?, &auth, &bin) {
+        println!("{}", step.describe());
+        step.execute(sudo)?;
+    }
+    println!(
+        "\nDone. `journalctl -u {SERVICE} -f` shows what the daemon does. Point jobs at the \
+         pool with `runs-on: [{}]`.",
+        cfg.pools[0].labels.join(", ")
+    );
+    Ok(())
+}
+
+/// Prints the steps with placeholders for the secrets, which it does not ask for.
+fn dry_run(opts: &Options, repo: &str, policy_text: &str, bin: &Path) -> Result<(), String> {
+    let placeholder = |name: &str| Secret(format!("<{name}>"));
+    let auth = if opts.pat {
+        Auth::Pat(placeholder("GITHUB_TOKEN"))
+    } else {
+        println!(
+            "Would create a private GitHub App for {repo} from this manifest (owned by the \
+             repository's owner), print the link to install it, and wait until it is \
+             installed:\n\n{}\n",
+            serde_json::to_string_pretty(&manifest(repo, "<name>")).expect("JSON")
+        );
+        Auth::App {
+            id: "<app id>".into(),
+            pem: placeholder("private key"),
+            installation: None,
+        }
+    };
+    let env = env_text(&placeholder("BOAT_API_KEY"), &auth);
+    let prefix = if is_root() { "" } else { "sudo " };
+    println!("Would run, as root ({prefix}for each):\n");
+    for step in steps(policy_text, &env, &auth, bin) {
+        println!("{}", step.describe());
+    }
+    Ok(())
+}
+
+/// `flag`, else the environment variable `env`, else a prompt.
+fn value(flag: &Option<String>, env: &str, prompt: &str) -> Result<String, String> {
+    if let Some(v) = flag {
+        return Ok(v.trim().to_string());
+    }
+    if let Some(v) = std::env::var(env).ok().filter(|v| !v.trim().is_empty()) {
+        return Ok(v.trim().to_string());
+    }
+    let v = read_line(prompt, false)?;
+    if v.is_empty() {
+        return Err(format!("{prompt}: empty; pass it as a flag or set {env}"));
+    }
+    Ok(v)
+}
+
+/// The environment variable `env`, else a prompt without echo.
+fn secret(env: &str, prompt: &str) -> Result<Secret, String> {
+    if let Some(v) = std::env::var(env).ok().filter(|v| !v.trim().is_empty()) {
+        return Ok(Secret(v.trim().to_string()));
+    }
+    let v = read_line(&format!("{prompt} (not echoed)"), true)?;
+    if v.is_empty() {
+        return Err(format!("{env} is empty"));
+    }
+    Ok(Secret(v))
+}
+
+/// Turns echo back on when dropped, so an error or a panic cannot leave it off.
+struct EchoOff;
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        let _ = Command::new("stty")
+            .arg("echo")
+            .stdin(Stdio::inherit())
+            .status();
+    }
+}
+
+fn read_line(prompt: &str, hidden: bool) -> Result<String, String> {
+    eprint!("{prompt}: ");
+    let _ = std::io::stderr().flush();
+    let stdin = std::io::stdin();
+    let guard = if hidden && stdin.is_terminal() {
+        let off = Command::new("stty")
+            .arg("-echo")
+            .stdin(Stdio::inherit())
+            .status();
+        if !off.is_ok_and(|s| s.success()) {
+            return Err("cannot turn off echo to read a secret; set it in the environment".into());
+        }
+        Some(EchoOff)
+    } else {
+        None
+    };
+    let mut line = String::new();
+    let read = stdin.lock().read_line(&mut line);
+    if guard.is_some() {
+        drop(guard);
+        eprintln!();
+    }
+    match read {
+        Ok(0) => Err(format!("{prompt}: no input")),
+        Ok(_) => Ok(line.trim().to_string()),
+        Err(e) => Err(format!("{prompt}: {e}")),
+    }
+}
+
+/// `check`'s own output for the policy, so setup shows what each default resolved to.
+fn show_check(text: &str) -> Result<(), String> {
+    let me = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
+    let mut child = Command::new(&me)
+        .args(["check", "/dev/stdin"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", me.display()))?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(text.as_bytes())
+        .map_err(|e| format!("check: {e}"))?;
+    let status = child.wait().map_err(|e| format!("check: {e}"))?;
+    println!();
+    if status.success() {
+        Ok(())
+    } else {
+        Err("check failed".into())
+    }
+}
+
+/// Labels from a comma- or space-separated list, with `self-hosted` first if missing.
+fn split_labels(text: &str) -> Vec<String> {
+    let mut labels: Vec<String> = text
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !labels.iter().any(|l| l.eq_ignore_ascii_case("self-hosted")) {
+        labels.insert(0, "self-hosted".into());
+    }
+    labels
+}
+
+/// The smallest policy: everything else takes its default (README.md#policy).
+fn policy_text(repo: &str, labels: &[String], snapshot: &str) -> String {
+    let quote = |s: &str| toml::Value::String(s.to_string()).to_string();
+    let labels: Vec<String> = labels.iter().map(|l| quote(l)).collect();
+    format!(
+        "# Written by `sw-boat-runner setup`. README.md#policy lists the other keys.\n\
+         repo = {}\nlabels = [{}]\nsnapshot = {}\n",
+        quote(repo),
+        labels.join(", "),
+        quote(snapshot)
+    )
+}
+
+pub enum Auth {
+    Pat(Secret),
+    App {
+        id: String,
+        pem: Secret,
+        installation: Option<u64>,
+    },
+}
+
+/// An App from `GITHUB_APP_ID` and the key at `GITHUB_APP_PRIVATE_KEY_FILE`.
+fn existing_app() -> Result<Auth, String> {
+    let id = std::env::var("GITHUB_APP_ID").unwrap_or_default();
+    let path = std::env::var("GITHUB_APP_PRIVATE_KEY_FILE")
+        .map_err(|_| "GITHUB_APP_ID is set: set GITHUB_APP_PRIVATE_KEY_FILE too".to_string())?;
+    let pem = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    App::new(id.clone(), None, pem.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+    let installation = match std::env::var("GITHUB_APP_INSTALLATION_ID") {
+        Ok(v) if !v.is_empty() => Some(
+            v.parse()
+                .map_err(|_| "GITHUB_APP_INSTALLATION_ID must be a number".to_string())?,
+        ),
+        _ => None,
+    };
+    Ok(Auth::App {
+        id,
+        pem: Secret(pem),
+        installation,
+    })
+}
+
+/// The manifest flow: the user creates the App in a browser, pastes back the code GitHub
+/// redirects with, and setup exchanges it for the App's id and private key, which it
+/// stores at once so a later failure does not lose it.
+fn create_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<(String, Secret), String> {
+    let (owner, name) = repo.split_once('/').expect("a checked repo");
+    let kind = owner_kind(t, owner)?;
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    let app_name = app_name(name, &state);
+    let page = manifest_page(&kind.new_app_url(owner), &manifest(repo, &app_name), &state);
+    println!(
+        "Create the GitHub App: open this link in your browser (paste it in the address bar),\n\
+         check the page and press the button. GitHub then asks you to confirm the app.\n\n\
+         {}\n\n\
+         GitHub then opens {HOMEPAGE}?code=...; copy that whole address.\n",
+        data_url(&page)
+    );
+    let pasted = secret("SBR_APP_CODE", "Paste the address (or just the code)")?;
+    let code = parse_code(pasted.expose(), &state)?;
+    let created = convert(t, &code)?;
+    App::new(
+        created.id.to_string(),
+        None,
+        created.pem.expose().as_bytes(),
+    )?;
+    println!("Created app {} (id {}).", created.slug, created.id);
+    // Stored now: GitHub shows the key only once.
+    for step in [
+        Step::Dir,
+        Step::write(KEY, "600", Content::Secret(&created.pem)),
+    ] {
+        println!("{}", step.describe());
+        step.execute(sudo)?;
+    }
+    println!(
+        "\nInstall it on {repo}: open https://github.com/apps/{}/installations/new and pick \
+         only {repo}.",
+        created.slug
+    );
+    Ok((created.id.to_string(), created.pem))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerKind {
+    User,
+    Organization,
+}
+
+impl OwnerKind {
+    /// Where GitHub takes a manifest. A private App installs only on its owner's
+    /// account, so an organization's repository needs an App the organization owns.
+    fn new_app_url(&self, owner: &str) -> String {
+        match self {
+            OwnerKind::User => "https://github.com/settings/apps/new".into(),
+            OwnerKind::Organization => {
+                format!("https://github.com/organizations/{owner}/settings/apps/new")
+            }
+        }
+    }
+}
+
+/// `GET /users/{owner}`, unauthenticated: whether the owner is a user or an organization.
+fn owner_kind(t: &dyn Transport, owner: &str) -> Result<OwnerKind, String> {
+    #[derive(Deserialize)]
+    struct Out {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    let url = format!("{API}/users/{owner}");
+    let resp = t
+        .send("GET", &url, &headers(), None)
+        .map_err(|e| format!("look up {owner}: {}", e.0))?;
+    if resp.status != 200 {
+        return Err(format!("look up {owner} on GitHub: status {}", resp.status));
+    }
+    let out: Out = serde_json::from_slice(&resp.body)
+        .map_err(|_| format!("look up {owner}: response not understood"))?;
+    Ok(match out.kind.as_str() {
+        "Organization" => OwnerKind::Organization,
+        _ => OwnerKind::User,
+    })
+}
+
+fn headers() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Accept", "application/vnd.github+json"),
+        ("X-GitHub-Api-Version", "2022-11-28"),
+        ("User-Agent", "sw-boat-runner"),
+    ]
+}
+
+/// App names are unique on GitHub and at most 34 characters; the suffix tells apart two
+/// setups of one repository.
+fn app_name(repo_name: &str, random: &str) -> String {
+    let base: String = repo_name.chars().take(21).collect();
+    format!("sbr-{base}-{}", &random[..8])
+}
+
+/// A private App with no webhook and only the permissions the daemon uses:
+/// Administration write to register runners, Actions read to see queued jobs.
+fn manifest(repo: &str, name: &str) -> Value {
+    json!({
+        "name": name,
+        "url": HOMEPAGE,
+        "description": format!("sw-boat-runner for {repo}"),
+        "hook_attributes": { "url": HOMEPAGE, "active": false },
+        "redirect_url": HOMEPAGE,
+        "public": false,
+        "default_permissions": { "administration": "write", "actions": "read" },
+        "default_events": [],
+    })
+}
+
+/// A page with one button that posts the manifest to GitHub, which accepts it only as a
+/// form field.
+fn manifest_page(action: &str, manifest: &Value, state: &str) -> String {
+    let attr = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let repo = manifest["description"].as_str().unwrap_or_default();
+    format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>Create the GitHub App</title>\
+         <form method=\"post\" action=\"{}?state={}\">\
+         <p>{}: a private GitHub App with Administration (write) and Actions (read) and no \
+         webhook.</p>\
+         <input type=\"hidden\" name=\"manifest\" value=\"{}\">\
+         <button type=\"submit\">Create the GitHub App</button></form>",
+        attr(action),
+        attr(state),
+        attr(repo),
+        attr(&manifest.to_string()),
+    )
+}
+
+/// The page as a `data:` URL, which a browser opens when it is pasted in the address bar.
+fn data_url(html: &str) -> String {
+    let mut url = String::from("data:text/html;charset=utf-8,");
+    for b in html.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// The code from a pasted redirect address, or a pasted code. A `state` in the address
+/// must be the one setup sent.
+fn parse_code(pasted: &str, state: &str) -> Result<Secret, String> {
+    let pasted = pasted.trim();
+    let code = match pasted.split_once('?') {
+        Some((_, query)) => {
+            let query = query.split('#').next().unwrap_or_default();
+            let param = |name: &str| {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+            };
+            if param("state").is_some_and(|s| s != state) {
+                return Err("the address is from another setup (its state differs)".into());
+            }
+            param("code").ok_or("the address has no code")?
+        }
+        None => pasted,
+    };
+    // The code goes into a URL path.
+    if code.is_empty() || !code.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("that is not a code from GitHub".into());
+    }
+    Ok(Secret(code.to_string()))
+}
+
+struct Created {
+    id: u64,
+    slug: String,
+    pem: Secret,
+}
+
+/// `POST /app-manifests/{code}/conversions`: the new App's id, slug and private key.
+fn convert(t: &dyn Transport, code: &Secret) -> Result<Created, String> {
+    #[derive(Deserialize)]
+    struct Out {
+        id: u64,
+        slug: String,
+        pem: String,
+    }
+    let url = format!("{API}/app-manifests/{}/conversions", code.expose());
+    // Errors name the endpoint, never the URL, which holds the code.
+    let resp = t
+        .send("POST", &url, &headers(), None)
+        .map_err(|_| "could not reach GitHub to exchange the code".to_string())?;
+    if !(200..300).contains(&resp.status) {
+        return Err(format!(
+            "GitHub refused the code ({}); a code works once, within an hour of creating \
+             the app",
+            resp.status
+        ));
+    }
+    // serde errors can quote the input, which holds the key.
+    let out: Out = serde_json::from_slice(&resp.body)
+        .map_err(|_| "the app-manifest conversion response was not understood".to_string())?;
+    Ok(Created {
+        id: out.id,
+        slug: out.slug,
+        pem: Secret(out.pem),
+    })
+}
+
+/// Polls `GET /repos/{repo}/installation` until the App is installed there.
+fn wait_installed(
+    t: &dyn Transport,
+    app: &App,
+    repo: &str,
+    limit: Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<u64, String> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        match app.installation_on(t, repo, now) {
+            Ok(id) => return Ok(id),
+            Err(e) if waited >= limit => {
+                return Err(format!("the app is not installed on {repo}: {e}"));
+            }
+            Err(_) => {
+                sleep(INSTALL_POLL);
+                waited += INSTALL_POLL;
+            }
+        }
+    }
+}
+
+/// `/etc/sw-boat-runner/env`, which systemd reads as root before it starts the service.
+fn env_file(boat_key: &Secret, auth: &Auth) -> Result<Secret, String> {
+    let mut values = vec![("BOAT_API_KEY", boat_key.expose())];
+    if let Auth::Pat(token) = auth {
+        values.push(("GITHUB_TOKEN", token.expose()));
+    }
+    for (name, value) in values {
+        // systemd would read a quote, a backslash or a space as syntax.
+        if value
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\'))
+        {
+            return Err(format!("{name} holds a space, quote or backslash"));
+        }
+    }
+    Ok(env_text(boat_key, auth))
+}
+
+fn env_text(boat_key: &Secret, auth: &Auth) -> Secret {
+    let mut text = format!("BOAT_API_KEY={}\n", boat_key.expose());
+    match auth {
+        Auth::Pat(token) => text += &format!("GITHUB_TOKEN={}\n", token.expose()),
+        Auth::App {
+            id, installation, ..
+        } => {
+            text += &format!("GITHUB_APP_ID={id}\nGITHUB_APP_PRIVATE_KEY_FILE={KEY}\n");
+            if let Some(i) = installation {
+                text += &format!("GITHUB_APP_INSTALLATION_ID={i}\n");
+            }
+        }
+    }
+    Secret(text)
+}
+
+/// The unit install.sh wrote: the daemon only reads its policy and talks HTTPS, so it runs
+/// as an unprivileged dynamic user that cannot write the file system or see home
+/// directories. With an App, the dynamic user cannot read the root-only key, so systemd
+/// hands the service a copy as a credential; `$$` is a literal `$` to systemd.
+fn unit_file(app: bool) -> String {
+    let run = format!("{BIN} run {POLICY}");
+    let (credential, exec_start) = if app {
+        (
+            format!("LoadCredential=github-app.pem:{KEY}\n"),
+            format!(
+                "/bin/sh -c 'GITHUB_APP_PRIVATE_KEY_FILE=\"$${{CREDENTIALS_DIRECTORY}}/github-app.pem\" exec {run}'"
+            ),
+        )
+    } else {
+        (String::new(), run)
+    };
+    format!(
+        "[Unit]
+Description=sw-boat-runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile={ENV}
+{credential}ExecStart={exec_start}
+Restart=always
+RestartSec=30
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target
+"
+    )
+}
+
+enum Content<'a> {
+    Public(String),
+    Secret(&'a Secret),
+}
+
+enum Step<'a> {
+    Dir,
+    Write {
+        path: &'static str,
+        mode: &'static str,
+        content: Content<'a>,
+    },
+    Install(PathBuf),
+    Run {
+        args: &'static [&'static str],
+        must_pass: bool,
+    },
+}
+
+impl<'a> Step<'a> {
+    fn write(path: &'static str, mode: &'static str, content: Content<'a>) -> Self {
+        Step::Write {
+            path,
+            mode,
+            content,
+        }
+    }
+
+    /// One line, or a file's text when it holds no secret. A secret file shows the
+    /// names of its variables only.
+    fn describe(&self) -> String {
+        match self {
+            Step::Dir => format!("+ install -d -m 755 {DIR}"),
+            Step::Write {
+                path,
+                mode,
+                content: Content::Public(text),
+            } => format!("+ write {path} (mode {mode}):\n{text}"),
+            Step::Write {
+                path,
+                mode,
+                content: Content::Secret(s),
+            } => {
+                let names: Vec<&str> = s
+                    .expose()
+                    .lines()
+                    .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+                    .filter(|k| k.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                    .collect();
+                let what = if names.is_empty() {
+                    "secret".to_string()
+                } else {
+                    format!("{}, values hidden", names.join(", "))
+                };
+                format!("+ write {path} (mode {mode}, root only): {what}")
+            }
+            Step::Install(from) => format!("+ install -m 755 {} {BIN}", from.display()),
+            Step::Run { args, .. } => format!("+ {}", args.join(" ")),
+        }
+    }
+
+    fn execute(&self, sudo: bool) -> Result<(), String> {
+        let (args, input, must_pass): (Vec<String>, Option<&str>, bool) = match self {
+            Step::Dir => (strings(&["install", "-d", "-m", "755", DIR]), None, true),
+            Step::Write {
+                path,
+                mode,
+                content,
+            } => {
+                // A temporary file under umask 077, renamed over the old one, so the file
+                // is never readable by others even for a moment. The content comes on
+                // stdin, never in the arguments.
+                let script = "umask 077; t=$(mktemp \"$1.XXXXXX\") && cat > \"$t\" && \
+                              chmod \"$2\" \"$t\" && mv -f \"$t\" \"$1\"";
+                let text = match content {
+                    Content::Public(text) => text.as_str(),
+                    Content::Secret(s) => s.expose(),
+                };
+                (
+                    strings(&["sh", "-c", script, "sh", path, mode]),
+                    Some(text),
+                    true,
+                )
+            }
+            Step::Install(from) => (
+                vec![
+                    "install".into(),
+                    "-m".into(),
+                    "755".into(),
+                    from.display().to_string(),
+                    BIN.into(),
+                ],
+                None,
+                true,
+            ),
+            Step::Run { args, must_pass } => (strings(args), None, *must_pass),
+        };
+        let mut cmd = if sudo {
+            let mut c = Command::new("sudo");
+            c.args(&args);
+            c
+        } else {
+            let mut c = Command::new(&args[0]);
+            c.args(&args[1..]);
+            c
+        };
+        cmd.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = cmd.spawn().map_err(|e| format!("{}: {e}", args[0]))?;
+        if let Some(text) = input {
+            child
+                .stdin
+                .take()
+                .expect("piped")
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("{}: {e}", args[0]))?;
+        }
+        let status = child.wait().map_err(|e| format!("{}: {e}", args[0]))?;
+        if must_pass && !status.success() {
+            return Err(format!("{} failed ({status})", self.describe_short()));
+        }
+        Ok(())
+    }
+
+    fn describe_short(&self) -> String {
+        self.describe()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
+}
+
+/// Everything setup does as root, in order. The policy holds no secret, and the service's
+/// dynamic user must read it; the keys are root-only.
+fn steps<'a>(policy_text: &str, env: &'a Secret, auth: &'a Auth, bin: &Path) -> Vec<Step<'a>> {
+    let app = matches!(auth, Auth::App { .. });
+    let mut steps = vec![
+        Step::Dir,
+        Step::write(POLICY, "644", Content::Public(policy_text.to_string())),
+        Step::write(ENV, "600", Content::Secret(env)),
+    ];
+    if let Auth::App { pem, .. } = auth {
+        steps.push(Step::write(KEY, "600", Content::Secret(pem)));
+    }
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same(bin, Path::new(BIN)) {
+        steps.push(Step::Install(bin.to_path_buf()));
+    }
+    steps.extend([
+        Step::write(UNIT, "644", Content::Public(unit_file(app))),
+        Step::Run {
+            args: &["systemctl", "daemon-reload"],
+            must_pass: true,
+        },
+        Step::Run {
+            args: &["systemctl", "enable", SERVICE],
+            must_pass: true,
+        },
+        // A restart, so running setup again applies the new files.
+        Step::Run {
+            args: &["systemctl", "restart", SERVICE],
+            must_pass: true,
+        },
+        Step::Run {
+            args: &["systemctl", "--no-pager", "status", SERVICE],
+            must_pass: false,
+        },
+    ]);
+    steps
+}
+
+fn is_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github_app::tests::test_pem;
+    use crate::transport::fake::{Fake, respond};
+
+    #[test]
+    fn parses_flags() {
+        let o = parse_args(&["--repo", "a/b", "--labels", "x,y", "--pat", "--dry-run"]).unwrap();
+        assert_eq!(o.repo.as_deref(), Some("a/b"));
+        assert_eq!(o.labels.as_deref(), Some("x,y"));
+        assert!(o.pat && o.dry_run);
+        assert_eq!(parse_args(&[]).unwrap(), Options::default());
+        assert!(
+            parse_args(&["--repo"])
+                .unwrap_err()
+                .contains("needs a value")
+        );
+        assert!(
+            parse_args(&["--token", "x"])
+                .unwrap_err()
+                .contains("unknown")
+        );
+        assert!(parse_args(&["--policy", "p", "--repo", "a/b"]).is_err());
+    }
+
+    #[test]
+    fn writes_a_minimal_policy_that_checks() {
+        let labels = split_labels("boat, linux");
+        assert_eq!(labels, ["self-hosted", "boat", "linux"]);
+        assert_eq!(split_labels("Self-Hosted x"), ["Self-Hosted", "x"]);
+        let text = policy_text("acme/app", &labels, "snap \"1\"");
+        assert_eq!(
+            text,
+            "# Written by `sw-boat-runner setup`. README.md#policy lists the other keys.\n\
+             repo = \"acme/app\"\nlabels = [\"self-hosted\", \"boat\", \"linux\"]\n\
+             snapshot = 'snap \"1\"'\n"
+        );
+        let cfg = policy::parse(&text).unwrap();
+        assert_eq!(cfg.pools[0].name, "boat_linux");
+        assert_eq!(cfg.pools[0].snapshot, "snap \"1\"");
+    }
+
+    #[test]
+    fn the_manifest_asks_for_two_permissions_and_no_webhook() {
+        let m = manifest("acme/app", "sbr-app-0123abcd");
+        assert_eq!(m["public"], false);
+        assert_eq!(m["hook_attributes"]["active"], false);
+        assert_eq!(
+            m["default_permissions"],
+            json!({"administration": "write", "actions": "read"})
+        );
+        assert_eq!(m["default_events"], json!([]));
+        assert_eq!(m["redirect_url"], HOMEPAGE);
+        let name = app_name(&"n".repeat(40), "0123abcdef");
+        assert!(name.len() <= 34 && name.ends_with("-0123abcd"), "{name}");
+    }
+
+    #[test]
+    fn the_manifest_page_posts_to_the_owners_settings() {
+        let org = OwnerKind::Organization.new_app_url("acme");
+        assert_eq!(
+            org,
+            "https://github.com/organizations/acme/settings/apps/new"
+        );
+        assert_eq!(
+            OwnerKind::User.new_app_url("me"),
+            "https://github.com/settings/apps/new"
+        );
+        let page = manifest_page(&org, &manifest("acme/app", "n"), "st4te");
+        assert!(page.contains(
+            "action=\"https://github.com/organizations/acme/settings/apps/new?state=st4te\""
+        ));
+        assert!(page.contains("name=\"manifest\" value=\"{&quot;default_events&quot;"));
+        assert!(!page.contains("value=\"{\""));
+        let url = data_url("<a href=\"x\">#&</a>");
+        assert_eq!(
+            url,
+            "data:text/html;charset=utf-8,%3Ca%20href%3D%22x%22%3E%23%26%3C%2Fa%3E"
+        );
+    }
+
+    #[test]
+    fn finds_the_owners_kind() {
+        let fake = Fake::new(|s| match s.url.as_str() {
+            "https://api.github.com/users/acme" => respond(200, &[], r#"{"type":"Organization"}"#),
+            "https://api.github.com/users/me" => respond(200, &[], r#"{"type":"User"}"#),
+            _ => respond(404, &[], "{}"),
+        });
+        assert_eq!(owner_kind(&fake, "acme").unwrap(), OwnerKind::Organization);
+        assert_eq!(owner_kind(&fake, "me").unwrap(), OwnerKind::User);
+        assert!(owner_kind(&fake, "nobody").unwrap_err().contains("404"));
+        assert!(
+            fake.sent()
+                .iter()
+                .all(|s| s.header("authorization").is_none())
+        );
+    }
+
+    #[test]
+    fn takes_the_code_from_an_address_or_alone() {
+        let code = |s: &str| parse_code(s, "st").map(|c| c.expose().to_string());
+        assert_eq!(code("abc123").unwrap(), "abc123");
+        assert_eq!(
+            code(&format!("{HOMEPAGE}?code=abc123&state=st")).unwrap(),
+            "abc123"
+        );
+        assert_eq!(
+            code(&format!(" {HOMEPAGE}?state=st&code=a_1#x ")).unwrap(),
+            "a_1"
+        );
+        assert_eq!(code(&format!("{HOMEPAGE}?code=abc")).unwrap(), "abc");
+        assert!(
+            code(&format!("{HOMEPAGE}?code=abc&state=other"))
+                .unwrap_err()
+                .contains("state")
+        );
+        assert!(code(&format!("{HOMEPAGE}?state=st")).is_err());
+        assert!(code("../x").is_err());
+        assert!(code("").is_err());
+    }
+
+    #[test]
+    fn exchanges_the_code_for_the_apps_key() {
+        let pem = test_pem();
+        let body = json!({"id": 42, "slug": "sbr-app", "pem": pem, "client_secret": "cs"});
+        let fake = Fake::new(move |s| match (s.method.as_str(), s.url.as_str()) {
+            ("POST", "https://api.github.com/app-manifests/abc/conversions") => {
+                respond(201, &[], &body.to_string())
+            }
+            _ => respond(404, &[], r#"{"message":"Not Found"}"#),
+        });
+        let created = convert(&fake, &Secret("abc".into())).unwrap();
+        assert_eq!((created.id, created.slug.as_str()), (42, "sbr-app"));
+        assert_eq!(created.pem.expose(), test_pem());
+        assert!(fake.sent()[0].body.is_none());
+
+        let err = convert(&fake, &Secret("zq9".into())).err().unwrap();
+        assert!(err.contains("404") && !err.contains("zq9"), "{err}");
+        let fake = Fake::new(|_| respond(201, &[], r#"{"id":1,"pem":"-----BEGIN secret"}"#));
+        let err = convert(&fake, &Secret("abc".into())).err().unwrap();
+        assert!(!err.contains("secret"), "{err}");
+    }
+
+    #[test]
+    fn waits_until_the_app_is_installed() {
+        let calls = std::cell::Cell::new(0);
+        let fake = Fake::new(move |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                respond(404, &[], r#"{"message":"Not Found"}"#)
+            } else {
+                respond(200, &[], r#"{"id":77}"#)
+            }
+        });
+        let app = App::new("42".into(), None, test_pem().as_bytes()).unwrap();
+        let mut slept = Vec::new();
+        let id = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, |d| slept.push(d)).unwrap();
+        assert_eq!(id, 77);
+        assert_eq!(slept, [INSTALL_POLL, INSTALL_POLL]);
+        assert!(
+            fake.sent()
+                .iter()
+                .all(|s| s.url.ends_with("/repos/o/r/installation"))
+        );
+
+        let never = Fake::new(|_| respond(404, &[], r#"{"message":"Not Found"}"#));
+        let err = wait_installed(&never, &app, "o/r", INSTALL_POLL * 2, |_| {}).unwrap_err();
+        assert!(err.contains("not installed on o/r"), "{err}");
+        assert_eq!(never.sent().len(), 3);
+    }
+
+    #[test]
+    fn env_files_hold_the_keys_and_reject_systemd_syntax() {
+        let boat = Secret("bk_1".into());
+        let pat = env_file(&boat, &Auth::Pat(Secret("github_pat_1".into()))).unwrap();
+        assert_eq!(
+            pat.expose(),
+            "BOAT_API_KEY=bk_1\nGITHUB_TOKEN=github_pat_1\n"
+        );
+        let app = Auth::App {
+            id: "42".into(),
+            pem: Secret(test_pem()),
+            installation: Some(77),
+        };
+        assert_eq!(
+            env_file(&boat, &app).unwrap().expose(),
+            "BOAT_API_KEY=bk_1\nGITHUB_APP_ID=42\n\
+             GITHUB_APP_PRIVATE_KEY_FILE=/etc/sw-boat-runner/github-app.pem\n\
+             GITHUB_APP_INSTALLATION_ID=77\n"
+        );
+        for bad in ["a b", "a\"b", "a\\b", "a\nb"] {
+            let err = env_file(&Secret(bad.into()), &app).err().unwrap();
+            assert!(
+                err.starts_with("BOAT_API_KEY") && !err.contains(bad),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unit_is_install_shs() {
+        let app = unit_file(true);
+        assert!(
+            app.contains("\nLoadCredential=github-app.pem:/etc/sw-boat-runner/github-app.pem\n")
+        );
+        assert!(app.contains(
+            "\nExecStart=/bin/sh -c 'GITHUB_APP_PRIVATE_KEY_FILE=\"$${CREDENTIALS_DIRECTORY}/github-app.pem\" \
+             exec /usr/local/bin/sw-boat-runner run /etc/sw-boat-runner/policy.toml'\n"
+        ));
+        let pat = unit_file(false);
+        assert!(!pat.contains("LoadCredential"));
+        assert!(pat.contains(
+            "\nExecStart=/usr/local/bin/sw-boat-runner run /etc/sw-boat-runner/policy.toml\n"
+        ));
+        for unit in [app, pat] {
+            for line in [
+                "EnvironmentFile=/etc/sw-boat-runner/env",
+                "DynamicUser=yes",
+                "NoNewPrivileges=yes",
+                "CapabilityBoundingSet=",
+                "ProtectSystem=strict",
+                "ProtectHome=yes",
+                "PrivateTmp=yes",
+                "PrivateDevices=yes",
+                "WantedBy=multi-user.target",
+            ] {
+                assert!(unit.lines().any(|l| l == line), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn steps_show_no_secret() {
+        let boat = Secret("bk_secret".into());
+        let auth = Auth::App {
+            id: "42".into(),
+            pem: Secret(test_pem()),
+            installation: None,
+        };
+        let env = env_file(&boat, &auth).unwrap();
+        let app_steps = steps("repo = \"a/b\"\n", &env, &auth, Path::new("/tmp/sbr"));
+        let shown: Vec<String> = app_steps.iter().map(Step::describe).collect();
+        let all = shown.join("\n");
+        assert!(
+            !all.contains("bk_secret") && !all.contains("PRIVATE KEY"),
+            "{all}"
+        );
+        assert!(all.contains(
+            "+ write /etc/sw-boat-runner/env (mode 600, root only): BOAT_API_KEY, \
+             GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE, values hidden"
+        ));
+        assert!(
+            all.contains(
+                "+ write /etc/sw-boat-runner/github-app.pem (mode 600, root only): secret"
+            )
+        );
+        assert!(
+            all.contains("+ write /etc/sw-boat-runner/policy.toml (mode 644):\nrepo = \"a/b\"")
+        );
+        assert!(all.contains("+ install -m 755 /tmp/sbr /usr/local/bin/sw-boat-runner"));
+        assert!(
+            shown
+                .last()
+                .unwrap()
+                .contains("systemctl --no-pager status")
+        );
+
+        let pat = Auth::Pat(Secret("t".into()));
+        let env = env_file(&boat, &pat).unwrap();
+        let pat_steps = steps("", &env, &pat, Path::new("/tmp/sbr"));
+        assert!(
+            !pat_steps
+                .iter()
+                .any(|s| s.describe().contains("github-app.pem"))
+        );
+    }
+}

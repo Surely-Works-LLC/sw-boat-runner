@@ -64,3 +64,44 @@ fn check_warns_about_a_register_timeout_inside_the_home_wait() {
     assert!(text(&out.stdout).contains("pool ci "));
     assert!(text(&out.stderr).contains("warning: pool \"ci\": register_timeout_s (300)"));
 }
+
+#[test]
+fn setup_dry_run_asks_no_secret_and_changes_nothing() {
+    let out = Command::new(env!("CARGO_BIN_EXE_sw-boat-runner"))
+        .args([
+            "setup",
+            "--dry-run",
+            "--repo",
+            "acme/app",
+            "--labels",
+            "boat",
+        ])
+        .args(["--snapshot", "snap-1", "--bin", "/tmp/sbr-none"])
+        .env_remove("BOAT_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GITHUB_APP_ID")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", text(&out.stderr));
+    assert!(
+        stdout.contains("labels = [\"self-hosted\", \"boat\"]"),
+        "{stdout}"
+    );
+    // `check`'s line, with the defaults applied.
+    assert!(
+        stdout.contains("pool boat labels self-hosted,boat machine default"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"administration\": \"write\""), "{stdout}");
+    assert!(
+        stdout.contains("LoadCredential=github-app.pem:"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("BOAT_API_KEY, GITHUB_APP_ID"), "{stdout}");
+
+    let out = run(&["setup", "--repo"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out.stdout).is_empty());
+}

@@ -133,6 +133,16 @@ impl App {
         Ok(token)
     }
 
+    /// The app's installation on `repo`; an `Error::App` until the app is installed there.
+    pub fn installation_on(
+        &self,
+        t: &dyn Transport,
+        repo: &str,
+        now: UnixSecs,
+    ) -> Result<u64, Error> {
+        installation_id(t, &self.jwt(now)?, repo)
+    }
+
     /// The installation token held now, if any.
     pub(crate) fn held_token(&self) -> Option<&str> {
         self.token.as_ref().map(|held| held.token.as_str())

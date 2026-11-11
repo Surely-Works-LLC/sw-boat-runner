@@ -1,0 +1,4 @@
+# Pins: Fork(none) defaults: a three-line policy is one warm pool named from its labels, which forks kept machines for its jobs up to the default max_boxes of 2.
+repo = "acme/app"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
