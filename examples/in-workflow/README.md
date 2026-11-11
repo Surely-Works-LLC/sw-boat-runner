@@ -13,7 +13,7 @@ permissions:
 jobs:
   runners:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@main
+    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.1.0
     with:
       snapshot: snap-1
     secrets:
@@ -34,8 +34,10 @@ The trigger and the `if:` on both jobs keep the pool to pushes to `main`. Keep t
 if you add triggers: in a `pull_request_target` run `github.ref` is still the base branch,
 so only the event check stops it. [Pull requests](#pull-requests) says why.
 
-The `runners` job needs only `contents: read` from the run's token. `@main` follows this
-repository; for anything you rely on, put a commit SHA there and in `ref`.
+The `runners` job needs only `contents: read` from the run's token. `@v0.1.0` pins the
+workflow and `ref` (default `v0.1.0`) pins the daemon it builds. GitHub tells a called
+workflow nothing reliable about its own ref, so the two are separate: change both
+together, to a later tag or to one commit SHA.
 
 `snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
 describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section; the
@@ -47,7 +49,7 @@ describes. `RUNNER_ADMIN_TOKEN` is the fine-grained token from the same section;
 | `max_boxes` | 4 | |
 | `pool` | `preset = "fork"` | More policy lines for the pool, such as `preset = "warm"`. |
 | `name` | none | Set it when one run calls the workflow more than once. The label is then `boat-<run id>-<attempt>-<name>`. |
-| `ref` | `main` | The sw-boat-runner commit to build. Pin one for anything you rely on. |
+| `ref` | `v0.1.0` | The sw-boat-runner tag or commit to build. Keep it the same as the `@` ref of `uses:`. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never
 share a daemon. The `runners` job ends once every other job of the run is done, and then

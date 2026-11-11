@@ -12,7 +12,7 @@ boat ssh <id>
 Inside the machine, write your `policy.toml` ([policy.toml](policy.toml) is a start), then:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/main/examples/always-on/install.sh
+curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.1.0/examples/always-on/install.sh
 bash install.sh policy.toml    # asks for BOAT_API_KEY and GITHUB_TOKEN
 ```
 

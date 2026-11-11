@@ -30,8 +30,12 @@ on:
         default: ""
         type: string
       ref:
-        description: The sw-boat-runner commit, tag or branch to build.
-        default: main
+        # A called workflow cannot read the ref it was called at (github.workflow_ref and
+        # workflow_sha name the caller's workflow), so the daemon's ref is its own pin.
+        description: >-
+          The sw-boat-runner tag or commit to build. Keep it the same as the ref in the
+          caller's `uses:` line.
+        default: v0.1.0
         type: string
     secrets:
       BOAT_API_KEY:

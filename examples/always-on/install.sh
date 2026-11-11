@@ -22,7 +22,7 @@ if ! command -v cargo >/dev/null; then
     # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
 fi
-cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner
+cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.1.0
 bin=$(command -v sw-boat-runner)
 "$bin" check "$policy"
 

@@ -41,7 +41,7 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
 1. Install it:
 
    ```sh
-   cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner
+   cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.1.0
    ```
 
 2. Make a boat snapshot with an extracted
