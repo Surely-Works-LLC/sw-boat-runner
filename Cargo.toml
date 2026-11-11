@@ -12,6 +12,11 @@ categories = ["command-line-utilities", "development-tools"]
 publish = false
 
 [dependencies]
+# GitHub App auth signs its JWT with ring and reads the PEM key with rustls-pki-types,
+# the crates ureq's rustls already brings; base64 is ureq's too.
+base64 = "0.23"
+ring = "0.17"
+rustls-pki-types = { version = "1.12", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.2"

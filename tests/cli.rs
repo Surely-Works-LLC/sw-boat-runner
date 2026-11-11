@@ -7,6 +7,9 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .env_remove("BOAT_API_KEY")
         .env_remove("GITHUB_TOKEN")
+        .env_remove("GITHUB_APP_ID")
+        .env_remove("GITHUB_APP_INSTALLATION_ID")
+        .env_remove("GITHUB_APP_PRIVATE_KEY_FILE")
         .output()
         .expect("the binary runs")
 }

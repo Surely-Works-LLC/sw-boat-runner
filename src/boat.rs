@@ -124,6 +124,12 @@ pub(crate) struct Sandbox {
     pub state: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// True while the sandbox holds its creator's personal logins (GitHub token, model
+    /// logins, secrets). A create with `noEnv` withholds the account's secrets but keeps
+    /// logins saved in the snapshot, so a snapshot of a sandbox made without `--no-env`
+    /// gives every fork these logins. `None` when boat did not say.
+    #[serde(default, rename = "holdsCreatorLogins")]
+    pub holds_creator_logins: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -250,8 +256,24 @@ impl<'t> Client<'t> {
         self.call("POST", path, Some(body), &[]).map(drop)
     }
 
+    /// One sandbox, with `holdsCreatorLogins`.
+    pub(crate) fn get(&self, id: &str) -> Result<Sandbox, Error> {
+        #[derive(Deserialize)]
+        struct Info {
+            sandbox: Sandbox,
+        }
+        let info: Info = parse(self.call("GET", &format!("/sandboxes/{id}"), None, &[])?)?;
+        Ok(info.sandbox)
+    }
+
+    /// Resumes with `noEnv`: boat withholds the account's secrets and scrubs owner secrets
+    /// the restored snapshot holds before the machine is reachable. One-way; the machine
+    /// stays no-env.
     pub(crate) fn resume(&self, id: &str) -> Result<(), Error> {
-        self.post(&format!("/sandboxes/{id}/resume"), &json!({}))
+        self.post(
+            &format!("/sandboxes/{id}/resume"),
+            &json!({ "noEnv": true }),
+        )
     }
 
     /// Returns at once; 200 when already stopped, 202 while the stop runs.
@@ -272,8 +294,9 @@ impl<'t> Client<'t> {
 
     /// Starts a new machine from the saved snapshot. boat returns the first sandbox again
     /// for a repeat of the same key and body within 24 h, even a deleted one.
-    /// `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv` keeps the account's logins and secrets
-    /// out of the machine, because CI jobs run arbitrary code there.
+    /// `ttl_s` must be 1 to `MAX_TTL_S`. `noEnv` keeps the account's secrets out of the
+    /// machine, because CI jobs run arbitrary code there. It does not scrub logins saved
+    /// in the snapshot; `holds_creator_logins` reports those.
     pub(crate) fn create_from_snapshot(
         &self,
         snapshot: &str,
@@ -630,6 +653,46 @@ mod tests {
             json!({"from":"runner-base","type":"large","ttlSeconds":3600,"noEnv":true,
                    "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"7-2"}})
         );
+    }
+
+    #[test]
+    fn resume_scrubs_owner_secrets() {
+        let fake = Fake::new(|_| respond(202, &[], "{}"));
+        Client::new(&fake, "k".into())
+            .resume("bx_55555555")
+            .unwrap();
+        let sent = fake.sent();
+        assert_eq!(
+            sent[0].url,
+            "https://boat.dev/api/v1/sandboxes/bx_55555555/resume"
+        );
+        assert_eq!(sent[0].body_text(), r#"{"noEnv":true}"#);
+    }
+
+    #[test]
+    fn get_reads_holds_creator_logins() {
+        let fake = Fake::new(|s| {
+            let holds = match s.url.as_str() {
+                u if u.ends_with("bx_22222222") => r#","holdsCreatorLogins":true"#,
+                u if u.ends_with("bx_33333333") => r#","holdsCreatorLogins":false"#,
+                _ => "",
+            };
+            let body = format!(
+                r#"{{"ok":true,"type":"sandbox.info","sandbox":{{"id":"bx_22222222",
+                    "state":"idle","labels":{{"sw-boat-runner":"ci"}}{holds}}}}}"#
+            );
+            respond(200, &[], &body)
+        });
+        let boat = Client::new(&fake, "k".into());
+        let holds = |id| boat.get(id).unwrap().holds_creator_logins;
+        assert_eq!(holds("bx_22222222"), Some(true));
+        assert_eq!(holds("bx_33333333"), Some(false));
+        assert_eq!(holds("bx_44444444"), None);
+        assert_eq!(
+            fake.sent()[0].url,
+            "https://boat.dev/api/v1/sandboxes/bx_22222222"
+        );
+        assert_eq!(fake.sent()[0].method, "GET");
     }
 
     #[test]

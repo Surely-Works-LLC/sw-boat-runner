@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
 use crate::boat;
 use crate::github;
+use crate::github_app;
 use crate::model::{
     Action, Cents, Config, JobKey, Limits, Machine, MachineState, Pool, Runner, RunnerState,
     Snapshot, UnixSecs,
@@ -29,6 +31,8 @@ const BACKOFF_MAX_S: u64 = 600;
 #[derive(Debug)]
 pub enum Error {
     MissingEnv(&'static str),
+    /// Credentials set but unusable: both GitHub modes, or an App key that does not load.
+    Config(String),
     Boat(boat::Error),
     GitHub(github::Error),
     /// A start after starts closed for this tick.
@@ -40,7 +44,7 @@ pub enum Error {
 impl Error {
     fn is_fatal(&self) -> bool {
         match self {
-            Error::MissingEnv(_) => true,
+            Error::MissingEnv(_) | Error::Config(_) => true,
             Error::Boat(e) => e.is_fatal(),
             Error::GitHub(e) => e.is_fatal(),
             Error::StartsClosed | Error::Invalid(_) => false,
@@ -52,6 +56,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::MissingEnv(name) => write!(f, "{name} is not set"),
+            Error::Config(m) => write!(f, "{m}"),
             Error::Boat(e) => write!(f, "{e}"),
             Error::GitHub(e) => write!(f, "{e}"),
             Error::StartsClosed => write!(f, "starts closed for this tick"),
@@ -94,13 +99,13 @@ fn snapshot(
     cfg: &Config,
     t: &dyn Transport,
     boat_key: String,
-    token: String,
+    github: github::Auth,
     now: UnixSecs,
 ) -> Result<Snapshot, Error> {
     // Started a request timeout ago, so the snapshot shows the starts `run` makes once its
     // restart wait is over.
     let since = now.saturating_sub(HTTP_TIMEOUT.as_secs());
-    let mut tick_loop = Loop::new(cfg, t, boat_key, token, since);
+    let mut tick_loop = Loop::new(cfg, t, boat_key, github, since);
     tick_loop.gh.begin_tick(now);
     tick_loop.observe(now).map(|(snapshot, _)| snapshot)
 }
@@ -117,10 +122,10 @@ fn drain_with(
     cfg: &Config,
     t: &dyn Transport,
     boat_key: String,
-    token: String,
+    github: github::Auth,
     now: UnixSecs,
 ) -> Result<usize, Error> {
-    let mut tick_loop = Loop::new(cfg, t, boat_key, token, now);
+    let mut tick_loop = Loop::new(cfg, t, boat_key, github, now);
     // `delete_everything` ignores queued jobs, so drain does not spend requests on them.
     tick_loop.read_jobs = false;
     tick_loop.tick(now, delete_everything)?;
@@ -147,8 +152,47 @@ fn delete_everything(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         .collect()
 }
 
-fn credentials() -> Result<(String, String), Error> {
-    Ok((env("BOAT_API_KEY")?, env("GITHUB_TOKEN")?))
+fn credentials() -> Result<(String, github::Auth), Error> {
+    let boat_key = env("BOAT_API_KEY")?;
+    let github = github_auth(&|name| std::env::var(name).ok().filter(|v| !v.is_empty()))?;
+    Ok((boat_key, github))
+}
+
+const APP_VARS: [&str; 3] = [
+    "GITHUB_APP_ID",
+    "GITHUB_APP_INSTALLATION_ID",
+    "GITHUB_APP_PRIVATE_KEY_FILE",
+];
+
+/// `GITHUB_TOKEN`, or a GitHub App from `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and,
+/// when set, `GITHUB_APP_INSTALLATION_ID`. Both at once is an error, so the daemon never
+/// quietly runs on a token someone meant to retire.
+fn github_auth(var: &dyn Fn(&str) -> Option<String>) -> Result<github::Auth, Error> {
+    let app = APP_VARS.iter().any(|name| var(name).is_some());
+    match (var("GITHUB_TOKEN"), app) {
+        (Some(_), true) => Err(Error::Config(
+            "GITHUB_TOKEN and GITHUB_APP_* are both set; set one of them".into(),
+        )),
+        (Some(token), false) => Ok(github::Auth::Token(token)),
+        (None, false) => Err(Error::Config(
+            "GITHUB_TOKEN is not set (or set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_FILE)".into(),
+        )),
+        (None, true) => {
+            let id = var("GITHUB_APP_ID").ok_or(Error::MissingEnv("GITHUB_APP_ID"))?;
+            let key_file = var("GITHUB_APP_PRIVATE_KEY_FILE")
+                .ok_or(Error::MissingEnv("GITHUB_APP_PRIVATE_KEY_FILE"))?;
+            let installation = var("GITHUB_APP_INSTALLATION_ID")
+                .map(|v| {
+                    v.trim().parse::<u64>().map_err(|_| {
+                        Error::Config(format!("GITHUB_APP_INSTALLATION_ID {v:?} is not a number"))
+                    })
+                })
+                .transpose()?;
+            let app = github_app::App::from_file(id, installation, Path::new(&key_file))
+                .map_err(|e| Error::Config(format!("GITHUB_APP_PRIVATE_KEY_FILE {e}")))?;
+            Ok(github::Auth::App(Box::new(app)))
+        }
+    }
 }
 
 fn env(name: &'static str) -> Result<String, Error> {
@@ -334,6 +378,9 @@ pub struct Loop<'a> {
     resumed: Vec<(String, UnixSecs)>,
     /// Starts that failed last time they were sent, by pool and kind; see `Failing`.
     failing: HashMap<(String, &'static str), Failing>,
+    /// Kept machines found holding their creator's logins, with the `since` of the state
+    /// they were found in. No runner goes on one until it starts again.
+    holds_logins: HashMap<String, UnixSecs>,
     /// False for `drain`, which needs no queued jobs.
     read_jobs: bool,
     /// The last tick skipped its observe to stay in the GitHub request budget.
@@ -348,6 +395,9 @@ struct Failing {
     error: String,
     backoff_s: u64,
     until: UnixSecs,
+    /// Forks deleted for holding their creator's logins. A fork boat accepts proves
+    /// nothing then, so only a machine of the pool found without them clears it.
+    logins: bool,
 }
 
 /// A fork boat accepted but may not list for a while. Until it is listed, `decide` sees
@@ -364,13 +414,13 @@ impl<'a> Loop<'a> {
         cfg: &'a Config,
         t: &'a dyn Transport,
         boat_key: String,
-        token: String,
+        github: github::Auth,
         now: UnixSecs,
     ) -> Self {
         Loop {
             cfg,
             boat: boat::Client::new(t, boat_key),
-            gh: github::Client::new(t, token, cfg.repo.clone()),
+            gh: github::Client::new(t, github, cfg.repo.clone()),
             machines: HashMap::new(),
             online: HashSet::new(),
             spent_day: None,
@@ -389,6 +439,7 @@ impl<'a> Loop<'a> {
             pending: Vec::new(),
             resumed: Vec::new(),
             failing: HashMap::new(),
+            holds_logins: HashMap::new(),
             read_jobs: true,
             paced: false,
         }
@@ -434,7 +485,7 @@ impl<'a> Loop<'a> {
             .iter()
             .filter_map(|a| backoff_key(&snapshot, a))
             .collect();
-        self.failing.retain(|k, _| asked.contains(k));
+        self.failing.retain(|k, f| f.logins || asked.contains(k));
         let mut starts = Starts {
             open: snapshot.limits.can_start,
             price: snapshot.limits.next_start_cents,
@@ -448,7 +499,9 @@ impl<'a> Loop<'a> {
             match self.execute(now, action, &mut runner_ids, &mut starts) {
                 Ok(()) => {
                     if let Some(k) = &key {
-                        self.failing.remove(k);
+                        if !self.failing.get(k).is_some_and(|f| f.logins) {
+                            self.failing.remove(k);
+                        }
                     }
                 }
                 Err(e) if e.is_fatal() => return Err(e),
@@ -494,8 +547,71 @@ impl<'a> Loop<'a> {
                 error,
                 backoff_s,
                 until: now.saturating_add(backoff_s),
+                logins: false,
             },
         );
+    }
+
+    /// Whether `machine` holds none of its creator's logins, so a runner may go on it.
+    /// boat's `noEnv` create keeps logins saved in the snapshot, and a CI job could read
+    /// them. A job's fork that holds them is deleted and the pool's forks back off; a kept
+    /// machine waits for its next start, whose `noEnv` resume scrubs them. A machine boat
+    /// does not say about counts as holding them.
+    fn free_of_logins(
+        &mut self,
+        now: UnixSecs,
+        pool: &Pool,
+        machine: &str,
+        runner_ids: &mut HashMap<String, u64>,
+    ) -> Result<bool, Error> {
+        let since = self.machines.get(machine).map_or(now, |m| m.since);
+        if self.holds_logins.get(machine) == Some(&since) {
+            return Ok(false);
+        }
+        let sb = self.boat.get(machine)?;
+        let why = match sb.holds_creator_logins {
+            Some(false) => {
+                self.holds_logins.remove(machine);
+                let key = (pool.name.clone(), "fork");
+                if self.failing.get(&key).is_some_and(|f| f.logins) {
+                    self.failing.remove(&key);
+                }
+                return Ok(true);
+            }
+            Some(true) => "holds its creator's personal logins (GitHub token, model logins)",
+            None => {
+                "may hold its creator's personal logins: boat did not report holdsCreatorLogins"
+            }
+        };
+        let error = format!(
+            "{machine} in pool {} {why}. Snapshot {:?} must be saved from a sandbox created \
+             with --no-env; a CI job there could read them",
+            pool.name, pool.snapshot
+        );
+        if sb.labels.contains_key(boat::JOB_LABEL) {
+            let key = (pool.name.clone(), "fork");
+            let backoff_s = match self.failing.get(&key) {
+                Some(f) if f.logins => (f.backoff_s * 2).clamp(BACKOFF_MIN_S, BACKOFF_MAX_S),
+                _ => BACKOFF_MIN_S,
+            };
+            eprintln!(
+                "error: {error}. No runner registered; deleting it, next fork in {backoff_s}s"
+            );
+            self.failing.insert(
+                key,
+                Failing {
+                    error,
+                    backoff_s,
+                    until: now.saturating_add(backoff_s),
+                    logins: true,
+                },
+            );
+            self.delete_machine(machine, runner_ids)?;
+        } else {
+            eprintln!("error: {error}. No runner registered until it is stopped and resumed");
+            self.holds_logins.insert(machine.to_string(), since);
+        }
+        Ok(false)
     }
 
     fn observe(&mut self, now: UnixSecs) -> Result<(Snapshot, HashMap<String, u64>), Error> {
@@ -585,6 +701,8 @@ impl<'a> Loop<'a> {
         }
         let listed: HashSet<&str> = machines.iter().map(|m| m.id.as_str()).collect();
         self.machines.retain(|id, _| listed.contains(id.as_str()));
+        self.holds_logins
+            .retain(|id, _| listed.contains(id.as_str()));
         self.restarted = false;
         // A create that answered has had its full request timeout and a tick to show up.
         let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
@@ -671,7 +789,14 @@ impl<'a> Loop<'a> {
                 pool,
                 machine,
                 slot,
-            } => self.register(now, pool, machine, *slot),
+            } => {
+                let p = self.pool(pool)?;
+                if self.free_of_logins(now, p, machine, runner_ids)? {
+                    self.register(now, pool, machine, *slot)
+                } else {
+                    Ok(())
+                }
+            }
             Action::Resume { machine } => {
                 let result = self.start(now, starts, |b| b.resume(machine));
                 // boat deleted the disk of a machine that stayed stopped too long. It can
@@ -890,7 +1015,13 @@ mod tests {
 
     /// A loop whose restart wait is over by `NOW`.
     fn started<'a>(cfg: &'a Config, fake: &'a Fake) -> Loop<'a> {
-        Loop::new(cfg, fake, "k".into(), "t".into(), STARTED)
+        Loop::new(
+            cfg,
+            fake,
+            "k".into(),
+            github::Auth::Token("t".into()),
+            STARTED,
+        )
     }
 
     fn reply(s: &Sent) -> Response {
@@ -916,6 +1047,13 @@ mod tests {
             ("GET", u) if u.contains("status=in_progress") => r#"{"workflow_runs":[]}"#,
             ("GET", u) if u.contains("/runs/5/jobs") => {
                 r#"{"jobs":[{"id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}]}"#
+            }
+            ("GET", u) if u.starts_with(&format!("{BOAT}/sandboxes/bx_")) => {
+                let id = u.rsplit('/').next().unwrap_or_default();
+                let body = format!(
+                    r#"{{"sandbox":{{"id":"{id}","state":"idle","holdsCreatorLogins":false}}}}"#
+                );
+                return respond(200, &[], &body);
             }
             ("GET", u) if u.ends_with("/v1/limits") => {
                 r#"{"canStart":true,"nextStartDollars":0.25}"#
@@ -1018,7 +1156,13 @@ mod tests {
     fn tick_executes_in_order() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "boat_k".into(), "gh_t".into(), STARTED);
+        let mut tick_loop = Loop::new(
+            &cfg,
+            &fake,
+            "boat_k".into(),
+            github::Auth::Token("gh_t".into()),
+            STARTED,
+        );
         tick_loop.tick(NOW, decide_all).unwrap();
 
         let expected = [
@@ -1034,6 +1178,8 @@ mod tests {
             // Stop deletes the machine's runner first.
             format!("DELETE {GH}/runners/11"),
             format!("POST {BOAT}/sandboxes/bx_22222222/stop"),
+            // A runner goes only on a machine that holds none of its creator's logins.
+            format!("GET {BOAT}/sandboxes/bx_22222222"),
             format!("POST {GH}/runners/generate-jitconfig"),
             format!("PUT {BOAT}/sandboxes/bx_22222222/files"),
             format!("POST {BOAT}/sandboxes/bx_22222222/commands"),
@@ -1045,26 +1191,26 @@ mod tests {
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
-        let fork = &sent[15];
+        let fork = &sent[16];
         assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
         assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
-        let jit = &sent[10];
+        let jit = &sent[11];
         assert!(
             jit.body_text()
                 .contains(r#""name":"sbr-ci-bx_22222222-1-1000""#)
         );
         assert!(
-            sent[11]
+            sent[12]
                 .body_text()
                 .contains(r#""path":"/home/user/.sbr-jit-1""#)
         );
-        assert!(sent[12].body_text().contains("/home/user/.sbr-jit-1"));
+        assert!(sent[13].body_text().contains("/home/user/.sbr-jit-1"));
         // The jit config goes into the file write only: never a URL, a command or a header.
         for (i, s) in sent.iter().enumerate() {
             let leaks = s.url.contains("JITSECRET")
                 || s.headers.iter().any(|(_, v)| v.contains("JITSECRET"))
                 || s.body_text().contains("JITSECRET");
-            assert_eq!(leaks, i == 11, "request {i}: {}", s.url);
+            assert_eq!(leaks, i == 12, "request {i}: {}", s.url);
         }
         // Two accepted starts at the 25-cent quote, on top of the assumed 100.
         assert_eq!(tick_loop.spent_cents, 150);
@@ -1138,7 +1284,14 @@ mod tests {
     fn a_live_plan_only_reads() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let snap = snapshot(&cfg, &fake, "boat_k".into(), "gh_t".into(), NOW).unwrap();
+        let snap = snapshot(
+            &cfg,
+            &fake,
+            "boat_k".into(),
+            github::Auth::Token("gh_t".into()),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(plan(&cfg, &snap, decide_all).len(), 6);
         assert_eq!(
             requests(&fake),
@@ -1301,7 +1454,13 @@ mod tests {
     fn a_restart_makes_no_start_until_an_inflight_create_has_landed() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, "k".into(), "t".into(), NOW);
+        let mut tick_loop = Loop::new(
+            &cfg,
+            &fake,
+            "k".into(),
+            github::Auth::Token("t".into()),
+            NOW,
+        );
         tick_loop.tick(NOW, fork_kept).unwrap();
         tick_loop.tick(NOW + 89, fork_kept).unwrap();
         assert!(forks(&fake).is_empty());
@@ -1349,7 +1508,14 @@ mod tests {
         let cfg = config();
         let fake = Fake::new(reply);
         // The fake lists the same three machines afterwards.
-        let left = drain_with(&cfg, &fake, "k".into(), "t".into(), NOW).unwrap();
+        let left = drain_with(
+            &cfg,
+            &fake,
+            "k".into(),
+            github::Auth::Token("t".into()),
+            NOW,
+        )
+        .unwrap();
         assert_eq!(left, 3);
         // Queued jobs do not matter to drain, so it spends no requests on them.
         assert!(!requests(&fake).iter().any(|r| r.contains("/runs")));
@@ -1825,5 +1991,189 @@ mod tests {
         assert_eq!(cents(Some(0.0)), 0);
         assert_eq!(cents(Some(-1.0)), 0);
         assert_eq!(cents(None), 0);
+    }
+
+    /// `bx_66666666` in pool ci, listed in `state`, a job's fork when `job`. boat says
+    /// `holds` for its `holdsCreatorLogins`, or nothing for `None`.
+    struct Logins {
+        fake: Fake,
+        state: std::rc::Rc<std::cell::RefCell<(&'static str, Option<bool>)>>,
+    }
+
+    impl Logins {
+        fn new(job: bool, holds: Option<bool>) -> Self {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(("idle", holds)));
+            let st = state.clone();
+            let labels = if job {
+                r#"{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}"#
+            } else {
+                r#"{"sw-boat-runner":"ci"}"#
+            };
+            let fake = Fake::new(move |s| {
+                let (listed, holds) = *st.borrow();
+                let sandbox =
+                    format!(r#"{{"id":"bx_66666666","state":"{listed}","labels":{labels}"#);
+                if s.method == "GET" && s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                    let body = format!(
+                        r#"{{"sandboxes":[{sandbox}}}],
+                           "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#
+                    );
+                    respond(200, &[], &body)
+                } else if s.method == "GET" && s.url == format!("{BOAT}/sandboxes/bx_66666666") {
+                    let holds =
+                        holds.map_or(String::new(), |h| format!(r#","holdsCreatorLogins":{h}"#));
+                    respond(200, &[], &format!(r#"{{"sandbox":{sandbox}{holds}}}}}"#))
+                } else if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                    respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+                } else {
+                    reply(s)
+                }
+            });
+            Logins { fake, state }
+        }
+
+        fn count(&self, request: &str) -> usize {
+            requests(&self.fake)
+                .iter()
+                .filter(|r| *r == request)
+                .count()
+        }
+    }
+
+    fn register_66(_: &Snapshot, p: &Pool) -> Vec<Action> {
+        vec![Action::Register {
+            pool: p.name.clone(),
+            machine: "bx_66666666".into(),
+            slot: 0,
+        }]
+    }
+
+    /// A job's fork that holds its creator's logins, or that boat says nothing about, gets
+    /// no runner: it is deleted and the pool's forks back off, doubling while new forks
+    /// keep holding them, until a machine of the pool holds none.
+    #[test]
+    fn a_fork_holding_its_creators_logins_is_deleted_and_forks_back_off() {
+        for holds in [Some(true), None] {
+            let cfg = config();
+            let logins = Logins::new(true, holds);
+            let mut tick_loop = started(&cfg, &logins.fake);
+            let key = ("ci".to_string(), "fork");
+            let get = format!("GET {BOAT}/sandboxes/bx_66666666");
+            let delete = format!("DELETE {BOAT}/sandboxes/bx_66666666");
+            let fork = format!("POST {BOAT}/sandboxes");
+
+            tick_loop.tick(NOW, register_66).unwrap();
+            assert_eq!(registers(&logins.fake), 0);
+            assert_eq!((logins.count(&get), logins.count(&delete)), (1, 1));
+            let f = &tick_loop.failing[&key];
+            assert!(
+                f.logins && f.error.contains(r#"Snapshot "runner-base""#),
+                "{}",
+                f.error
+            );
+            assert_eq!((f.backoff_s, f.until), (BACKOFF_MIN_S, NOW + BACKOFF_MIN_S));
+
+            tick_loop.tick(NOW + 5, fork_job_70).unwrap();
+            assert_eq!(logins.count(&fork), 0);
+            // A fork boat accepts does not end the back-off; the next one holding logins
+            // doubles it.
+            tick_loop.tick(NOW + BACKOFF_MIN_S, fork_job_70).unwrap();
+            assert_eq!(logins.count(&fork), 1);
+            assert!(tick_loop.failing[&key].logins);
+            tick_loop.tick(NOW + 30, register_66).unwrap();
+            assert_eq!(tick_loop.failing[&key].backoff_s, 2 * BACKOFF_MIN_S);
+            assert_eq!(registers(&logins.fake), 0);
+
+            logins.state.borrow_mut().1 = Some(false);
+            tick_loop.tick(NOW + 45, register_66).unwrap();
+            assert_eq!(registers(&logins.fake), 1);
+            assert!(!tick_loop.failing.contains_key(&key));
+        }
+    }
+
+    /// A kept machine holding its creator's logins gets no runner and is not deleted. boat
+    /// is asked again once the machine has started again, which a `noEnv` resume scrubs.
+    #[test]
+    fn a_kept_machine_holding_logins_waits_for_its_next_start() {
+        let cfg = config();
+        let logins = Logins::new(false, Some(true));
+        let mut tick_loop = started(&cfg, &logins.fake);
+        let get = format!("GET {BOAT}/sandboxes/bx_66666666");
+        tick_loop.tick(NOW, register_66).unwrap();
+        tick_loop.tick(NOW + 15, register_66).unwrap();
+        assert_eq!(logins.count(&get), 1);
+        assert_eq!(registers(&logins.fake), 0);
+        assert_eq!(
+            logins.count(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
+            0
+        );
+        assert!(tick_loop.failing.is_empty());
+
+        *logins.state.borrow_mut() = ("archived", Some(true));
+        tick_loop.tick(NOW + 30, no_actions).unwrap();
+        *logins.state.borrow_mut() = ("idle", Some(false));
+        tick_loop.tick(NOW + 45, register_66).unwrap();
+        assert_eq!(logins.count(&get), 2);
+        assert_eq!(registers(&logins.fake), 1);
+    }
+
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn github_credentials_from_the_environment() {
+        let token = github_auth(&vars(&[("GITHUB_TOKEN", "ghp_x")])).unwrap();
+        assert!(matches!(token, github::Auth::Token(t) if t == "ghp_x"));
+        let err = |pairs: &[(&str, &str)]| github_auth(&vars(pairs)).err().unwrap().to_string();
+        assert_eq!(
+            err(&[("GITHUB_TOKEN", "ghp_x"), ("GITHUB_APP_ID", "1")]),
+            "GITHUB_TOKEN and GITHUB_APP_* are both set; set one of them"
+        );
+        assert!(err(&[]).starts_with("GITHUB_TOKEN is not set"));
+        assert_eq!(
+            err(&[("GITHUB_APP_ID", "1")]),
+            "GITHUB_APP_PRIVATE_KEY_FILE is not set"
+        );
+        assert_eq!(
+            err(&[("GITHUB_APP_PRIVATE_KEY_FILE", "/k.pem")]),
+            "GITHUB_APP_ID is not set"
+        );
+        assert_eq!(
+            err(&[
+                ("GITHUB_APP_ID", "1"),
+                ("GITHUB_APP_PRIVATE_KEY_FILE", "/k.pem"),
+                ("GITHUB_APP_INSTALLATION_ID", "abc"),
+            ]),
+            r#"GITHUB_APP_INSTALLATION_ID "abc" is not a number"#
+        );
+        assert!(
+            err(&[
+                ("GITHUB_APP_ID", "1"),
+                ("GITHUB_APP_PRIVATE_KEY_FILE", "/nonexistent/k.pem")
+            ])
+            .starts_with("GITHUB_APP_PRIVATE_KEY_FILE /nonexistent/k.pem: ")
+        );
+
+        let path = std::env::temp_dir().join(format!("sbr-app-key-{}.pem", std::process::id()));
+        std::fs::write(&path, crate::github_app::tests::test_pem()).unwrap();
+        let app = github_auth(&vars(&[
+            ("GITHUB_APP_ID", "12345"),
+            ("GITHUB_APP_PRIVATE_KEY_FILE", path.to_str().unwrap()),
+            ("GITHUB_APP_INSTALLATION_ID", "9"),
+        ]));
+        std::fs::remove_file(&path).unwrap();
+        match app.unwrap() {
+            github::Auth::App(app) => assert_eq!(
+                format!("{app:?}"),
+                r#"App { id: "12345", installation: Some(9), .. }"#
+            ),
+            github::Auth::Token(_) => panic!("a token"),
+        }
     }
 }

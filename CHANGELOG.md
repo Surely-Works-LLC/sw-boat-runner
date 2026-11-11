@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- GitHub App authentication: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and an
+  optional `GITHUB_APP_INSTALLATION_ID` instead of `GITHUB_TOKEN`. The daemon mints and
+  renews the installation token itself. Setting both modes is an error.
+
+### Security
+
+- A runner is registered only on a machine boat reports free of its creator's personal
+  logins (`holdsCreatorLogins: false`). A `noEnv` create keeps logins saved in a snapshot
+  of a sandbox made without `--no-env`, so a CI job could read them. Such a job fork is
+  deleted and the pool's forks back off; a kept machine waits for its next start.
+- Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
+
 ## [0.1.0] - 2026-11-11
 
 First release. sw-boat-runner keeps self-hosted GitHub Actions runners on

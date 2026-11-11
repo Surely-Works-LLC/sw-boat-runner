@@ -49,7 +49,14 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    `/home/user/actions-runner`, its dependencies, and whatever your jobs expect to find.
    Leave the runner unconfigured. Keep logins and tokens out: a job can read every file
    in the snapshot. Remove cleanup timers, because machines keep the snapshot's systemd
-   timers. With the `boat` CLI:
+   timers. Make the snapshot from a sandbox created with `--no-env`: boat says "a saved
+   snapshot of a `--no-env` sandbox stays `--no-env`". A snapshot of any other sandbox
+   carries your personal logins (GitHub token, model logins) into every machine forked
+   from it, even though the daemon forks with `noEnv`. `check` cannot see this. Before it
+   registers a runner, the daemon asks boat whether the machine holds its creator's
+   logins (`holdsCreatorLogins`); if so, or if boat does not say, it registers nothing and
+   logs an error that names the snapshot. A job's fork is deleted and the pool's forks
+   back off; a kept machine waits until it is stopped and resumed. With the `boat` CLI:
 
    ```sh
    boat new --no-env --type large   # the pool's machine_type; prints the machine's id
@@ -57,11 +64,30 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    boat snapshot <id> snap-1        # the name goes in the policy's `snapshot`
    ```
 
-3. Set two environment variables:
+3. Set `BOAT_API_KEY` to a boat key for the account that owns the snapshot, and give the
+   daemon GitHub access in one of two ways. Setting both is an error.
+
+   A GitHub App (recommended). It has its own rate limit instead of a share of yours, it
+   is no one's personal token, and it reaches only the repositories it is installed on.
+   Create an app under your account or organization (Settings, Developer settings,
+   GitHub Apps) with webhooks off and two repository permissions: Administration read and
+   write (to register and delete self-hosted runners) and Actions read (to see queued
+   jobs). Install it on the repository and generate a private key.
 
    | Variable | Value |
    | - | - |
-   | `BOAT_API_KEY` | A boat key for the account that owns the snapshot. |
+   | `GITHUB_APP_ID` | The app's ID, or its client ID. |
+   | `GITHUB_APP_PRIVATE_KEY_FILE` | Path to the private key (`.pem`) GitHub generated. |
+   | `GITHUB_APP_INSTALLATION_ID` | Optional. Without it the daemon looks up the app's installation on the policy's repository. |
+
+   The daemon signs a JWT with the key, exchanges it for an installation token limited
+   to the policy's repository, and renews that token five minutes before it expires and
+   whenever GitHub answers 401. It never logs the key, the JWT or the token.
+
+   Or a fine-grained personal access token:
+
+   | Variable | Value |
+   | - | - |
    | `GITHUB_TOKEN` | A fine-grained personal access token for the repository with Administration read and write (to register runners) and Actions read (to see queued jobs). |
 
    The `GITHUB_TOKEN` that GitHub Actions creates for each workflow run does not work:
@@ -106,8 +132,10 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    Runners you registered yourself with the same labels keep taking these jobs. Remove
    them once the pool runs.
 
-The daemon creates machines with `noEnv`, so boat adds none of the account's secrets. It
-labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
+The daemon creates and resumes machines with `noEnv`. On a create, boat adds none of the
+account's secrets, but logins saved in the snapshot stay, which is why step 2 needs a
+`--no-env` snapshot. On a resume, boat also scrubs owner secrets from the restored disk
+before the machine is reachable. The daemon labels its machines `sw-boat-runner=<pool>`, names its runners `sbr-<pool>-...`, and
 ignores every other machine and runner. To update the runner, rebuild the snapshot.
 
 The [`self-hosted` workflow](.github/workflows/self-hosted.yml) is a working example of
@@ -158,8 +186,7 @@ Use `fork` for untrusted code such as pull requests from forks.
 
 A fine-grained personal access token shares its owner's limit of 5,000 REST requests an
 hour with everything else the owner runs. A GitHub App installation token has its own
-limit, at least 5,000 an hour, but it expires after an hour and the daemon reads
-`GITHUB_TOKEN` only at start.
+limit, at least 5,000 an hour; it expires after an hour, and the daemon renews it.
 
 The daemon aims to use at most a quarter of the limit GitHub reports
 (`X-RateLimit-Limit`), 1,250 requests an hour for a personal token. When fewer requests

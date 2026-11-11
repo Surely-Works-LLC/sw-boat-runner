@@ -19,7 +19,8 @@ Keeps self-hosted GitHub Actions runners on boat machines.
   run     observe, decide and act every tick_s seconds
   drain   delete the policy's runners and machines; fails while any are left
 
-run, drain and a live plan read BOAT_API_KEY and GITHUB_TOKEN.";
+run, drain and a live plan read BOAT_API_KEY, and GITHUB_TOKEN or a GitHub App's
+GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE and optional GITHUB_APP_INSTALLATION_ID.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
