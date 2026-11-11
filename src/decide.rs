@@ -79,8 +79,9 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         .iter()
         .filter(|m| m.job.is_some() && m.state != MachineState::Gone)
     {
-        let busy = runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy);
-        let live = runners_on(snap, &m.id).any(|r| r.state != RunnerState::Offline);
+        let on: Vec<&Runner> = runners_on(snap, &m.id).collect();
+        let busy = on.iter().any(|r| r.state == RunnerState::Busy);
+        let live = on.iter().any(|r| r.state != RunnerState::Offline);
         let seen = m.last_busy >= m.since;
         let age = now.saturating_sub(m.since);
         let finished = match m.state {
@@ -93,7 +94,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             actions.push(Action::Delete {
                 machine: m.id.clone(),
             });
-        } else if m.state == MachineState::Up && !seen && runners_on(snap, &m.id).next().is_none() {
+        } else if m.state == MachineState::Up && !seen && on.is_empty() {
             fresh.push(*m);
         }
     }
