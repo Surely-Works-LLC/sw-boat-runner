@@ -327,6 +327,9 @@ pub struct Loop<'a> {
     restarted: bool,
     /// Forks this process created that boat has not listed yet.
     pending: Vec<Pending>,
+    /// Stopped machines this process resumed, with when, that boat may still list as
+    /// stopped; `decide` sees them as `Starting` for the same window as `pending`.
+    resumed: Vec<(String, UnixSecs)>,
     /// Starts that failed last time they were sent, by pool and kind; see `Failing`.
     failing: HashMap<(String, &'static str), Failing>,
 }
@@ -378,6 +381,7 @@ impl<'a> Loop<'a> {
             starts_blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             restarted: true,
             pending: Vec::new(),
+            resumed: Vec::new(),
             failing: HashMap::new(),
         }
     }
@@ -573,6 +577,23 @@ impl<'a> Loop<'a> {
             }
             keep
         });
+        // A resume boat accepted holds its box from then on, though the listing may still
+        // show the machine stopped; resumed again, it would cost a second start.
+        self.resumed.retain(|(id, sent)| {
+            let stale = machines
+                .iter()
+                .any(|m| m.id == *id && m.state == MachineState::Stopped);
+            let keep = stale && now.saturating_sub(*sent) <= lag_s;
+            if stale && !keep {
+                eprintln!("warn: resume of {id} was never listed; dropped");
+            }
+            keep
+        });
+        for m in &mut machines {
+            if self.resumed.iter().any(|(id, _)| *id == m.id) {
+                m.state = MachineState::Starting;
+            }
+        }
         machines.extend(self.pending.iter().map(|p| Machine {
             id: p.id.clone(),
             pool: p.pool.clone(),
@@ -636,6 +657,9 @@ impl<'a> Loop<'a> {
                 {
                     eprintln!("warn: {machine} lost its disk; deleting it");
                     return self.delete_machine(machine, runner_ids);
+                }
+                if result.is_ok() {
+                    self.resumed.push((machine.clone(), now));
                 }
                 result
             }
@@ -1537,6 +1561,49 @@ mod tests {
                 .body_text()
                 .contains(r#""sw-boat-runner-job":"71-1""#)
         );
+    }
+
+    const ARCHIVED_33: &str =
+        r#"{"id":"bx_33333333","state":"archived","labels":{"sw-boat-runner":"ci"}}"#;
+    const RESUMING_33: &str =
+        r#"{"id":"bx_33333333","state":"provisioning","labels":{"sw-boat-runner":"ci"}}"#;
+
+    fn resumes(fake: &Fake) -> usize {
+        requests(fake)
+            .iter()
+            .filter(|r| r.ends_with("/resume"))
+            .count()
+    }
+
+    /// boat still lists the resumed machine as archived on the next ticks. Until it lists
+    /// the resume or the listing window passes, the machine counts as Starting: it is not
+    /// resumed again, and it holds the pool's one box, so job 71 gets no fork.
+    #[test]
+    fn a_resume_boat_has_not_listed_is_not_resumed_again() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume, Placement::Fork];
+        cfg.pools[0].slots_per_box = 1;
+        cfg.pools[0].max_boxes = 1;
+        let fake = lagging(
+            |t| if t < 4 { ARCHIVED_33 } else { RESUMING_33 },
+            |_| JOBS_70_71,
+        );
+        let mut tick_loop = started(&cfg, &fake);
+        for k in 0..4 {
+            tick_loop.tick(NOW + 15 * k, decide).unwrap();
+        }
+        assert_eq!((resumes(&fake), forks(&fake).len()), (1, 0));
+        assert!(tick_loop.resumed.is_empty());
+
+        // A resume boat never lists is forgotten after the window, like a fork.
+        let fake = lagging(|_| ARCHIVED_33, |_| JOB_70);
+        let mut tick_loop = started(&cfg, &fake);
+        let lag_s = HTTP_TIMEOUT.as_secs() + cfg.tick_s;
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop.tick(NOW + lag_s, decide).unwrap();
+        assert_eq!(resumes(&fake), 1);
+        tick_loop.tick(NOW + lag_s + 1, decide).unwrap();
+        assert_eq!(resumes(&fake), 2);
     }
 
     #[test]
