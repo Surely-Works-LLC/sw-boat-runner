@@ -177,7 +177,7 @@ process saw it online is `Registered` until that timeout.
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that is not `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, minus its runners
@@ -189,6 +189,9 @@ pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects 
 without it. A job that matches several pools counts only for the first one in the file.
 
 Stop needs `resume` in placement because without it a stopped machine never comes back.
+A pool without `slot` keeps no kept machine: one is left only when the pool's placement
+changed after it was made, and without this rule it would hold a `max_boxes` box until
+boat's 30-day TTL. A `Stopping` one is deleted once it is `Stopped`.
 A `Busy` runner keeps its machine even past `fork_ttl_s`, which counts from the machine's
 last state change. The policy accepts `fork_ttl_s` from 1 to 2592000 (30 days, boat's
 longest TTL) and rejects anything else rather than clamping it.

@@ -46,6 +46,12 @@ in [docs/design.md](../docs/design.md). The spec does not read Rust code.
 ## What is abstracted away
 
 - One pool with one label set and one slot per machine. No routing between pools.
+- Placement is fixed for a run. `decide` also deletes an idle kept machine that is Up or
+  Starting in a pool without `slot`, which is left over when a pool's placement changes.
+  The models cannot reach that state: kept machines start `Stopped`, the only model
+  without `slot` (`BoatRunnerFork.cfg`) has no `resume` and, by `ASSUME`, no `MinUp`, so
+  it never resumes or forks a kept machine, and the `Stopped` rule deletes them. So
+  `DeleteGuard` leaves that rule out.
 - One price unit per paid start, and no day rollover.
 - Stopping is folded into Stopped. HTTP errors other than a refused start, a lost
   create and a failed runner delete are not modelled. A lost create of a machine boat
