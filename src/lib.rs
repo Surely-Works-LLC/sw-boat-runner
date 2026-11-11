@@ -3,6 +3,7 @@
 pub mod boat;
 pub mod decide;
 pub mod github;
+pub mod github_app;
 pub mod model;
 pub mod policy;
 pub mod run;

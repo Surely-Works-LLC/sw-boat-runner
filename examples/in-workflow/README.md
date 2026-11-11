@@ -58,7 +58,9 @@ deletes the pool's machines and runners with `sw-boat-runner drain`.
 What this costs compared with a daemon that stays up:
 
 - With the default `fork` preset every job is one start, as with `runs-on: boat`, on a
-  fresh machine from your snapshot with none of the account's secrets. `pool: preset =
+  fresh machine from your snapshot with none of the account's secrets, as long as the
+  snapshot was saved from a `--no-env` sandbox
+  ([README](../../README.md#connect-a-repository), step 2). `pool: preset =
   "warm"` reuses machines among the jobs of one run. Nothing is kept between runs; a
   [daemon that stays up](../always-on/) does that.
 - Jobs wait for the daemon to build and for its 90 s restart wait, about 3 minutes in

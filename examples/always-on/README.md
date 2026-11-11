@@ -16,9 +16,25 @@ curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0
 bash install.sh policy.toml    # asks for BOAT_API_KEY and GITHUB_TOKEN
 ```
 
+To use a GitHub App instead of a personal token, copy its private key to the machine
+(over `boat scp`, or paste it into a file over `boat ssh`) and set the App variables
+from the [README](../../README.md#connect-a-repository) before running the script:
+
+```sh
+read -rp 'GITHUB_APP_ID: ' GITHUB_APP_ID && export GITHUB_APP_ID
+export GITHUB_APP_PRIVATE_KEY_FILE=$HOME/app.pem   # GITHUB_APP_INSTALLATION_ID is optional
+bash install.sh policy.toml    # asks for BOAT_API_KEY only
+rm "$HOME/app.pem"
+```
+
+The App variables need a release after 0.1.0. Until one is out, change `--tag v0.1.0` in
+the script to `--branch main`.
+
 [install.sh](install.sh) asks for the two keys without echoing them, builds the daemon,
 and stores the policy in `/etc/sw-boat-runner` and the keys in `/etc/sw-boat-runner/env`
-(mode 0600, readable by root only). It then enables a systemd service that runs the
+(mode 0600, readable by root only). An App's private key goes to
+`/etc/sw-boat-runner/github-app.pem`, also 0600 and root's, and systemd hands the
+service a copy with `LoadCredential`. It then enables a systemd service that runs the
 daemon as an unprivileged dynamic user with a read-only file system, no access to home
 directories, and no way to gain privileges. An enabled service starts again after the
 machine stops and resumes, and the daemon is safe to restart at any time.

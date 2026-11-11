@@ -3,6 +3,7 @@
 use std::cell::Cell;
 
 use super::{HTTP_TIMEOUT, Loop};
+use crate::github;
 use crate::model::{Action, Config, JobKey, Placement, Pool, UnixSecs};
 use crate::transport::Response;
 use crate::transport::fake::{Fake, Reply, Sent, respond};
@@ -39,7 +40,12 @@ pub(super) fn config() -> Config {
 
 /// A loop whose restart wait is over by `NOW`.
 pub(super) fn started<'a>(cfg: &'a Config, fake: &'a Fake) -> Loop<'a> {
-    Loop::new(cfg, fake, BOAT_KEY.into(), GH_TOKEN.into(), STARTED)
+    Loop::new(cfg, fake, BOAT_KEY.into(), gh_auth(), STARTED)
+}
+
+/// `GH_TOKEN` as a personal access token.
+pub(super) fn gh_auth() -> github::Auth {
+    github::Auth::Token(GH_TOKEN.into())
 }
 
 /// Three machines of pool `ci` (one up, one stopped, one job fork), two of its runners and
@@ -67,6 +73,13 @@ pub(super) fn reply(s: &Sent) -> Response {
         ("GET", u) if u.contains("status=in_progress") => r#"{"workflow_runs":[]}"#,
         ("GET", u) if u.contains("/runs/5/jobs") => {
             r#"{"jobs":[{"id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}]}"#
+        }
+        ("GET", u) if u.starts_with(&format!("{BOAT}/sandboxes/bx_")) => {
+            let id = u.rsplit('/').next().unwrap_or_default();
+            let body = format!(
+                r#"{{"sandbox":{{"id":"{id}","state":"idle","holdsCreatorLogins":false}}}}"#
+            );
+            return respond(200, &[], &body);
         }
         ("GET", u) if u.ends_with("/v1/limits") => r#"{"canStart":true,"nextStartDollars":0.25}"#,
         ("POST", u) if u.ends_with("/generate-jitconfig") => {

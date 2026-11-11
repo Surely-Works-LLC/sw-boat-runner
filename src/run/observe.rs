@@ -33,6 +33,9 @@ struct Seen {
     state: MachineState,
     since: UnixSecs,
     last_busy: UnixSecs,
+    /// A kept machine found holding its creator's logins in its current state. No runner
+    /// goes on it until it starts again.
+    holds_logins: bool,
 }
 
 /// A start boat accepted but may not list for a while (`FixListLag`). Until it is listed,
@@ -79,6 +82,20 @@ impl Memory {
     pub(super) fn mark_used(&mut self, machine: &str, now: UnixSecs) {
         if let Some(seen) = self.machines.get_mut(machine) {
             seen.last_busy = now;
+        }
+    }
+
+    /// Whether `machine` was found holding its creator's logins since it last changed state.
+    pub(super) fn holds_logins(&self, machine: &str) -> bool {
+        self.machines
+            .get(machine)
+            .is_some_and(|seen| seen.holds_logins)
+    }
+
+    /// Notes that `machine` holds its creator's logins, until it changes state.
+    pub(super) fn note_holds_logins(&mut self, machine: &str) {
+        if let Some(seen) = self.machines.get_mut(machine) {
+            seen.holds_logins = true;
         }
     }
 
@@ -144,10 +161,12 @@ impl Memory {
                     state,
                     since: now,
                     last_busy: if used { now } else { now.saturating_sub(1) },
+                    holds_logins: false,
                 });
                 if seen.state != state {
                     seen.state = state;
                     seen.since = now;
+                    seen.holds_logins = false;
                 }
                 if live.contains(sb.id.as_str()) {
                     seen.last_busy = now;

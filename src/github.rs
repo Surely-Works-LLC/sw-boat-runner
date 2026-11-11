@@ -7,8 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::boat;
+use crate::github_app::App;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
-use crate::transport::{Transport, redact};
+use crate::transport::{Response, Transport, redact};
 
 pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
@@ -47,6 +48,9 @@ pub enum Error {
         status: u16,
     },
     NotFound,
+    /// The GitHub App's JWT or installation was refused: wrong app id or key, the app
+    /// not installed on the repository, or a missing permission.
+    App(String),
     Network(String),
     Status {
         status: u16,
@@ -57,15 +61,16 @@ pub enum Error {
 
 impl Error {
     pub(crate) fn is_fatal(&self) -> bool {
-        matches!(self, Error::Unauthorized { .. })
+        matches!(self, Error::Unauthorized { .. } | Error::App(_))
     }
 
     /// This error with every copy of `secret` in its text replaced.
     fn redact(mut self, secret: &str) -> Self {
         match &mut self {
-            Error::Network(text) | Error::Status { message: text, .. } | Error::Parse(text) => {
-                redact(text, secret)
-            }
+            Error::Network(text)
+            | Error::Status { message: text, .. }
+            | Error::Parse(text)
+            | Error::App(text) => redact(text, secret),
             Error::RateLimited { .. } | Error::Unauthorized { .. } | Error::NotFound => {}
         }
         self
@@ -80,6 +85,7 @@ impl fmt::Display for Error {
             }
             Error::Unauthorized { status } => write!(f, "GitHub unauthorized ({status})"),
             Error::NotFound => write!(f, "GitHub: not found"),
+            Error::App(e) => write!(f, "GitHub App: {e}"),
             Error::Network(e) => write!(f, "GitHub network error: {e}"),
             Error::Status { status, message } => write!(f, "GitHub error {status}: {message}"),
             Error::Parse(e) => write!(f, "GitHub response not understood: {e}"),
@@ -216,9 +222,27 @@ struct Cached {
     used: bool,
 }
 
+/// How the client authenticates to GitHub.
+pub enum Auth {
+    /// A personal access token, sent as is.
+    Token(String),
+    /// A GitHub App, whose installation token the client mints and renews itself.
+    App(Box<App>),
+}
+
+impl Auth {
+    /// The credential requests carry now, to keep out of error text.
+    fn secret(&self) -> Option<&str> {
+        match self {
+            Auth::Token(token) => Some(token),
+            Auth::App(app) => app.held_token(),
+        }
+    }
+}
+
 pub(crate) struct Client<'t> {
     t: &'t dyn Transport,
-    token: String,
+    auth: Auth,
     repo: String,
     now: UnixSecs,
     /// Bodies by URL with their ETag. A 304 answer to `If-None-Match` does not count
@@ -232,10 +256,10 @@ pub(crate) struct Client<'t> {
 }
 
 impl<'t> Client<'t> {
-    pub(crate) fn new(t: &'t dyn Transport, token: String, repo: String) -> Self {
+    pub(crate) fn new(t: &'t dyn Transport, auth: Auth, repo: String) -> Self {
         Client {
             t,
-            token,
+            auth,
             repo,
             now: 0,
             cache: HashMap::new(),
@@ -295,7 +319,10 @@ impl<'t> Client<'t> {
         body: Option<&Value>,
     ) -> Result<Vec<u8>, Error> {
         let result = self.send(method, path, body);
-        result.map_err(|e| e.redact(&self.token))
+        result.map_err(|e| match self.auth.secret() {
+            Some(secret) => e.redact(secret),
+            None => e,
+        })
     }
 
     fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Vec<u8>, Error> {
@@ -307,29 +334,16 @@ impl<'t> Client<'t> {
         }
         let url = format!("{API}/repos/{}{path}", self.repo);
         let cacheable = method == "GET";
-        let auth = format!("Bearer {}", self.token);
-        let mut headers = vec![
-            ("Authorization", auth.as_str()),
-            ("Accept", "application/vnd.github+json"),
-            ("X-GitHub-Api-Version", "2022-11-28"),
-            ("User-Agent", "sw-boat-runner"),
-        ];
-        let etag = self
-            .cache
-            .get(&url)
-            .filter(|_| cacheable)
-            .map(|c| c.etag.clone());
-        if let Some(etag) = &etag {
-            headers.push(("If-None-Match", etag.as_str()));
+        let mut resp = self.send_once(method, &url, body)?;
+        // An installation token GitHub no longer takes, revoked or outlived by a clock
+        // that ran slow, is minted again once.
+        if resp.status == 401 {
+            if let Auth::App(app) = &mut self.auth {
+                app.forget_token();
+                self.budget.tokens -= 1.0;
+                resp = self.send_once(method, &url, body)?;
+            }
         }
-        if body.is_some() {
-            headers.push(("Content-Type", "application/json"));
-        }
-        let bytes = body.map(|b| b.to_string().into_bytes());
-        let resp = self
-            .t
-            .send(method, &url, &headers, bytes.as_deref())
-            .map_err(|e| Error::Network(e.0))?;
 
         let remaining = resp.number("x-ratelimit-remaining");
         let retry_after = resp.number("retry-after");
@@ -404,6 +418,41 @@ impl<'t> Client<'t> {
                 message: message(),
             }),
         }
+    }
+
+    /// One request with the current credential and, for a cached GET, its ETag.
+    fn send_once(
+        &mut self,
+        method: &str,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<Response, Error> {
+        let token = match &mut self.auth {
+            Auth::Token(token) => token.clone(),
+            Auth::App(app) => app.token(self.t, &self.repo, self.now)?,
+        };
+        let auth = format!("Bearer {token}");
+        let mut headers = vec![
+            ("Authorization", auth.as_str()),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "sw-boat-runner"),
+        ];
+        let etag = self
+            .cache
+            .get(url)
+            .filter(|_| method == "GET")
+            .map(|c| c.etag.clone());
+        if let Some(etag) = &etag {
+            headers.push(("If-None-Match", etag.as_str()));
+        }
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json"));
+        }
+        let bytes = body.map(|b| b.to_string().into_bytes());
+        self.t
+            .send(method, url, &headers, bytes.as_deref())
+            .map_err(|e| Error::Network(e.0))
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> Result<T, Error> {
@@ -630,7 +679,7 @@ mod tests {
                 &json!({"total_count": 101, "runners": runners}).to_string(),
             )
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         let got = gh.runners().unwrap();
         assert_eq!(got.len(), 100);
         assert_eq!(got.last().unwrap().id, 500);
@@ -652,7 +701,7 @@ mod tests {
                 &json!({"runners": [runner_json(1, "sbr-ci-bx_22222222-0-1")]}).to_string(),
             ),
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         gh.begin_tick(1);
         let first = gh.runners().unwrap();
         gh.begin_tick(2);
@@ -682,7 +731,7 @@ mod tests {
                 r#"{"runners":[]}"#,
             )
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         gh.begin_tick(1000);
         assert!(gh.runners().unwrap().is_empty());
         assert_eq!(
@@ -713,7 +762,7 @@ mod tests {
                 respond(401, &[], r#"{"message":"Bad credentials"}"#)
             }
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         assert_eq!(
             gh.runners(),
             Err(Error::RateLimited {
@@ -737,7 +786,7 @@ mod tests {
                 r#"{"message":"You have exceeded a secondary rate limit."}"#,
             )
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         gh.begin_tick(100);
         let limited = Error::RateLimited {
             remaining: 0,
@@ -748,7 +797,7 @@ mod tests {
         assert_eq!(fake.sent().len(), 1);
 
         let fake = Fake::new(|_| respond(429, &[], "{}"));
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         assert!(matches!(gh.runners(), Err(Error::RateLimited { .. })));
     }
 
@@ -773,7 +822,7 @@ mod tests {
             };
             respond(200, &[], &body.to_string())
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         let jobs = gh.queued_jobs(&|_| true).unwrap();
         assert_eq!(
             jobs,
@@ -805,7 +854,7 @@ mod tests {
                 r#"{"runner":{"id":9,"name":"n"},"encoded_jit_config":"SECRET"}"#,
             )
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         let jit = gh
             .generate_jitconfig("sbr-ci-bx_22222222-0-1", &["self-hosted".into()])
             .unwrap();
@@ -820,6 +869,78 @@ mod tests {
             body,
             json!({"name": "sbr-ci-bx_22222222-0-1", "runner_group_id": 1, "labels": ["self-hosted"]})
         );
+    }
+
+    /// An installation token GitHub answers with 401 is minted again and the request sent
+    /// once more; a second 401 is fatal.
+    #[test]
+    fn an_app_token_is_renewed_after_a_401() {
+        let fake = |revoked: &'static [&'static str]| {
+            let minted = std::cell::Cell::new(0);
+            Fake::new(move |s| {
+                if s.url.ends_with("/app/installations/77/access_tokens") {
+                    minted.set(minted.get() + 1);
+                    let body = format!(
+                        r#"{{"token":"ghs_{}","expires_at":"2099-01-01T00:00:00Z"}}"#,
+                        minted.get()
+                    );
+                    return respond(201, &[], &body);
+                }
+                let token = s.header("authorization").unwrap_or_default();
+                if revoked.iter().any(|r| token.ends_with(r)) {
+                    respond(401, &[], r#"{"message":"Bad credentials"}"#)
+                } else {
+                    respond(200, &[], r#"{"runners":[]}"#)
+                }
+            })
+        };
+        let app = |fake| {
+            let app = crate::github_app::tests::test_app(Some(77));
+            Client::new(fake, Auth::App(Box::new(app)), "o/r".into())
+        };
+        let renewed = fake(&["ghs_1"]);
+        let mut gh = app(&renewed);
+        gh.begin_tick(T0);
+        gh.runners().unwrap();
+        gh.runners().unwrap();
+        let sent: Vec<(String, String)> = renewed
+            .sent()
+            .iter()
+            .map(|s| {
+                let path = s.url.trim_start_matches(API).to_string();
+                let auth = s.header("authorization").unwrap().to_string();
+                (
+                    path,
+                    if auth.contains("ghs_") {
+                        auth
+                    } else {
+                        "jwt".into()
+                    },
+                )
+            })
+            .collect();
+        let runners = "/repos/o/r/actions/runners?per_page=100&page=1";
+        let tokens = "/app/installations/77/access_tokens";
+        let want = [
+            (tokens, "jwt"),
+            (runners, "Bearer ghs_1"),
+            (tokens, "jwt"),
+            (runners, "Bearer ghs_2"),
+            (runners, "Bearer ghs_2"),
+        ];
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(p, a)| (p.to_string(), a.to_string()))
+            .collect();
+        assert_eq!(sent, want);
+
+        let refused = fake(&["ghs_1", "ghs_2"]);
+        let mut gh = app(&refused);
+        gh.begin_tick(T0);
+        let err = gh.runners().unwrap_err();
+        assert_eq!(err, Error::Unauthorized { status: 401 });
+        assert!(err.is_fatal());
+        assert_eq!(refused.sent().len(), 4);
     }
 
     /// A repository with `runs` in-progress runs, each with one running job. `queued_in`
@@ -896,7 +1017,7 @@ mod tests {
     #[test]
     fn thirty_in_progress_runs_stay_in_budget() {
         let busy = Busy::new(30, 4_000);
-        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
         let per_tick: Vec<usize> = (0..240).map(|t| busy.tick(&mut gh, t).0).collect();
         assert_eq!(per_tick[0], 32);
         let hour: usize = per_tick.iter().sum();
@@ -910,7 +1031,7 @@ mod tests {
     /// looks unchanged.
     fn ticks_to_find(runs: u64, run: u64, settle: u64) -> u64 {
         let busy = Busy::new(runs, 4_000);
-        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
         for t in 0..settle {
             busy.tick(&mut gh, t);
         }
@@ -946,7 +1067,7 @@ mod tests {
     #[test]
     fn changed_and_wanted_runs_are_read_at_once() {
         let busy = Busy::new(30, 4_000);
-        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
         for t in 0..40 {
             busy.tick(&mut gh, t);
         }
@@ -981,7 +1102,7 @@ mod tests {
     #[test]
     fn a_low_budget_stretches_observation() {
         let busy = Busy::new(30, 450);
-        let mut gh = Client::new(&busy.fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
         let observed: Vec<u64> = (0..80)
             .filter(|&t| busy.tick(&mut gh, t).1.is_some())
             .collect();
@@ -1005,7 +1126,7 @@ mod tests {
             };
             respond(200, &[("ETag", "\"j\"")], &body.to_string())
         });
-        let mut gh = Client::new(&fake, "t".into(), "o/r".into());
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         for t in 0..=RUN_MAX_AGE_S / TICK_S {
             gh.begin_tick(T0 + t * TICK_S);
             gh.queued_jobs(&|_| true).unwrap();

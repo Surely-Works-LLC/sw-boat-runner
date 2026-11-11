@@ -46,6 +46,9 @@ struct Failing {
     error: String,
     backoff_s: u64,
     until: UnixSecs,
+    /// Forks deleted for holding their creator's logins. A fork boat accepts proves
+    /// nothing then, so only a machine of the pool found without them clears it.
+    logins: bool,
 }
 
 impl Ledger {
@@ -92,6 +95,48 @@ impl Ledger {
         self.failing.get(key).is_some_and(|f| now < f.until)
     }
 
+    /// Forgets the starts `decide` no longer asks for, except a logins back-off.
+    fn keep_asked(&mut self, asked: &HashSet<(String, StartKind)>) {
+        self.failing.retain(|k, f| f.logins || asked.contains(k));
+    }
+
+    /// A start boat accepted ends its back-off, except a logins back-off.
+    fn succeeded(&mut self, key: &(String, StartKind)) {
+        if !self.failing.get(key).is_some_and(|f| f.logins) {
+            self.failing.remove(key);
+        }
+    }
+
+    /// A fork of `pool` held its creator's logins: the pool's forks wait, doubling while
+    /// new forks keep holding them. Returns the wait.
+    fn fork_held_logins(&mut self, now: UnixSecs, pool: &str, error: String) -> u64 {
+        let key = (pool.to_string(), StartKind::Fork);
+        let backoff_s = match self.failing.get(&key) {
+            Some(f) if f.logins => (f.backoff_s * 2).clamp(BACKOFF_MIN_S, BACKOFF_MAX_S),
+            _ => BACKOFF_MIN_S,
+        };
+        let until = now.saturating_add(backoff_s);
+        let logins = true;
+        self.failing.insert(
+            key,
+            Failing {
+                error,
+                backoff_s,
+                until,
+                logins,
+            },
+        );
+        backoff_s
+    }
+
+    /// A machine of `pool` held none of its creator's logins, which ends a logins back-off.
+    fn pool_free_of_logins(&mut self, pool: &str) {
+        let key = (pool.to_string(), StartKind::Fork);
+        if self.failing.get(&key).is_some_and(|f| f.logins) {
+            self.failing.remove(&key);
+        }
+    }
+
     /// Logs a failed start. The same error twice in a row backs the start off; a repeat
     /// is logged only when it is sent again after its wait.
     fn note_failure(
@@ -112,12 +157,14 @@ impl Ledger {
             eprintln!("{action:?}: {e} (again; next try in {backoff_s}s)");
         }
         let until = now.saturating_add(backoff_s);
+        let logins = false;
         self.failing.insert(
             key,
             Failing {
                 error,
                 backoff_s,
                 until,
+                logins,
             },
         );
     }
@@ -188,7 +235,7 @@ impl Loop<'_> {
             .iter()
             .filter_map(|a| backoff_key(snapshot, a))
             .collect();
-        self.ledger.failing.retain(|k, _| asked.contains(k));
+        self.ledger.keep_asked(&asked);
         let limits = snapshot.limits;
         let mut tick = Tick {
             now,
@@ -214,7 +261,7 @@ impl Loop<'_> {
             match self.execute(&mut tick, action) {
                 Ok(()) => {
                     if let Some(k) = &key {
-                        self.ledger.failing.remove(k);
+                        self.ledger.succeeded(k);
                     }
                 }
                 Err(e) if e.is_fatal() => return Err(e),
@@ -250,7 +297,13 @@ impl Loop<'_> {
                 pool,
                 machine,
                 slot,
-            } => self.register(t.now, pool, machine, *slot),
+            } => {
+                if self.free_of_logins(t, pool, machine)? {
+                    self.register(t.now, pool, machine, *slot)
+                } else {
+                    Ok(())
+                }
+            }
             Action::Resume { machine } => self.resume(t, machine),
             Action::Fork { pool, job } => self.fork(t, pool, *job),
         }
@@ -289,6 +342,44 @@ impl Loop<'_> {
             Err(boat::Error::NotFound) => Ok(()),
             r => r.map_err(Error::from),
         }
+    }
+
+    /// Whether `machine` holds none of its creator's logins, so a runner may go on it.
+    /// boat's `noEnv` create keeps logins saved in the snapshot, and a CI job could read
+    /// them. A job's fork that holds them is deleted and the pool's forks back off; a kept
+    /// machine waits for its next start, whose `noEnv` resume scrubs them, and is logged
+    /// once. A machine boat does not say about counts as holding them.
+    fn free_of_logins(&mut self, t: &mut Tick, pool: &str, machine: &str) -> Result<bool, Error> {
+        if self.memory.holds_logins(machine) {
+            return Ok(false);
+        }
+        let p = self.pool(pool)?;
+        let sb = self.boat.get(machine)?;
+        let why = match sb.holds_creator_logins {
+            Some(false) => {
+                self.ledger.pool_free_of_logins(pool);
+                return Ok(true);
+            }
+            Some(true) => "holds its creator's personal logins (GitHub token, model logins)",
+            None => {
+                "may hold its creator's personal logins: boat did not report holdsCreatorLogins"
+            }
+        };
+        let error = format!(
+            "{machine} in pool {pool} {why}. Snapshot {:?} must be saved from a sandbox created \
+             with --no-env; a CI job there could read them",
+            p.snapshot
+        );
+        if sb.job().is_some() {
+            let msg = format!("error: {error}. No runner registered; deleting it");
+            let backoff_s = self.ledger.fork_held_logins(t.now, pool, error);
+            eprintln!("{msg}, next fork in {backoff_s}s");
+            self.delete_machine(t, machine)?;
+        } else {
+            eprintln!("error: {error}. No runner registered until it is stopped and resumed");
+            self.memory.note_holds_logins(machine);
+        }
+        Ok(false)
     }
 
     /// If the file write or the command fails, the GitHub runner stays `Registered` and
@@ -525,7 +616,7 @@ mod tests {
     fn a_restart_just_before_midnight_spends_normally_the_next_day() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), GH_TOKEN.into(), DAY_S - 1);
+        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), DAY_S - 1);
         assert_eq!(tick_loop.ledger.spent_cents, 100);
         tick_loop.tick(DAY_S + 90, |_, _| Vec::new()).unwrap();
         assert_eq!(tick_loop.ledger.spent_cents, 0);
@@ -564,7 +655,7 @@ mod tests {
     fn a_restart_makes_no_start_until_an_inflight_create_has_landed() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), GH_TOKEN.into(), NOW);
+        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), NOW);
         let fork_kept = |_: &Snapshot, _: &Pool| vec![fork(None)];
         tick_loop.tick(NOW, fork_kept).unwrap();
         tick_loop.tick(NOW + 89, fork_kept).unwrap();
@@ -768,5 +859,125 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `bx_66666666` in pool ci, listed in `state`, a job's fork when `job`. boat says
+    /// `holds` for its `holdsCreatorLogins`, or nothing for `None`.
+    struct Logins {
+        fake: Fake,
+        state: std::rc::Rc<std::cell::RefCell<(&'static str, Option<bool>)>>,
+    }
+
+    impl Logins {
+        fn new(job: bool, holds: Option<bool>) -> Self {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(("idle", holds)));
+            let st = state.clone();
+            let labels = if job {
+                r#"{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}"#
+            } else {
+                r#"{"sw-boat-runner":"ci"}"#
+            };
+            let fake = Fake::new(move |s| {
+                let (listed, holds) = *st.borrow();
+                let sandbox =
+                    format!(r#"{{"id":"bx_66666666","state":"{listed}","labels":{labels}"#);
+                if s.method == "GET" && s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                    let body = format!(
+                        r#"{{"sandboxes":[{sandbox}}}],
+                           "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#
+                    );
+                    respond(200, &[], &body)
+                } else if s.method == "GET" && s.url == format!("{BOAT}/sandboxes/bx_66666666") {
+                    let holds =
+                        holds.map_or(String::new(), |h| format!(r#","holdsCreatorLogins":{h}"#));
+                    respond(200, &[], &format!(r#"{{"sandbox":{sandbox}{holds}}}}}"#))
+                } else if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                    respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+                } else {
+                    reply(s)
+                }
+            });
+            Logins { fake, state }
+        }
+
+        fn count(&self, request: &str) -> usize {
+            requests(&self.fake)
+                .iter()
+                .filter(|r| *r == request)
+                .count()
+        }
+    }
+
+    fn register_66(_: &Snapshot, _: &Pool) -> Vec<Action> {
+        vec![register("bx_66666666", 0)]
+    }
+
+    /// A job's fork that holds its creator's logins, or that boat says nothing about, gets
+    /// no runner: it is deleted and the pool's forks back off, doubling while new forks
+    /// keep holding them, until a machine of the pool holds none.
+    #[test]
+    fn a_fork_holding_its_creators_logins_is_deleted_and_forks_back_off() {
+        for holds in [Some(true), None] {
+            let cfg = config();
+            let logins = Logins::new(true, holds);
+            let mut tick_loop = started(&cfg, &logins.fake);
+            let key = ("ci".to_string(), StartKind::Fork);
+            let get = format!("GET {BOAT}/sandboxes/bx_66666666");
+            let delete = format!("DELETE {BOAT}/sandboxes/bx_66666666");
+            let fork_70 = |_: &Snapshot, _: &Pool| vec![fork(Some(70))];
+
+            tick_loop.tick(NOW, register_66).unwrap();
+            assert_eq!(registers(&logins.fake), 0);
+            assert_eq!((logins.count(&get), logins.count(&delete)), (1, 1));
+            let f = &tick_loop.ledger.failing[&key];
+            assert!(
+                f.logins && f.error.contains(r#"Snapshot "runner-base""#),
+                "{}",
+                f.error
+            );
+            assert_eq!((f.backoff_s, f.until), (BACKOFF_MIN_S, NOW + BACKOFF_MIN_S));
+
+            tick_loop.tick(NOW + 5, fork_70).unwrap();
+            assert_eq!(forks(&logins.fake).len(), 0);
+            // A fork boat accepts does not end the back-off; the next one holding logins
+            // doubles it.
+            tick_loop.tick(NOW + BACKOFF_MIN_S, fork_70).unwrap();
+            assert_eq!(forks(&logins.fake).len(), 1);
+            assert!(tick_loop.ledger.failing[&key].logins);
+            tick_loop.tick(NOW + 30, register_66).unwrap();
+            assert_eq!(tick_loop.ledger.failing[&key].backoff_s, 2 * BACKOFF_MIN_S);
+            assert_eq!(registers(&logins.fake), 0);
+
+            logins.state.borrow_mut().1 = Some(false);
+            tick_loop.tick(NOW + 45, register_66).unwrap();
+            assert_eq!(registers(&logins.fake), 1);
+            assert!(!tick_loop.ledger.failing.contains_key(&key));
+        }
+    }
+
+    /// A kept machine holding its creator's logins gets no runner and is not deleted. boat
+    /// is asked again once the machine has started again, which a `noEnv` resume scrubs.
+    #[test]
+    fn a_kept_machine_holding_logins_waits_for_its_next_start() {
+        let cfg = config();
+        let logins = Logins::new(false, Some(true));
+        let mut tick_loop = started(&cfg, &logins.fake);
+        let get = format!("GET {BOAT}/sandboxes/bx_66666666");
+        tick_loop.tick(NOW, register_66).unwrap();
+        tick_loop.tick(NOW + 15, register_66).unwrap();
+        assert_eq!(logins.count(&get), 1);
+        assert_eq!(registers(&logins.fake), 0);
+        assert_eq!(
+            logins.count(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
+            0
+        );
+        assert!(tick_loop.ledger.failing.is_empty());
+
+        *logins.state.borrow_mut() = ("archived", Some(true));
+        tick_loop.tick(NOW + 30, |_, _| Vec::new()).unwrap();
+        *logins.state.borrow_mut() = ("idle", Some(false));
+        tick_loop.tick(NOW + 45, register_66).unwrap();
+        assert_eq!(logins.count(&get), 2);
+        assert_eq!(registers(&logins.fake), 1);
     }
 }

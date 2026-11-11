@@ -16,10 +16,12 @@ mod script;
 mod testkit;
 
 use std::fmt;
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::boat;
 use crate::github;
+use crate::github_app;
 use crate::model::{Action, Cents, Config, MachineState, Pool, Snapshot, UnixSecs};
 use crate::transport::{Transport, Ureq};
 
@@ -32,6 +34,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 #[derive(Debug)]
 pub enum Error {
     MissingEnv(&'static str),
+    /// Credentials set but unusable: both GitHub modes, or an App key that does not load.
+    Config(String),
     Boat(boat::Error),
     GitHub(github::Error),
     /// A start after starts closed for this tick.
@@ -43,7 +47,7 @@ pub enum Error {
 impl Error {
     fn is_fatal(&self) -> bool {
         match self {
-            Error::MissingEnv(_) => true,
+            Error::MissingEnv(_) | Error::Config(_) => true,
             Error::Boat(e) => e.is_fatal(),
             Error::GitHub(e) => e.is_fatal(),
             Error::StartsClosed | Error::Invalid(_) => false,
@@ -55,6 +59,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::MissingEnv(name) => write!(f, "{name} is not set"),
+            Error::Config(m) => write!(f, "{m}"),
             Error::Boat(e) => write!(f, "{e}"),
             Error::GitHub(e) => write!(f, "{e}"),
             Error::StartsClosed => write!(f, "starts closed for this tick"),
@@ -122,6 +127,43 @@ fn delete_everything(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             machine: m.id.clone(),
         }))
         .collect()
+}
+
+const APP_VARS: [&str; 3] = [
+    "GITHUB_APP_ID",
+    "GITHUB_APP_INSTALLATION_ID",
+    "GITHUB_APP_PRIVATE_KEY_FILE",
+];
+
+/// `GITHUB_TOKEN`, or a GitHub App from `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` and,
+/// when set, `GITHUB_APP_INSTALLATION_ID`. Both at once is an error, so the daemon never
+/// quietly runs on a token someone meant to retire.
+fn github_auth(var: &dyn Fn(&str) -> Option<String>) -> Result<github::Auth, Error> {
+    let app = APP_VARS.iter().any(|name| var(name).is_some());
+    match (var("GITHUB_TOKEN"), app) {
+        (Some(_), true) => Err(Error::Config(
+            "GITHUB_TOKEN and GITHUB_APP_* are both set; set one of them".into(),
+        )),
+        (Some(token), false) => Ok(github::Auth::Token(token)),
+        (None, false) => Err(Error::Config(
+            "GITHUB_TOKEN is not set (or set GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_FILE)".into(),
+        )),
+        (None, true) => {
+            let id = var("GITHUB_APP_ID").ok_or(Error::MissingEnv("GITHUB_APP_ID"))?;
+            let key_file = var("GITHUB_APP_PRIVATE_KEY_FILE")
+                .ok_or(Error::MissingEnv("GITHUB_APP_PRIVATE_KEY_FILE"))?;
+            let installation = var("GITHUB_APP_INSTALLATION_ID")
+                .map(|v| {
+                    v.trim().parse::<u64>().map_err(|_| {
+                        Error::Config(format!("GITHUB_APP_INSTALLATION_ID {v:?} is not a number"))
+                    })
+                })
+                .transpose()?;
+            let app = github_app::App::from_file(id, installation, Path::new(&key_file))
+                .map_err(|e| Error::Config(format!("GITHUB_APP_PRIVATE_KEY_FILE {e}")))?;
+            Ok(github::Auth::App(Box::new(app)))
+        }
+    }
 }
 
 fn env(name: &'static str) -> Result<String, Error> {
@@ -200,13 +242,13 @@ impl<'a> Loop<'a> {
         cfg: &'a Config,
         t: &'a dyn Transport,
         boat_key: String,
-        token: String,
+        github: github::Auth,
         now: UnixSecs,
     ) -> Self {
         Loop {
             cfg,
             boat: boat::Client::new(t, boat_key),
-            gh: github::Client::new(t, token, cfg.repo.clone()),
+            gh: github::Client::new(t, github, cfg.repo.clone()),
             memory: observe::Memory::default(),
             ledger: act::Ledger::new(cfg, now),
             read_jobs: true,
@@ -214,15 +256,12 @@ impl<'a> Loop<'a> {
         }
     }
 
-    /// A loop with the credentials in `BOAT_API_KEY` and `GITHUB_TOKEN`.
+    /// A loop with the credentials in `BOAT_API_KEY`, and `GITHUB_TOKEN` or the
+    /// `GITHUB_APP_*` variables.
     fn connect(cfg: &'a Config, t: &'a dyn Transport, now: UnixSecs) -> Result<Self, Error> {
-        Ok(Loop::new(
-            cfg,
-            t,
-            env("BOAT_API_KEY")?,
-            env("GITHUB_TOKEN")?,
-            now,
-        ))
+        let boat_key = env("BOAT_API_KEY")?;
+        let github = github_auth(&|name| std::env::var(name).ok().filter(|v| !v.is_empty()))?;
+        Ok(Loop::new(cfg, t, boat_key, github, now))
     }
 
     /// One observe-decide-act pass. Returns `Err` only for errors no later tick can fix.
@@ -359,7 +398,7 @@ mod tests {
     fn tick_executes_in_order() {
         let cfg = config();
         let fake = Fake::new(reply);
-        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), GH_TOKEN.into(), STARTED);
+        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), STARTED);
         tick_loop.tick(NOW, decide_all).unwrap();
 
         let mut expected = observe_requests().to_vec();
@@ -370,6 +409,8 @@ mod tests {
             // Stop deletes the machine's runner first.
             format!("DELETE {GH}/runners/11"),
             format!("POST {BOAT}/sandboxes/bx_22222222/stop"),
+            // A runner goes only on a machine that holds none of its creator's logins.
+            format!("GET {BOAT}/sandboxes/bx_22222222"),
             format!("POST {GH}/runners/generate-jitconfig"),
             format!("PUT {BOAT}/sandboxes/bx_22222222/files"),
             format!("POST {BOAT}/sandboxes/bx_22222222/commands"),
@@ -381,26 +422,26 @@ mod tests {
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
-        let fork = &sent[15];
+        let fork = &sent[16];
         assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
         assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
-        let jit = &sent[10];
+        let jit = &sent[11];
         assert!(
             jit.body_text()
                 .contains(r#""name":"sbr-ci-bx_22222222-1-1000""#)
         );
         assert!(
-            sent[11]
+            sent[12]
                 .body_text()
                 .contains(r#""path":"/home/user/.sbr-jit-1""#)
         );
-        assert!(sent[12].body_text().contains("/home/user/.sbr-jit-1"));
+        assert!(sent[13].body_text().contains("/home/user/.sbr-jit-1"));
         // The jit config goes into the file write only: never a URL, a command or a header.
         for (i, s) in sent.iter().enumerate() {
             let leaks = s.url.contains("JITSECRET")
                 || s.headers.iter().any(|(_, v)| v.contains("JITSECRET"))
                 || s.body_text().contains("JITSECRET");
-            assert_eq!(leaks, i == 11, "request {i}: {}", s.url);
+            assert_eq!(leaks, i == 12, "request {i}: {}", s.url);
         }
         // Two accepted starts at the 25-cent quote, on top of the assumed 100.
         assert_eq!(tick_loop.ledger.spent_cents(), 150);
@@ -461,7 +502,7 @@ mod tests {
         let cfg = config();
         let fake = Fake::new(reply);
         // The fake lists the same three machines afterwards.
-        let left = Loop::new(&cfg, &fake, BOAT_KEY.into(), GH_TOKEN.into(), NOW)
+        let left = Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), NOW)
             .drain(NOW)
             .unwrap();
         assert_eq!(left, 3);
@@ -558,5 +599,65 @@ mod tests {
         let mut tick_loop = started(&cfg, &fake);
         let err = tick_loop.tick(NOW, |_, _| Vec::new()).unwrap_err();
         assert!(matches!(err, Error::Boat(boat::Error::BillingRequired)));
+    }
+
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn github_credentials_from_the_environment() {
+        let token = github_auth(&vars(&[("GITHUB_TOKEN", "ghp_x")])).unwrap();
+        assert!(matches!(token, github::Auth::Token(t) if t == "ghp_x"));
+        let err = |pairs: &[(&str, &str)]| github_auth(&vars(pairs)).err().unwrap().to_string();
+        assert_eq!(
+            err(&[("GITHUB_TOKEN", "ghp_x"), ("GITHUB_APP_ID", "1")]),
+            "GITHUB_TOKEN and GITHUB_APP_* are both set; set one of them"
+        );
+        assert!(err(&[]).starts_with("GITHUB_TOKEN is not set"));
+        assert_eq!(
+            err(&[("GITHUB_APP_ID", "1")]),
+            "GITHUB_APP_PRIVATE_KEY_FILE is not set"
+        );
+        assert_eq!(
+            err(&[("GITHUB_APP_PRIVATE_KEY_FILE", "/k.pem")]),
+            "GITHUB_APP_ID is not set"
+        );
+        assert_eq!(
+            err(&[
+                ("GITHUB_APP_ID", "1"),
+                ("GITHUB_APP_PRIVATE_KEY_FILE", "/k.pem"),
+                ("GITHUB_APP_INSTALLATION_ID", "abc"),
+            ]),
+            r#"GITHUB_APP_INSTALLATION_ID "abc" is not a number"#
+        );
+        assert!(
+            err(&[
+                ("GITHUB_APP_ID", "1"),
+                ("GITHUB_APP_PRIVATE_KEY_FILE", "/nonexistent/k.pem")
+            ])
+            .starts_with("GITHUB_APP_PRIVATE_KEY_FILE /nonexistent/k.pem: ")
+        );
+
+        let path = std::env::temp_dir().join(format!("sbr-app-key-{}.pem", std::process::id()));
+        std::fs::write(&path, crate::github_app::tests::test_pem()).unwrap();
+        let app = github_auth(&vars(&[
+            ("GITHUB_APP_ID", "12345"),
+            ("GITHUB_APP_PRIVATE_KEY_FILE", path.to_str().unwrap()),
+            ("GITHUB_APP_INSTALLATION_ID", "9"),
+        ]));
+        std::fs::remove_file(&path).unwrap();
+        match app.unwrap() {
+            github::Auth::App(app) => assert_eq!(
+                format!("{app:?}"),
+                r#"App { id: "12345", installation: Some(9), .. }"#
+            ),
+            github::Auth::Token(_) => panic!("a token"),
+        }
     }
 }

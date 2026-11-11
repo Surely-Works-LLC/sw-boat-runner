@@ -298,6 +298,15 @@ impl World {
                             "starts": { "minute": minute, "hour": hour, "day": day } }),
                 )
             }
+            // The machines start from a snapshot of a --no-env sandbox.
+            ("GET", ["sandboxes", id]) if id.starts_with("bx_") => {
+                let Some(s) = self.sandbox(id) else {
+                    return (404, json!({}));
+                };
+                let sandbox = json!({ "id": s.id, "state": "running", "labels": s.labels,
+                                      "holdsCreatorLogins": false });
+                (200, json!({ "sandbox": sandbox }))
+            }
             ("GET", ["sandboxes", _]) => {
                 let list: Vec<Value> = self
                     .sandboxes
@@ -562,7 +571,13 @@ fn daemon(setup: &'static str, pool: &str, target: u64, jobs: &[Job]) -> Row {
         jobs: jobs.to_vec(),
         ..World::default()
     }));
-    let mut tick_loop = Loop::new(&cfg, &mock, "key".into(), "token".into(), start);
+    let mut tick_loop = Loop::new(
+        &cfg,
+        &mock,
+        "key".into(),
+        github::Auth::Token("token".into()),
+        start,
+    );
     for now in (start..DAY_START + DAY_S + DRAIN_S).step_by(TICK_S as usize) {
         mock.0.borrow_mut().advance(now);
         tick_loop.tick(now, decide::decide).expect("tick");
