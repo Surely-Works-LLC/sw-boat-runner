@@ -5,11 +5,24 @@ boat's per-job machines (`runs-on: boat`) to persistent self-hosted runners. It 
 offline analysis, not part of the daemon: a standard-library Python script that reads
 `boat ci --json` output and calls `gh api`.
 
-Per window and runner kind it reports jobs sampled, jobs that never got a
-runner, queue time (`started_at - created_at`) and run time (`completed_at -
-started_at`) at p50 and p90, and the window's boat starts per day. One more row gives
-wait and run time from the `boat ci` log itself. Two further tables give jobs per
-persistent runner and persistent queue time per day.
+Per window and runner kind it reports, over the completed, non-skipped jobs of the
+sampled runs:
+
+- `jobs`: jobs that got a runner. Queue and run times are over these jobs only.
+- `no runner`: jobs that completed without ever getting a runner, for example cancelled
+  while queued. They are not in `jobs`, so the sampled total is the sum of the two.
+- queue time (`started_at - created_at`) and run time (`completed_at - started_at`) at
+  p50 and p90, and the window's boat starts per day.
+
+One more row gives wait and run time from the `boat ci` log itself. Two further tables
+give jobs per persistent runner and persistent queue time per day.
+
+The one result so far, [example-2026-11.md](results/example-2026-11.md), measured four
+long-lived runners registered once on always-on machines, not this daemon. Their names
+are not `sbr-...`, and each ran many jobs where a daemon runner runs one. Its queue times
+(p50 5.6 min, p90 27.8 min) are those of too few fixed runners. The README's 17 s / 24 s
+come from the [bench](../bench/), a simulation of the daemon. Neither measures the other;
+what the result shows about keeping machines up is the drop in boat starts.
 
 ## Reproduce
 

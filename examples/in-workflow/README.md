@@ -5,10 +5,14 @@ builds the daemon and runs it for the length of the calling workflow run. Add on
 change `runs-on`:
 
 ```yaml
+on:
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
   runners:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@main
     with:
       snapshot: snap-1
@@ -17,6 +21,7 @@ jobs:
       RUNNER_ADMIN_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
 
   test:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, "boat-${{ github.run_id }}-${{ github.run_attempt }}"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -24,6 +29,10 @@ jobs:
           persist-credentials: false
       - run: make test
 ```
+
+The trigger and the `if:` on both jobs keep the pool to pushes to `main`. Keep the `if:`
+if you add triggers: in a `pull_request_target` run `github.ref` is still the base branch,
+so only the event check stops it. [Pull requests](#pull-requests) says why.
 
 The `runners` job needs only `contents: read` from the run's token. `@main` follows this
 repository; for anything you rely on, put a commit SHA there and in `ref`.
@@ -54,10 +63,11 @@ What this costs compared with a daemon that stays up:
   all, and the `runners` job uses GitHub-hosted minutes for the whole run.
 - It makes only starts the plan includes. A job past them waits.
 
-This repository uses it on itself:
-[self-hosted.yml](../../.github/workflows/self-hosted.yml) runs `cargo test` on a machine
-the daemon forks. Both of its jobs are skipped until the repository variable
-`BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) and the two secrets are set.
+[self-hosted.yml](../../.github/workflows/self-hosted.yml) in this repository is a
+working caller that runs `cargo test` on a machine the daemon forks. Its jobs are skipped
+unless the repository variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) and the
+two secrets are set, and they are not set here, so it does not run in this repository. A
+fork that sets them runs it.
 
 ## Pull requests
 
@@ -68,5 +78,5 @@ is going, and a pull request can add a job with that label to any workflow, a fo
 included once its run is approved. The machine is forked for that one job and deleted
 after it, and the job gets none of the daemon's secrets, but it does run that pull
 request's code on a boat machine. Call the workflow only from runs you trust, such as
-pushes to your default branch (this repository's self-hosted.yml checks for `main`), and
-approve fork pull request runs only after reading their workflow changes.
+pushes to your default branch, as the example above does, and approve fork pull request
+runs only after reading their workflow changes.
