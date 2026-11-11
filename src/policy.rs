@@ -227,6 +227,11 @@ fn validate(p: &Pool) -> Result<(), String> {
     if p.slots_per_box == 0 {
         return Err("slots_per_box must be at least 1".into());
     }
+    // A runner is still booting when the tick after its registration checks it, so a
+    // timeout of 0 unregisters every runner before it can take a job.
+    if p.register_timeout_s == 0 {
+        return Err("register_timeout_s must be at least 1".into());
+    }
     if !(1..=MAX_TTL_S).contains(&p.fork_ttl_s) {
         return Err(format!("fork_ttl_s must be 1 to {MAX_TTL_S}"));
     }
@@ -391,6 +396,7 @@ max_boxes = 4
             (policy("placement = [\"resume\"]"), "resume needs slot"),
             (policy("preset = \"fork\"\nmin_up = 1"), "min_up needs slot"),
             (policy("fork_ttl_s = 0"), "fork_ttl_s"),
+            (policy("register_timeout_s = 0"), "register_timeout_s"),
             (policy("fork_ttl_s = 2592001"), "fork_ttl_s"),
             (policy("min_up = 5"), "above max_boxes"),
             (policy("slots_per_box = 0"), "slots_per_box"),
