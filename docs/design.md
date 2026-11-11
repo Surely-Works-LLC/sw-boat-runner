@@ -50,8 +50,65 @@ slot whose runner went `Offline` gets `Unregister`. Either slot takes a fresh `R
 in the same tick when a job is waiting. The runner's work directory stays on the
 machine, so its caches survive from job to job. A stop and resume restores the machine
 from a boat snapshot, which does not save `/tmp` or `~/.cache`, so caches meant to outlive
-a stop go elsewhere under `/home`, set in the runner's `.env`; the
-[README](../README.md#connect-a-repository) has an example.
+a stop go elsewhere under `/home`, set in the runner's `.env`;
+[Snapshots](#snapshots) has an example.
+
+## Snapshots
+
+Every pool starts its machines from one boat snapshot. It holds an extracted
+[actions/runner](https://github.com/actions/runner) release at `/home/user/actions-runner`,
+left unconfigured, its dependencies, and whatever the jobs expect to find. A job can read
+every file in the snapshot, so keep logins and tokens out. Machines keep the snapshot's
+systemd timers, so remove cleanup timers.
+
+Make it from a sandbox created with `--no-env`: boat says "a saved snapshot of a
+`--no-env` sandbox stays `--no-env`". A snapshot of any other sandbox carries your
+personal logins (GitHub token, model logins) into every machine forked from it, even
+though the daemon forks with `noEnv`. `check` cannot see this. Before it registers a
+runner, the daemon asks boat whether the machine holds its creator's logins
+(`holdsCreatorLogins`); if so, or if boat does not say, it registers nothing and logs an
+error that names the snapshot. A job's fork is deleted and the pool's forks back off; a
+kept machine waits until it is stopped and resumed.
+
+```sh
+boat new --no-env --type large   # the pool's machine_type; prints the machine's id
+boat ssh <id>                    # extract the runner, run its bin/installdependencies.sh
+boat snapshot <id> snap-1        # the name goes in the policy's `snapshot`
+```
+
+On a create, boat adds none of the account's secrets, but logins saved in the snapshot
+stay. On a resume, boat also scrubs owner secrets from the restored disk before the
+machine is reachable. The daemon labels its machines `sw-boat-runner=<pool>`, names its
+runners `sbr-<pool>-...`, and ignores every other machine and runner. To update the
+runner, rebuild the snapshot.
+
+Keep the snapshot small: every start that is not a resume of a kept machine copies it to
+a new disk, and a snapshot larger than `machine_type`'s disk makes boat refuse each fork
+with 409 `deploy_failed`. boat snapshots do not save `/tmp` or `~/.cache` (except
+`~/.cache/ms-playwright` and deno's cache), and a stop saves a machine the same way, so
+build caches a warm or kept machine should keep across a stop and resume must live
+elsewhere under `/home`. Point tools at it in the runner's `.env` file,
+`/home/user/actions-runner/.env`, which every slot's copy of the runner reads:
+
+```sh
+CARGO_TARGET_DIR=/home/user/ci-cache/target
+XDG_CACHE_HOME=/home/user/ci-cache/xdg
+```
+
+`sw-boat-runner snapshot <sandbox-id> <name> [--machine-type T] [--fix] [--keep-fork] [--yes]`
+forks the sandbox with `noEnv` (the sandbox itself is not changed), waits for the fork to
+hydrate, and checks it: boat's `holdsCreatorLogins`, an unconfigured runner with `run.sh`
+at `/home/user/actions-runner`, enabled `actions.runner.*` systemd units, credential files
+(`gh`, git, ssh, codex, claude, netrc, docker, aws, npm, gcloud), runner `.env` cache
+directories under `/tmp` or `~/.cache`, and the size against `machine_type`'s disk (51 GB
+for small and default, 111 GB for large, 251 GB for xlarge). It prints the largest
+directories. With no FAIL it saves the fork under `<name>`, prints the size and deletes
+the fork. `--fix` disables old runner units and removes `.runner` and `.credentials` in
+the fork, and removes credential files from it after a yes. Replacing an existing name
+also asks first; `--yes` answers both. A replacement is first saved under a temporary
+`sbr-tmp-` name to read its real size, and the old snapshot is kept when it is too big.
+Ctrl-C or SIGTERM deletes the fork before exiting; a second one exits at once. `run` warns
+once at start about a pool whose saved snapshot is larger than its machine type's disk.
 
 ## Start budget
 
