@@ -31,6 +31,10 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   resumed twice and holds its `max_boxes` box.
 - A kept machine left in a pool whose placement no longer has `slot` is deleted instead of
   holding a box until boat's 30-day TTL.
+- An error from boat or GitHub that echoes the request no longer carries the API key,
+  token or jit config into the log.
+- A daemon started just before 00:00 UTC no longer counts every pool's cap as spent for
+  the whole next day.
 - `register_timeout_s` defaults to 900 s, above the runner's 600 s wait for the snapshot
   copy, and 0 is rejected. `repo` rejects `.` and `..`.
 
