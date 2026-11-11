@@ -1,0 +1,53 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_k1",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 1000000,
+      "job": null
+    },
+    {
+      "id": "bx_k2",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 1000000,
+      "job": null
+    },
+    {
+      "id": "bx_k3",
+      "pool": "ci",
+      "state": "stopped",
+      "since": 999000,
+      "last_busy": 998000,
+      "job": null
+    }
+  ],
+  "runners": [
+    {
+      "name": "sbr-ci-bx_k1-0-999000",
+      "pool": "ci",
+      "machine": "bx_k1",
+      "slot": 0,
+      "registered_at": 999000,
+      "state": "idle"
+    },
+    {
+      "name": "sbr-ci-bx_k3-0-998000",
+      "pool": "ci",
+      "machine": "bx_k3",
+      "slot": 0,
+      "registered_at": 998000,
+      "state": "idle"
+    }
+  ],
+  "queued": [],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  }
+}

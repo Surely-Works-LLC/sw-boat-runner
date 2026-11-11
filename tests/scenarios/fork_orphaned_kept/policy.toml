@@ -1,3 +1,4 @@
+# Pins: Delete: a pool switched from warm to fork deletes kept machines up or starting unless a runner is Busy or Registered.
 repo = "acme/app"
 
 # Was `warm`; switched to `fork`, so no step uses its kept machines any more.

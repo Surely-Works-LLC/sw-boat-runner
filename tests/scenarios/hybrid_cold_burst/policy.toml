@@ -1,3 +1,4 @@
+# Pins: Fork(none) then Fork(job): an empty hybrid pool forks kept machines up to min_up, then one machine per job left, up to max_boxes.
 repo = "acme/app"
 
 [[pool]]
