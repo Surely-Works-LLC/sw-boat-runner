@@ -38,8 +38,9 @@ next tick tries again. Presets:
 | `hybrid` | `slot, resume, fork` | `min_up` always up; a job their slots cannot take gets its own fork | bursts above `min_up` |
 
 `hybrid` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
-only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps keep the order `slot`, `resume`, `fork`, and `resume` and
-`min_up` need `slot`, the only step that registers runners on kept machines.
+only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps
+keep the order `slot`, `resume`, `fork`, and `resume` and `min_up` need `slot`, the only
+step that registers runners on kept machines.
 
 Every runner is a just-in-time runner: it is registered through GitHub's JIT config,
 takes one job and exits. A long-lived runner would need a registration token on the
@@ -108,9 +109,9 @@ The daemon keeps a few facts in memory only: when each machine changed state and
 a busy or registered runner, which runners it has seen online, the forks boat has not
 listed yet, the cents spent on starts today, and the time before which it makes no start.
 A machine first seen counts as never busy, which can only delay a stop. The rules below
-keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in `spec/BoatRunner.tla`, and
-[spec/README.md](../spec/README.md#fix-flags) describes the counterexample TLC finds
-without it.
+keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in
+`spec/BoatRunner.tla`, and [spec/README.md](../spec/README.md#fix-flags) describes the
+counterexample TLC finds without it.
 
 - Stale act (`FixStaleAct`): `Stop` and `Delete` first delete the machine's GitHub
   runners. GitHub refuses while a runner runs a job, which it may have taken since the
