@@ -16,7 +16,7 @@ All notable changes to this project are documented here. The format follows
 - A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
   `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
   put its keys at the top level, without `[[pool]]`.
-- A `release` workflow: a pushed `v*` tag publishes static Linux x86_64 and arm64 (musl)
+- A `release` workflow: a pushed `v*` tag publishes Linux x86_64 and arm64 (glibc 2.35 or newer)
   and macOS arm64 binaries with `SHA256SUMS` and a build provenance attestation
   (`gh attestation verify`). CI builds the same targets on every pull request.
 - `examples/always-on/install.sh` gets the latest release's binary, checked against

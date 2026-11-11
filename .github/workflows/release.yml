@@ -26,11 +26,12 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          # Static, so one binary runs on any Linux of the arch, boat machines included.
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
+          # glibc, built on the oldest supported Ubuntu (glibc 2.35) with its own gcc, so the
+          # binary runs on that and anything newer, boat machines included. No musl, no apt.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           # For `check` and `plan` on a Mac.
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -40,14 +41,6 @@ jobs:
           persist-credentials: false
       - name: The tag matches Cargo.toml
         run: grep -qx "version = \"${TAG#v}\"" Cargo.toml || { echo "Cargo.toml version is not ${TAG#v}" >&2; exit 1; }
-      - if: endsWith(matrix.target, '-musl')
-        # Retried: the runners' package mirrors sometimes fail to resolve for minutes.
-        run: |
-          for i in 1 2 3 4 5; do
-            sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends musl-tools && exit 0
-            sleep $((i * 20))
-          done
-          exit 1
       - run: rustup toolchain install stable --profile minimal -t "$TARGET"
       # No cache: a release builds from nothing, so no other run's cache goes into it.
       - run: cargo build --locked --release --target "$TARGET"

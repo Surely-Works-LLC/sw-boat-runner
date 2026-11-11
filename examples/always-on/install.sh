@@ -55,10 +55,18 @@ download() {
         tag=${BASH_REMATCH[1]}
     fi
     case "$(uname -s)/$(uname -m)" in
-        Linux/x86_64) target=x86_64-unknown-linux-musl ;;
-        Linux/aarch64 | Linux/arm64) target=aarch64-unknown-linux-musl ;;
+        Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+        Linux/aarch64 | Linux/arm64) target=aarch64-unknown-linux-gnu ;;
         *) return 1 ;;
     esac
+    # The Linux binaries need glibc 2.35 or newer; older hosts build the tag from source.
+    if [[ $target == *-linux-gnu ]]; then
+        glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+        if [[ -z $glibc ]] || [[ $(printf '%s\n' 2.35 "$glibc" | sort -V | head -1) != 2.35 ]]; then
+            echo "glibc ${glibc:-unknown} is older than 2.35; building $tag from source" >&2
+            return 1
+        fi
+    fi
     base=https://github.com/$repo/releases/download/$tag
     file=sw-boat-runner-$target.tar.gz
     code=$(fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS") || exit 1

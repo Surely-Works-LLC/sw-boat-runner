@@ -81,13 +81,13 @@ and runs.
 
 ## Verifying a release
 
-Each release has `sw-boat-runner-<target>.tar.gz` for `x86_64-unknown-linux-musl`,
-`aarch64-unknown-linux-musl` and `aarch64-apple-darwin`, a `SHA256SUMS` file, and a build
+Each release has `sw-boat-runner-<target>.tar.gz` for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu` and `aarch64-apple-darwin`, a `SHA256SUMS` file, and a build
 provenance attestation signed by the `release` workflow. To check a download by hand:
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify sw-boat-runner-x86_64-unknown-linux-musl.tar.gz --repo Surely-Works-LLC/sw-boat-runner
+gh attestation verify sw-boat-runner-x86_64-unknown-linux-gnu.tar.gz --repo Surely-Works-LLC/sw-boat-runner
 ```
 
 `SHA256SUMS` is published on the same release as the tarballs, so the checksum only
