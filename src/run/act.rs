@@ -519,6 +519,18 @@ mod tests {
         assert_eq!(tick_loop.ledger.spent_cents, 25);
     }
 
+    /// The restart's assumed spend lasts until 00:00 UTC of the day the process started,
+    /// even when its first tick comes after midnight.
+    #[test]
+    fn a_restart_just_before_midnight_spends_normally_the_next_day() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), GH_TOKEN.into(), DAY_S - 1);
+        assert_eq!(tick_loop.ledger.spent_cents, 100);
+        tick_loop.tick(DAY_S + 90, |_, _| Vec::new()).unwrap();
+        assert_eq!(tick_loop.ledger.spent_cents, 0);
+    }
+
     /// The second fork of a job stands for a fork after the first one was deleted: with the
     /// same key boat would return the deleted machine.
     #[test]
