@@ -45,6 +45,9 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal -t "$TARGET"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Per runner image: build scripts built on a newer glibc do not run on an older one.
+          key: ${{ matrix.os }}
       - run: cargo build --locked --release --target "$TARGET"
       - run: '"target/$TARGET/release/sw-boat-runner" --version'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
