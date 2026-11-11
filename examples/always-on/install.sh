@@ -115,8 +115,9 @@ if [ -z "${bin:-}" ]; then
         # shellcheck source=/dev/null
         . "$HOME/.cargo/env"
     fi
-    cargo install --locked --git "https://github.com/$repo" "${from[@]}"
-    bin=$(command -v sw-boat-runner)
+    # Into $tmp, not ~/.cargo/bin, which a non-interactive shell's PATH may lack.
+    cargo install --locked --root "$tmp/cargo" --git "https://github.com/$repo" "${from[@]}"
+    bin=$tmp/cargo/bin/sw-boat-runner
 fi
 
 # Releases before `setup` existed cannot install themselves; say so instead of failing
