@@ -47,7 +47,7 @@ which nobody can move. `ref` is required: GitHub tells a called workflow nothing
 reliable about its own ref, so `uses:` pins the workflow and `ref` pins the daemon it
 builds, and the job gets your keys. Change both together.
 
-`snapshot` is a boat snapshot as the [README](../../README.md#connect-a-repository)
+`snapshot` is a boat snapshot as [Snapshots](../../docs/design.md#snapshots)
 describes. The daemon registers runners as a GitHub App installed on the repository with
 Administration read and write and Actions read: pass its ID as `app-id` (a variable is
 fine) and its private key as the `app-private-key` secret. The daemon mints and renews
@@ -76,7 +76,7 @@ What this costs compared with a daemon that stays up:
 - With the default `fork` preset every job is one start, as with `runs-on: boat`, on a
   fresh machine from your snapshot with none of the account's secrets, as long as the
   snapshot was saved from a `--no-env` sandbox
-  ([README](../../README.md#connect-a-repository), step 2). `pool: preset =
+  ([Snapshots](../../docs/design.md#snapshots)). `pool: preset =
   "warm"` reuses machines among the jobs of one run. Nothing is kept between runs; a
   [daemon that stays up](../always-on/) does that.
 - Jobs wait for the daemon to build and for its 90 s restart wait, about 3 minutes in
