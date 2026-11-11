@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-tCOrchkR1NAUDQ/UYZZl5AW7Pvep8mE3jIw4Q5VjBXk='; style-src 'unsafe-inline'; form-action https://github.com; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<title>sw-boat-runner: new GitHub App</title>
+<style>
+body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; color: #1f2328; background: #fff; }
+h1 { font-size: 1.4rem; }
+code { font: 0.9em ui-monospace, monospace; background: #f0f2f4; padding: 0 0.2em; }
+.warn { border-left: 4px solid #bf8700; background: #fff8c5; padding: 0.5rem 1rem; }
+.error { border-left: 4px solid #cf222e; background: #ffebe9; padding: 0.5rem 1rem; }
+button { font: inherit; padding: 0.5rem 1rem; cursor: pointer; }
+input[type=text] { font: 0.9em ui-monospace, monospace; width: 100%; box-sizing: border-box; padding: 0.4rem; }
+@media (prefers-color-scheme: dark) {
+  body { color: #e6edf3; background: #0d1117; }
+  code { background: #262c36; }
+  .warn { background: #3b2e00; }
+  .error { background: #3c1618; }
+}
+</style>
+</head>
+<body>
+<h1>sw-boat-runner: new GitHub App</h1>
+<main id="main"><p>This page needs JavaScript. It sends nothing anywhere except the form you post to GitHub.</p></main>
+<script>
+"use strict";
+// Keep in sync with manifest() in src/setup.rs; a test there checks these strings.
+const PAGE_URL = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
+const HOMEPAGE = "https://github.com/Surely-Works-LLC/sw-boat-runner";
+const PERMISSIONS = { "administration": "write", "actions": "read" };
+
+const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO = /^[A-Za-z0-9._-]{1,100}$/;
+const STATE = /^[0-9a-f]{32}$/;
+const APP_NAME = /^sbr-[A-Za-z0-9._-]{1,21}-[0-9a-f]{8}$/;
+
+const main = document.getElementById("main");
+
+function el(tag, text) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function para(...parts) {
+  const p = el("p");
+  for (const part of parts) {
+    p.append(typeof part === "string" ? document.createTextNode(part) : part);
+  }
+  return p;
+}
+
+function fail(message) {
+  main.replaceChildren();
+  const box = el("div");
+  box.className = "error";
+  box.append(para(message), para("Nothing was created. Run ", el("code", "sw-boat-runner setup"), " again and open the link it prints."));
+  main.append(box);
+}
+
+function manifest(owner, repo, name) {
+  return {
+    "name": name,
+    "url": HOMEPAGE,
+    "description": "sw-boat-runner for " + owner + "/" + repo,
+    "hook_attributes": { "url": HOMEPAGE, "active": false },
+    "redirect_url": PAGE_URL,
+    "public": false,
+    "default_permissions": PERMISSIONS,
+    "default_events": []
+  };
+}
+
+function createForm(params) {
+  const owner = params.get("owner") || "";
+  const kind = params.get("kind") || "";
+  const repo = params.get("repo") || "";
+  const state = params.get("state") || "";
+  const name = params.get("name") || "";
+  if (!OWNER.test(owner)) return fail("The link's owner is not a GitHub account name.");
+  if (!REPO.test(repo) || repo === "." || repo === "..") return fail("The link's repository is not a GitHub repository name.");
+  if (kind !== "user" && kind !== "org") return fail("The link's kind must be user or org.");
+  if (!STATE.test(state)) return fail("The link's state is not one setup makes.");
+  if (!APP_NAME.test(name)) return fail("The link's app name is not one setup makes.");
+
+  const full = owner + "/" + repo;
+  const action = kind === "org"
+    ? "https://github.com/organizations/" + owner + "/settings/apps/new?state=" + state
+    : "https://github.com/settings/apps/new?state=" + state;
+
+  main.replaceChildren();
+  main.append(para("The button below asks GitHub to create a private GitHub App called ", el("code", name),
+    kind === "org" ? " owned by the organization " : " owned by your account ", el("code", owner), ", for ", el("code", full), "."));
+  const list = el("ul");
+  list.append(
+    el("li", "Permissions: Administration (read and write), Actions (read). Nothing else."),
+    el("li", "No webhook and no events."),
+    el("li", "Private: it can be installed only on " + owner + "'s repositories."),
+    el("li", "After you confirm, GitHub sends you back to this page with a one-time code to copy into the terminal.")
+  );
+  main.append(list);
+  const warn = el("div");
+  warn.className = "warn";
+  warn.append(para("Administration write can change a repository's settings or delete the repository. Install the app only on ",
+    el("code", full), ": choose “Only select repositories” and pick that one."));
+  main.append(warn);
+  if (kind === "org") {
+    main.append(para("Creating an app for an organization takes an organization owner or app manager. Installing it as anyone else shows a “Request” button, and an organization owner must approve the request."));
+  }
+
+  const form = el("form");
+  form.method = "post";
+  form.action = action;
+  const field = el("input");
+  field.type = "hidden";
+  field.name = "manifest";
+  field.value = JSON.stringify(manifest(owner, repo, name));
+  const button = el("button", "Create the GitHub App on GitHub");
+  button.type = "submit";
+  form.append(field, button);
+  main.append(form);
+}
+
+function showCode() {
+  const address = location.href;
+  main.replaceChildren();
+  main.append(el("h2", "Copy this back into the terminal"));
+  main.append(para("GitHub created the app. Paste this whole address where setup asks for it. The code in it works once, within an hour."));
+  const field = el("input");
+  field.type = "text";
+  field.readOnly = true;
+  field.value = address;
+  field.addEventListener("focus", () => field.select());
+  const button = el("button", "Copy");
+  button.type = "button";
+  button.addEventListener("click", () => {
+    field.select();
+    const done = () => { button.textContent = "Copied"; };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(address).then(done, () => { if (document.execCommand("copy")) done(); });
+    } else if (document.execCommand("copy")) {
+      done();
+    }
+  });
+  main.append(para(field), para(button));
+  main.append(para("This page sent the code nowhere; it only shows it. It is now gone from the address bar."));
+  history.replaceState(null, "", location.pathname);
+}
+
+const query = new URLSearchParams(location.search);
+if (query.has("code")) {
+  showCode();
+} else if (location.hash.length > 1) {
+  createForm(new URLSearchParams(location.hash.slice(1)));
+} else {
+  fail("This page opens from the link sw-boat-runner setup prints.");
+}
+</script>
+</body>
+</html>

@@ -40,9 +40,12 @@ labels = ["self-hosted", "boat"]
 snapshot = "snap-1"
 ```
 
-It then creates a private GitHub App for you through a manifest link, waits until you
-install it on the repository, asks for the boat key without echo, and enables a systemd
-service. Point jobs at the pool with `runs-on: [self-hosted, boat]`.
+The prompts offer defaults: the repository from `gh` or the `origin` remote, labels
+`self-hosted, boat`, and your saved boat snapshots when `BOAT_API_KEY` is set. It then
+prints a short link to [a page](docs/new-app.html) on this project's GitHub Pages that
+creates a private GitHub App for you (Administration write, Actions read, no webhook),
+waits until you install it on the repository, asks for the boat key without echo, and
+enables a systemd service. Point jobs at the pool with `runs-on: [self-hosted, boat]`.
 [examples/always-on](examples/always-on/) has the details.
 
 ## Opt-ins

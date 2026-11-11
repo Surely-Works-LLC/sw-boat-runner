@@ -17,8 +17,11 @@ curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0
 SBR_REF=v0.2.0 bash install.sh    # gets the daemon, then runs `sw-boat-runner setup`
 ```
 
-`setup` asks for the repository, labels and snapshot, creates a GitHub App and asks for
-`BOAT_API_KEY`. `bash install.sh policy.toml` uses your policy instead
+`setup` asks for the repository, labels (default `self-hosted, boat`) and snapshot,
+creates a GitHub App and asks for `BOAT_API_KEY`. For the App it prints a short link to
+[docs/new-app.html](../../docs/new-app.html) on GitHub Pages, a static page that posts the
+App's manifest to GitHub and shows the code GitHub sends back, to paste into setup; it
+sends the code nowhere. `setup --offline-link` prints the page as a `data:` URL instead. `bash install.sh policy.toml` uses your policy instead
 ([policy.toml](policy.toml) is a start), and a `GITHUB_TOKEN` in the environment means a
 personal token instead of an App.
 
@@ -63,7 +66,7 @@ and [Any other host](#any-other-host) what the two keys need.
 Then point jobs at the pool:
 
 ```yaml
-runs-on: [self-hosted, large]
+runs-on: [self-hosted, boat]
 ```
 
 To stop using it, stop the service and delete the pool's machines and runners. Repeat

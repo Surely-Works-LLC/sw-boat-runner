@@ -29,13 +29,18 @@ const BIN: &str = "/usr/local/bin/sw-boat-runner";
 const UNIT: &str = "/etc/systemd/system/sw-boat-runner.service";
 const SERVICE: &str = "sw-boat-runner";
 const HOMEPAGE: &str = "https://github.com/Surely-Works-LLC/sw-boat-runner";
+/// docs/new-app.html on GitHub Pages: it posts the manifest to GitHub, and GitHub sends
+/// the browser back to it with the code to paste into setup.
+const NEW_APP_PAGE: &str = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
+const DEFAULT_LABELS: &str = "self-hosted, boat";
 /// How long `setup` waits for the new App to be installed on the repository.
 const INSTALL_WAIT: Duration = Duration::from_secs(30 * 60);
 const INSTALL_POLL: Duration = Duration::from_secs(5);
 
 const HELP: &str = "\
 usage: sw-boat-runner setup [--repo owner/name] [--labels a,b] [--snapshot name]
-                            [--policy file] [--pat] [--new-app] [--dry-run] [--bin path]
+                            [--policy file] [--pat] [--new-app] [--offline-link]
+                            [--dry-run] [--bin path]
 
 Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
 
@@ -47,10 +52,15 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
   4. writes /etc/sw-boat-runner/{policy.toml,env,github-app.pem}, installs the binary
      to /usr/local/bin and enables the sw-boat-runner service
 
-  --repo, --labels, --snapshot   skip the prompt; or set SBR_REPO, SBR_LABELS, SBR_SNAPSHOT
+  --repo, --labels, --snapshot   skip the prompt; or set SBR_REPO, SBR_LABELS, SBR_SNAPSHOT.
+                                 The prompts offer defaults: the repository from `gh` or
+                                 the origin remote here, labels self-hosted, boat, and (with
+                                 BOAT_API_KEY set) your saved boat snapshots
   --policy FILE                  use this policy instead of the three prompts
   --pat                          a fine-grained personal token (GITHUB_TOKEN) instead of an App
   --new-app                      create a new App even when /etc/sw-boat-runner/env names one
+  --offline-link                 print the App's manifest page as a long data: URL instead
+                                 of the short link to the project's GitHub Pages page
   --dry-run                      print what setup would do; asks no secret, changes nothing
   --bin PATH                     the binary to install (default: this one)
 
@@ -76,6 +86,7 @@ struct Options {
     policy: Option<PathBuf>,
     pat: bool,
     new_app: bool,
+    offline_link: bool,
     dry_run: bool,
     bin: Option<PathBuf>,
 }
@@ -97,6 +108,7 @@ fn parse_args(args: &[&str]) -> Result<Options, String> {
             "--bin" => o.bin = Some(value()?.into()),
             "--pat" => o.pat = true,
             "--new-app" => o.new_app = true,
+            "--offline-link" => o.offline_link = true,
             "--dry-run" => o.dry_run = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
@@ -137,13 +149,22 @@ fn setup(opts: &Options) -> Result<(), String> {
             std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?
         }
         None => {
-            let repo = value(&opts.repo, "SBR_REPO", "Repository (owner/name)")?;
+            let repo = value(
+                &opts.repo,
+                "SBR_REPO",
+                "Repository (owner/name)",
+                default_repo,
+            )?;
             let labels = value(
                 &opts.labels,
                 "SBR_LABELS",
                 "Runner labels, comma-separated (self-hosted is added)",
+                || Some(DEFAULT_LABELS.into()),
             )?;
-            let snapshot = value(&opts.snapshot, "SBR_SNAPSHOT", "boat snapshot")?;
+            let snapshot = match given(&opts.snapshot, "SBR_SNAPSHOT") {
+                Some(s) => s,
+                None => ask_snapshot()?,
+            };
             policy_text(&repo, &split_labels(&labels), &snapshot)
         }
     };
@@ -222,7 +243,7 @@ fn setup(opts: &Options) -> Result<(), String> {
                     .map_err(|e| format!("{e}; pass --new-app to create a new App"))?
             }
             AppPlan::Unknown => unreachable!("a real run reads {ENV} or fails"),
-            AppPlan::Create => new_app(&t, &cfg.repo, sudo)?,
+            AppPlan::Create => new_app(&t, &cfg.repo, opts.offline_link, sudo)?,
         }
     };
     for step in steps(&policy_text, &env_file(&boat_key, &auth)?, &auth, &bin) {
@@ -231,8 +252,8 @@ fn setup(opts: &Options) -> Result<(), String> {
     }
     println!(
         "\nDone. `journalctl -u {SERVICE} -f` shows what the daemon does. Point jobs at the \
-         pool with `runs-on: [{}]`.",
-        cfg.pools[0].labels.join(", ")
+         pool with this line in the workflow:\n\n    {}\n",
+        runs_on(&cfg.pools[0].labels)
     );
     Ok(())
 }
@@ -303,19 +324,152 @@ fn dry_run_app(plan: AppPlan, repo: &str) -> (String, Auth) {
     }
 }
 
-/// `flag`, else the environment variable `env`, else a prompt.
-fn value(flag: &Option<String>, env: &str, prompt: &str) -> Result<String, String> {
-    if let Some(v) = flag {
-        return Ok(v.trim().to_string());
+/// The line a workflow's job needs to run on the pool.
+fn runs_on(labels: &[String]) -> String {
+    format!("runs-on: [{}]", labels.join(", "))
+}
+
+/// `flag`, else the environment variable `env`.
+fn given(flag: &Option<String>, env: &str) -> Option<String> {
+    flag.clone()
+        .or_else(|| std::env::var(env).ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// `flag`, else the environment variable `env`, else a prompt that offers `default()`.
+fn value(
+    flag: &Option<String>,
+    env: &str,
+    prompt: &str,
+    default: impl FnOnce() -> Option<String>,
+) -> Result<String, String> {
+    if let Some(v) = given(flag, env) {
+        return Ok(v);
     }
-    if let Some(v) = std::env::var(env).ok().filter(|v| !v.trim().is_empty()) {
-        return Ok(v.trim().to_string());
+    let default = default();
+    let v = read_line(&with_default(prompt, default.as_deref()), false)?;
+    accept(v, default).ok_or_else(|| format!("{prompt}: empty; pass it as a flag or set {env}"))
+}
+
+/// The prompt with its default in brackets.
+fn with_default(prompt: &str, default: Option<&str>) -> String {
+    match default {
+        Some(d) => format!("{prompt} [{d}]"),
+        None => prompt.to_string(),
     }
-    let v = read_line(prompt, false)?;
-    if v.is_empty() {
-        return Err(format!("{prompt}: empty; pass it as a flag or set {env}"));
+}
+
+/// What was typed, or the default on Enter.
+fn accept(typed: String, default: Option<String>) -> Option<String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        default.filter(|d| !d.is_empty())
+    } else {
+        Some(typed.to_string())
     }
-    Ok(v)
+}
+
+/// The repository of the current directory: `gh repo view`, else the `origin` remote.
+fn default_repo() -> Option<String> {
+    let run = |cmd: &str, args: &[&str]| {
+        Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    run(
+        "gh",
+        &[
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ],
+    )
+    .filter(|r| repo_ok(r))
+    .or_else(|| run("git", &["remote", "get-url", "origin"]).and_then(|u| github_repo(&u)))
+}
+
+/// `owner/name` from a github.com remote URL (https, ssh or scp-like), else `None`.
+fn github_repo(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = [
+        "https://github.com/",
+        "http://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ]
+    .iter()
+    .find_map(|p| url.strip_prefix(p))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let repo = format!("{owner}/{name}");
+    repo_ok(&repo).then_some(repo)
+}
+
+/// Only a repository the policy takes, so a default never fails the check.
+fn repo_ok(repo: &str) -> bool {
+    policy::parse(&policy_text(repo, &["self-hosted".into()], "s")).is_ok()
+}
+
+/// The snapshot: a choice among the boat account's saved snapshots when `BOAT_API_KEY` is
+/// set and lists some, else a plain prompt.
+fn ask_snapshot() -> Result<String, String> {
+    const PROMPT: &str = "boat snapshot";
+    let saved = given(&None, "BOAT_API_KEY")
+        .and_then(|key| {
+            let t = Ureq::new(Duration::from_secs(30));
+            match crate::boat::Client::new(&t, key).saved_snapshots(None) {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    eprintln!("Could not list saved boat snapshots ({e}); type the name.");
+                    None
+                }
+            }
+        })
+        .unwrap_or_default();
+    let names: Vec<String> = saved.iter().map(|s| s.name.clone()).collect();
+    if names.is_empty() {
+        return value(&None, "SBR_SNAPSHOT", PROMPT, || None);
+    }
+    eprintln!("Saved boat snapshots, newest first:");
+    for (i, s) in saved.iter().enumerate() {
+        let size = s
+            .size_bytes
+            .map_or(String::new(), |b| format!(", {:.1} GB", b as f64 / 1e9));
+        eprintln!("  {}. {} ({}{size})", i + 1, s.name, s.status);
+    }
+    let default = saved
+        .iter()
+        .find(|s| s.status == "ready")
+        .map(|s| s.name.clone());
+    let typed = read_line(
+        &with_default(&format!("{PROMPT} (number or name)"), default.as_deref()),
+        false,
+    )?;
+    pick_snapshot(&typed, &names, default)
+}
+
+/// A number from the list, a name, or the default on Enter.
+fn pick_snapshot(typed: &str, names: &[String], default: Option<String>) -> Result<String, String> {
+    let typed = accept(typed.to_string(), default)
+        .ok_or("boat snapshot: empty; pass --snapshot or set SBR_SNAPSHOT")?;
+    match typed.parse::<usize>() {
+        Ok(n) if (1..=names.len()).contains(&n) => Ok(names[n - 1].clone()),
+        Ok(n) if !names.contains(&typed) => Err(format!(
+            "boat snapshot: {n} is not in the list (1 to {})",
+            names.len()
+        )),
+        _ => Ok(typed),
+    }
 }
 
 /// The environment variable `env`, else a prompt without echo.
@@ -577,16 +731,16 @@ fn staged_key(id: &str) -> String {
 
 /// Creates an App and waits until it is installed. Until the last steps, the service
 /// keeps the App and key it had: the new key waits at `staged_key`.
-fn new_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<Auth, String> {
-    let (id, pem) = create_app(t, repo, sudo)?;
+fn new_app(t: &dyn Transport, repo: &str, offline_link: bool, sudo: bool) -> Result<Auth, String> {
+    let (id, pem, note) = create_app(t, repo, offline_link, sudo)?;
     let staged = staged_key(&id);
     let app = App::new(id.clone(), None, pem.expose().as_bytes())?;
     println!(
         "Waiting until the app is installed on {repo} (up to {} min)...",
         INSTALL_WAIT.as_secs() / 60
     );
-    let installation =
-        wait_installed(t, &app, repo, INSTALL_WAIT, std::thread::sleep).map_err(|e| {
+    let installation = wait_installed(t, &app, repo, INSTALL_WAIT, &note, std::thread::sleep)
+        .map_err(|e| {
             format!(
                 "{e}\nNothing else changed: the service keeps its old settings. The new app's \
                  key is at {staged}; to use the app, install it and run setup again with \
@@ -604,19 +758,30 @@ fn new_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<Auth, String> {
 
 /// The manifest flow: the user creates the App in a browser, pastes back the code GitHub
 /// redirects with, and setup exchanges it for the App's id and private key. It stores
-/// the key at once at `staged_key`, since GitHub shows it only once.
-fn create_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<(String, Secret), String> {
+/// the key at once at `staged_key`, since GitHub shows it only once. The third value is
+/// what the wait for the installation repeats, if anything.
+fn create_app(
+    t: &dyn Transport,
+    repo: &str,
+    offline_link: bool,
+    sudo: bool,
+) -> Result<(String, Secret, String), String> {
     let (owner, name) = repo.split_once('/').expect("a checked repo");
     let kind = owner_kind(t, owner)?;
     let state = uuid::Uuid::new_v4().simple().to_string();
     let app_name = app_name(name, &state);
-    let page = manifest_page(&kind.new_app_url(owner), &manifest(repo, &app_name), &state);
-    println!(
-        "Create the GitHub App: open this link in your browser (paste it in the address bar),\n\
-         check the page and press the button. GitHub then asks you to confirm the app.\n\n\
-         {}\n\n\
-         GitHub then opens {HOMEPAGE}?code=...; copy that whole address.\n",
+    let link = if offline_link {
+        let page = manifest_page(&kind.new_app_url(owner), &manifest(repo, &app_name), &state);
         data_url(&page)
+    } else {
+        pages_link(owner, &kind, name, &state, &app_name)
+    };
+    println!(
+        "Create the GitHub App: open this link in your browser, check what the page lists \
+         and press its button.\nGitHub then asks you to confirm the app.\n\n\
+         {link}\n\n\
+         GitHub then opens {NEW_APP_PAGE}?code=...; copy the whole address it shows\n\
+         (if that page does not load, copy the address from the address bar).\n"
     );
     let pasted = secret("SBR_APP_CODE", "Paste the address (or just the code)")?;
     let code = parse_code(pasted.expose(), &state)?;
@@ -639,12 +804,52 @@ fn create_app(t: &dyn Transport, repo: &str, sudo: bool) -> Result<(String, Secr
         println!("{}", step.describe());
         step.execute(sudo)?;
     }
+    let note = match kind {
+        OwnerKind::Organization if org_owner(owner) != Some(true) => format!(
+            "If you are not an owner of {owner}, GitHub shows a \"Request\" screen instead: \
+             an owner of {owner} must approve the request before the app is installed."
+        ),
+        _ => String::new(),
+    };
     println!(
-        "\nInstall it on {repo}: open https://github.com/apps/{}/installations/new and pick \
-         only {repo}.",
+        "\nAdministration write can change {repo}'s settings or delete it, so install the app \
+         on {repo} only:\nchoose 'Only select repositories' -> {repo}.{}\n\n\
+         https://github.com/apps/{}/installations/new\n",
+        if note.is_empty() {
+            String::new()
+        } else {
+            format!("\n{note}")
+        },
         created.slug
     );
-    Ok((created.id.to_string(), created.pem))
+    Ok((created.id.to_string(), created.pem, note))
+}
+
+/// The short link to docs/new-app.html, which builds the same manifest as `manifest`.
+/// Every value is in the GitHub name charset or hex, so none needs escaping.
+fn pages_link(owner: &str, kind: &OwnerKind, repo_name: &str, state: &str, app: &str) -> String {
+    let kind = match kind {
+        OwnerKind::User => "user",
+        OwnerKind::Organization => "org",
+    };
+    format!("{NEW_APP_PAGE}#owner={owner}&kind={kind}&repo={repo_name}&state={state}&name={app}")
+}
+
+/// Whether the `gh` user is an owner of the organization; `None` when `gh` cannot tell.
+fn org_owner(org: &str) -> Option<bool> {
+    let out = Command::new("gh")
+        .args([
+            "api",
+            &format!("user/memberships/orgs/{org}"),
+            "-q",
+            ".role",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).trim() == "admin")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -711,7 +916,7 @@ fn manifest(repo: &str, name: &str) -> Value {
         "url": HOMEPAGE,
         "description": format!("sw-boat-runner for {repo}"),
         "hook_attributes": { "url": HOMEPAGE, "active": false },
-        "redirect_url": HOMEPAGE,
+        "redirect_url": NEW_APP_PAGE,
         "public": false,
         "default_permissions": { "administration": "write", "actions": "read" },
         "default_events": [],
@@ -833,6 +1038,7 @@ fn wait_installed(
     app: &App,
     repo: &str,
     limit: Duration,
+    note: &str,
     mut sleep: impl FnMut(Duration),
 ) -> Result<u64, String> {
     let mut waited = Duration::ZERO;
@@ -872,9 +1078,14 @@ fn wait_installed(
         waited += INSTALL_POLL;
         if waited.as_secs() % 60 == 0 {
             println!(
-                "Still waiting for the app to be installed on {repo} ({} of {} min)...",
+                "Still waiting for the app to be installed on {repo} ({} of {} min)...{}",
                 waited.as_secs() / 60,
-                limit.as_secs() / 60
+                limit.as_secs() / 60,
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {note}")
+                }
             );
         }
     }
@@ -1214,7 +1425,7 @@ mod tests {
             json!({"administration": "write", "actions": "read"})
         );
         assert_eq!(m["default_events"], json!([]));
-        assert_eq!(m["redirect_url"], HOMEPAGE);
+        assert_eq!(m["redirect_url"], NEW_APP_PAGE);
         let name = app_name(&"n".repeat(40), "0123abcdef");
         assert!(name.len() <= 34 && name.ends_with("-0123abcd"), "{name}");
     }
@@ -1265,24 +1476,24 @@ mod tests {
         let code = |s: &str| parse_code(s, "st").map(|c| c.expose().to_string());
         assert_eq!(code("abc123").unwrap(), "abc123");
         assert_eq!(
-            code(&format!("{HOMEPAGE}?code=abc123&state=st")).unwrap(),
+            code(&format!("{NEW_APP_PAGE}?code=abc123&state=st")).unwrap(),
             "abc123"
         );
         assert_eq!(
-            code(&format!(" {HOMEPAGE}?state=st&code=a_1#x ")).unwrap(),
+            code(&format!(" {NEW_APP_PAGE}?state=st&code=a_1#x ")).unwrap(),
             "a_1"
         );
         assert!(
-            code(&format!("{HOMEPAGE}?code=abc"))
+            code(&format!("{NEW_APP_PAGE}?code=abc"))
                 .unwrap_err()
                 .contains("no state")
         );
         assert!(
-            code(&format!("{HOMEPAGE}?code=abc&state=other"))
+            code(&format!("{NEW_APP_PAGE}?code=abc&state=other"))
                 .unwrap_err()
                 .contains("state")
         );
-        assert!(code(&format!("{HOMEPAGE}?state=st")).is_err());
+        assert!(code(&format!("{NEW_APP_PAGE}?state=st")).is_err());
         assert!(code("../x").is_err());
         assert!(code("").is_err());
     }
@@ -1322,7 +1533,7 @@ mod tests {
         });
         let app = App::new("42".into(), None, test_pem().as_bytes()).unwrap();
         let mut slept = Vec::new();
-        let id = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, |d| slept.push(d)).unwrap();
+        let id = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, "", |d| slept.push(d)).unwrap();
         assert_eq!(id, 77);
         assert_eq!(slept, [INSTALL_POLL, INSTALL_POLL]);
         assert!(
@@ -1332,7 +1543,7 @@ mod tests {
         );
 
         let never = Fake::new(|_| respond(404, &[], r#"{"message":"Not Found"}"#));
-        let err = wait_installed(&never, &app, "o/r", INSTALL_POLL * 2, |_| {}).unwrap_err();
+        let err = wait_installed(&never, &app, "o/r", INSTALL_POLL * 2, "", |_| {}).unwrap_err();
         assert!(err.contains("not installed on o/r"), "{err}");
         assert_eq!(never.sent().len(), 3);
 
@@ -1347,7 +1558,7 @@ mod tests {
             }
         });
         assert_eq!(
-            wait_installed(&flaky, &app, "o/r", INSTALL_WAIT, |_| {}).unwrap(),
+            wait_installed(&flaky, &app, "o/r", INSTALL_WAIT, "", |_| {}).unwrap(),
             5
         );
     }
@@ -1363,7 +1574,7 @@ mod tests {
             let fake = Fake::new(move |_| {
                 respond(status, &[], r#"{"message":"Resource not accessible"}"#)
             });
-            let err = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, |_| {
+            let err = wait_installed(&fake, &app, "o/r", INSTALL_WAIT, "", |_| {
                 panic!("slept after {status}")
             })
             .unwrap_err();
@@ -1609,5 +1820,140 @@ mod tests {
                 .iter()
                 .any(|s| s.describe().contains("github-app.pem"))
         );
+    }
+
+    #[test]
+    fn the_pages_link_is_short_and_carries_what_the_page_checks() {
+        let state = "0123456789abcdef0123456789abcdef";
+        let link = pages_link(
+            "acme",
+            &OwnerKind::Organization,
+            "app.rs",
+            state,
+            "sbr-app.rs-01234567",
+        );
+        assert_eq!(
+            link,
+            "https://surely-works-llc.github.io/sw-boat-runner/new-app.html#owner=acme&kind=org\
+             &repo=app.rs&state=0123456789abcdef0123456789abcdef&name=sbr-app.rs-01234567"
+        );
+        assert!(pages_link("me", &OwnerKind::User, "r", state, "n").contains("&kind=user&"));
+        let name = app_name("app.rs", state);
+        assert!(name.starts_with("sbr-app.rs-") && name.len() == "sbr-app.rs-".len() + 8);
+    }
+
+    /// docs/new-app.html builds the manifest in the browser; it must match `manifest`.
+    #[test]
+    fn the_pages_manifest_matches_setups() {
+        let page = include_str!("../docs/new-app.html");
+        assert!(page.contains(&format!("const PAGE_URL = \"{NEW_APP_PAGE}\";")));
+        assert!(page.contains(&format!("const HOMEPAGE = \"{HOMEPAGE}\";")));
+        let m = manifest("acme/app", "n");
+        let perms: Vec<String> = m["default_permissions"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("\"{k}\": {v}"))
+            .collect();
+        let line = page
+            .lines()
+            .find(|l| l.starts_with("const PERMISSIONS = "))
+            .unwrap();
+        for p in &perms {
+            assert!(line.contains(p.as_str()), "{p} not in {line}");
+        }
+        assert_eq!(line.matches(':').count(), perms.len(), "{line}");
+        let keys: Vec<&String> = m.as_object().unwrap().keys().collect();
+        for key in keys {
+            assert!(page.contains(&format!("\"{key}\": ")), "{key}");
+        }
+        for s in [
+            "\"active\": false",
+            "\"public\": false",
+            "\"default_events\": []",
+            "\"redirect_url\": PAGE_URL",
+            "\"sw-boat-runner for \" + owner + \"/\" + repo",
+            "https://github.com/organizations/\" + owner + \"/settings/apps/new?state=",
+            "\"https://github.com/settings/apps/new?state=\"",
+        ] {
+            assert!(page.contains(s), "{s}");
+        }
+        assert_eq!(m["description"], "sw-boat-runner for acme/app");
+    }
+
+    /// The page's CSP allows its one inline script by hash, so an edit must update it.
+    #[test]
+    fn the_pages_csp_hash_matches_its_script() {
+        use base64::Engine;
+        let page = include_str!("../docs/new-app.html");
+        let script = page
+            .split_once("<script>")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .unwrap()
+            .0;
+        let digest = ring::digest::digest(&ring::digest::SHA256, script.as_bytes());
+        let hash = base64::engine::general_purpose::STANDARD.encode(digest);
+        assert!(
+            page.contains(&format!(
+                "default-src 'none'; script-src 'sha256-{hash}'; style-src 'unsafe-inline'; \
+                 form-action https://github.com; base-uri 'none'"
+            )),
+            "update the CSP hash in docs/new-app.html to sha256-{hash}"
+        );
+        assert_eq!(page.matches("<script").count(), 1);
+    }
+
+    #[test]
+    fn prompts_take_the_default_on_enter() {
+        assert_eq!(with_default("Repo", Some("a/b")), "Repo [a/b]");
+        assert_eq!(with_default("Repo", None), "Repo");
+        assert_eq!(
+            accept("".into(), Some("a/b".into())).as_deref(),
+            Some("a/b")
+        );
+        assert_eq!(
+            accept(" c/d ".into(), Some("a/b".into())).as_deref(),
+            Some("c/d")
+        );
+        assert_eq!(accept("".into(), None), None);
+        assert_eq!(split_labels(DEFAULT_LABELS), ["self-hosted", "boat"]);
+        assert_eq!(
+            runs_on(&split_labels(DEFAULT_LABELS)),
+            "runs-on: [self-hosted, boat]"
+        );
+    }
+
+    #[test]
+    fn finds_the_repository_in_a_github_remote() {
+        for url in [
+            "https://github.com/acme/app.git",
+            "https://github.com/acme/app",
+            "git@github.com:acme/app.git\n",
+            "ssh://git@github.com/acme/app/",
+        ] {
+            assert_eq!(github_repo(url).as_deref(), Some("acme/app"), "{url}");
+        }
+        for url in [
+            "https://gitlab.com/acme/app.git",
+            "https://github.com/acme",
+            "https://github.com/acme/app/tree/main",
+            "git@github.com:acme/..",
+        ] {
+            assert_eq!(github_repo(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn picks_a_snapshot_by_number_or_name() {
+        let names: Vec<String> = ["ci-2", "ci-1", "7"].map(String::from).to_vec();
+        let pick = |typed: &str| pick_snapshot(typed, &names, Some("ci-2".into()));
+        assert_eq!(pick("").unwrap(), "ci-2");
+        assert_eq!(pick("2").unwrap(), "ci-1");
+        assert_eq!(pick("ci-1").unwrap(), "ci-1");
+        assert_eq!(pick("other").unwrap(), "other");
+        assert_eq!(pick("3").unwrap(), "7");
+        assert_eq!(pick("7").unwrap(), "7");
+        assert!(pick("9").unwrap_err().contains("1 to 3"));
+        assert!(pick_snapshot("", &names, None).is_err());
     }
 }
