@@ -11,16 +11,30 @@ All notable changes to this project are documented here. The format follows
 - `sw-boat-runner setup`: writes a policy, creates a GitHub App from a manifest (or takes
   a personal token with `--pat`), stores the keys root-only and enables the systemd
   service. `--dry-run` prints the steps. Running it again reuses the App it stored;
-  `--new-app` makes another. `examples/always-on/install.sh` now builds the binary and
+  `--new-app` makes another. `examples/always-on/install.sh` now gets the binary and
   runs it.
 - A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
   `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
   put its keys at the top level, without `[[pool]]`.
+- A `release` workflow: a pushed `v*` tag publishes static Linux x86_64 and arm64 (musl)
+  and macOS arm64 binaries with `SHA256SUMS` and a build provenance attestation
+  (`gh attestation verify`). CI builds the same targets on every pull request.
+- `examples/always-on/install.sh` gets the latest release's binary, checked against
+  `SHA256SUMS` and, when `gh` is logged in, its attestation, before it runs `setup`. It
+  builds with cargo only for a commit or branch named in `SBR_REF`, or for a release
+  without a binary for the machine, and then builds that release's tag. Any other
+  failure stops it. `SBR_REF` pins a tag or commit.
+- The `runners` workflow takes a GitHub App: the `app-id` input and the `app-private-key`
+  secret. `RUNNER_ADMIN_TOKEN` is now the opt-in alternative; passing both, or neither,
+  fails the job at its first step.
 
 ### Changed
 
 - The default preset is `warm`, not `hybrid`. A pool with no `preset` no longer forks a
   machine per job past its kept machines; set `preset = "hybrid"` to keep that.
+- The `runners` workflow lists the run's jobs with the run's own token, so the calling
+  job must grant `actions: read`.
+  Its `ref` default and the example's `uses:` follow `main`; pin both to one SHA.
 
 ## [0.1.0] - 2026-11-11
 

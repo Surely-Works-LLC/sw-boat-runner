@@ -22,6 +22,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- check examples/always-on/policy.toml
+  # The release workflow's targets, so a tag never meets a build that fails.
   release:
     name: release (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -33,16 +34,21 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - run: rustup toolchain install stable --profile minimal -t "$TARGET"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked --release --target "$TARGET"
+      - run: '"target/$TARGET/release/sw-boat-runner" --version'
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sw-boat-runner-${{ matrix.target }}

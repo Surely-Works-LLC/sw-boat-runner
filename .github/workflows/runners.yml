@@ -35,26 +35,37 @@ on:
         description: >-
           The sw-boat-runner tag or commit to build. Keep it the same as the ref in the
           caller's `uses:` line.
-        default: v0.1.0
+        default: main
+        type: string
+      app-id:
+        description: >-
+          The ID (or client ID) of a GitHub App installed on the calling repository with
+          Administration read and write and Actions read. Pass its key as the
+          app-private-key secret. Leave it empty to use RUNNER_ADMIN_TOKEN instead.
+        default: ""
         type: string
     secrets:
       BOAT_API_KEY:
         required: true
+      app-private-key:
+        description: The private key (PEM) of the app that app-id names.
+        required: false
       RUNNER_ADMIN_TOKEN:
         description: >-
-          A fine-grained token for the calling repository with Administration read and
-          write and Actions read. The token Actions creates for the run cannot register
-          runners.
-        required: true
+          Instead of an app: a fine-grained token for the calling repository with
+          Administration read and write and Actions read. The token Actions creates for the run cannot
+          register runners.
+        required: false
 permissions: {}
 jobs:
   daemon:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    # Checkout is the only use of the run's own token. The daemon and `gh` use the secrets,
-    # which only the steps that call them get, not the build.
+    # The run's own token checks out the code and lists the run's jobs. The daemon uses the
+    # app or RUNNER_ADMIN_TOKEN, which only the steps that call it get, not the build.
     permissions:
       contents: read
+      actions: read
     env:
       SNAPSHOT: ${{ inputs.snapshot }}
       MACHINE_TYPE: ${{ inputs.machine_type }}
@@ -62,6 +73,19 @@ jobs:
       POOL: ${{ inputs.pool }}
       NAME: ${{ inputs.name }}
     steps:
+      - name: Credentials
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          APP_KEY: ${{ secrets.app-private-key }}
+          PAT: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+        run: |
+          if [ -n "$APP_ID$APP_KEY" ] && [ -n "$PAT" ]; then
+            echo "::error::Pass app-id and app-private-key, or RUNNER_ADMIN_TOKEN, not both."
+            exit 1
+          elif [ -z "$PAT" ] && { [ -z "$APP_ID" ] || [ -z "$APP_KEY" ]; }; then
+            echo "::error::Pass app-id and the app-private-key secret together, or RUNNER_ADMIN_TOKEN instead."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: Surely-Works-LLC/sw-boat-runner
@@ -87,11 +111,23 @@ jobs:
           $POOL
           TOML
           target/release/sw-boat-runner check policy.toml
+      # Written after the build, so no build script can read it. The daemon mints and renews
+      # the app's installation token itself; a token minted here would expire after an
+      # hour, and this job can run for six.
+      - name: App key
+        if: inputs.app-id != ''
+        env:
+          APP_KEY: ${{ secrets.app-private-key }}
+          APP_KEY_FILE: ${{ runner.temp }}/github-app.pem
+        run: (umask 077 && printf '%s\n' "$APP_KEY" > "$APP_KEY_FILE")
       - name: Run the daemon until the run's other jobs are done
         env:
           BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
-          GH_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+          GITHUB_APP_ID: ${{ inputs.app-id }}
+          GITHUB_APP_PRIVATE_KEY_FILE: ${{ inputs.app-id != '' && format('{0}/github-app.pem', runner.temp) || '' }}
+          # Listing this run's jobs needs only the run's own token.
+          GH_TOKEN: ${{ github.token }}
         run: |
           target/release/sw-boat-runner run policy.toml &
           daemon=$!
@@ -111,6 +147,8 @@ jobs:
         env:
           BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
+          GITHUB_APP_ID: ${{ inputs.app-id }}
+          GITHUB_APP_PRIVATE_KEY_FILE: ${{ inputs.app-id != '' && format('{0}/github-app.pem', runner.temp) || '' }}
         run: |
           [ -f policy.toml ] || exit 0
           for _ in $(seq 20); do
@@ -118,3 +156,8 @@ jobs:
             sleep 15
           done
           exit 1
+      - name: Delete the app's key
+        if: always()
+        env:
+          APP_KEY_FILE: ${{ runner.temp }}/github-app.pem
+        run: rm -f "$APP_KEY_FILE"
