@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use crate::boat;
 use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
-use crate::run::Transport;
+use crate::transport::Transport;
 
 pub(crate) const API: &str = "https://api.github.com";
 /// Every runner this tool registers has a name starting with this.
@@ -372,7 +372,7 @@ impl<'t> Client<'t> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::fake::{Fake, respond};
+    use crate::transport::fake::{Fake, respond};
 
     const RUNNERS: &str = "https://api.github.com/repos/o/r/actions/runners?per_page=100&page=1";
 

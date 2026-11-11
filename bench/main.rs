@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde_json::{Value, json};
-use sw_boat_runner::run::{Loop, NetworkError, Response, Transport};
+use sw_boat_runner::run::Loop;
+use sw_boat_runner::transport::{NetworkError, Response, Transport};
 use sw_boat_runner::{decide, github, policy};
 
 const TICK_S: u64 = 15;

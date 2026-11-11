@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::model::MachineState;
-use crate::run::{Response, Transport};
+use crate::transport::{Response, Transport};
 
 pub(crate) const BASE: &str = "https://boat.dev/api/v1";
 /// Label every machine of a pool carries: `sw-boat-runner=<pool>`.
@@ -409,7 +409,7 @@ fn encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::fake::{Fake, respond};
+    use crate::transport::fake::{Fake, respond};
 
     fn err(status: u16, headers: &[(&str, &str)], body: &str) -> Error {
         map_error(&respond(status, headers, body))
