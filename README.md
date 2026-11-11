@@ -53,6 +53,8 @@ enables a systemd service. Point jobs at the pool with `runs-on: [self-hosted, b
 - `setup --pat`: a fine-grained token (Administration read and write, Actions read)
   instead of an App. It shares your rate limit. `setup --help` lists the other flags.
 - `preset`: `warm` (default), `pool`, `fork` or `hybrid`, see [Policy](#policy).
+- `sw-boat-runner doctor` checks a setup end to end (clock, boat key, snapshot, App
+  permissions, service, runners) and says how to fix each failure. `setup` runs it last.
 - `sw-boat-runner snapshot <sandbox-id> <name>` checks a sandbox for logins, runner
   state, cache paths and size in a `noEnv` fork, then saves it.
 - [In-workflow mode](examples/in-workflow/): no host; a reusable workflow runs the daemon

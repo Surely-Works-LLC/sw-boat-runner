@@ -15,6 +15,12 @@ All notable changes to this project are documented here. The format follows
   runs it. The App comes from a short link to `docs/new-app.html` on GitHub Pages
   (`--offline-link` prints a `data:` URL instead), and the prompts offer the repository
   from `gh` or `origin`, labels `self-hosted, boat` and the saved boat snapshots.
+- `sw-boat-runner doctor [policy.toml]`: checks a setup end to end (policy, clock skew
+  against GitHub, boat key, each pool's snapshot and its size and logins, GitHub App
+  permissions or token, rate limit, the systemd service, each pool's runners) and prints
+  `ok`, `warn` or `FAIL` with a fix for each; any FAIL exits non-zero. As root without
+  credentials in the environment it reads `/etc/sw-boat-runner/env`. `setup` runs it at
+  the end; a FAIL there leaves the setup in place.
 - A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
   `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
   put its keys at the top level, without `[[pool]]`.

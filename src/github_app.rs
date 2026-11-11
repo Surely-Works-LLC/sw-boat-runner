@@ -4,6 +4,7 @@
 //! The key, the JWT and the installation token are credentials: none of them has `Debug`
 //! or `Display`, and no error message quotes them or a response body that holds them.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -160,6 +161,33 @@ impl App {
         }
     }
 
+    /// The installation set in `GITHUB_APP_INSTALLATION_ID` or found on first use.
+    pub(crate) fn installation(&self) -> Option<u64> {
+        self.installation
+    }
+
+    /// `GET /app/installations/{id}`: what the installation was granted, such as
+    /// `administration: write`, for `doctor`.
+    pub(crate) fn installation_permissions(
+        &self,
+        t: &dyn Transport,
+        installation: u64,
+        now: UnixSecs,
+    ) -> Result<BTreeMap<String, String>, Error> {
+        #[derive(Deserialize)]
+        struct Out {
+            #[serde(default)]
+            permissions: BTreeMap<String, String>,
+        }
+        let jwt = self.jwt(now)?;
+        let url = format!("{API}/app/installations/{installation}");
+        let what = format!("read installation {installation}");
+        let body = call(t, "GET", &url, &jwt, None, &what)?;
+        serde_json::from_slice::<Out>(&body)
+            .map(|out| out.permissions)
+            .map_err(|_| Error::Parse("installation response".into()))
+    }
+
     /// The installation token held now, if any.
     pub(crate) fn held_token(&self) -> Option<&str> {
         self.token.as_ref().map(|held| held.token.as_str())
@@ -278,7 +306,7 @@ fn message(body: &[u8], jwt: &str) -> String {
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, the form GitHub sends, to Unix seconds.
-fn parse_utc(s: &str) -> Option<UnixSecs> {
+pub(crate) fn parse_utc(s: &str) -> Option<UnixSecs> {
     let b = s.as_bytes();
     if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
         return None;

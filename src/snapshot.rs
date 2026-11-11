@@ -895,7 +895,7 @@ fn quote(path: &str) -> Result<String, String> {
 }
 
 /// Decimal GB, as boat prints them.
-fn gb(bytes: u64) -> String {
+pub(crate) fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
 }
 
