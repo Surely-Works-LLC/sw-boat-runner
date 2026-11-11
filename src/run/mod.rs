@@ -86,6 +86,15 @@ impl From<github::Error> for Error {
 pub fn run(cfg: &Config, decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>) -> Result<(), Error> {
     let transport = Ureq::new(HTTP_TIMEOUT);
     let mut tick_loop = Loop::connect(cfg, &transport, unix_now())?;
+    // Once, and only advice: a failed read changes nothing.
+    match tick_loop.boat.saved_snapshots(None) {
+        Ok(saved) => {
+            for warning in crate::snapshot::oversized(&cfg.pools, &saved) {
+                eprintln!("warning: {warning}");
+            }
+        }
+        Err(e) => eprintln!("saved snapshots: {e}"),
+    }
     let period = Duration::from_secs(cfg.tick_s.max(1));
     loop {
         let started = Instant::now();

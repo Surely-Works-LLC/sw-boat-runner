@@ -2,13 +2,14 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use sw_boat_runner::model::{self, Placement};
-use sw_boat_runner::{decide, policy, run};
+use sw_boat_runner::{decide, policy, run, snapshot};
 
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
        sw-boat-runner plan <policy.toml> [snapshot.json]
        sw-boat-runner run <policy.toml>
        sw-boat-runner drain <policy.toml>
+       sw-boat-runner snapshot <sandbox-id> <name> [--machine-type T] [--fix] [--keep-fork] [--yes]
        sw-boat-runner --help | --version";
 
 const HELP: &str = "\
@@ -18,8 +19,9 @@ Keeps self-hosted GitHub Actions runners on boat machines.
   plan    print the actions run would take, from a snapshot file or one live read
   run     observe, decide and act every tick_s seconds
   drain   delete the policy's runners and machines; fails while any are left
+  snapshot  check a sandbox in a noEnv fork and save the fork as a CI snapshot
 
-run, drain and a live plan read BOAT_API_KEY, and GITHUB_TOKEN or a GitHub App's
+run, drain, snapshot and a live plan read BOAT_API_KEY, and GITHUB_TOKEN or a GitHub App's
 GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE and optional GITHUB_APP_INSTALLATION_ID.";
 
 fn main() -> ExitCode {
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         }
         ["run", policy] => with_policy(policy, cmd_run),
         ["drain", policy] => with_policy(policy, cmd_drain),
+        ["snapshot", rest @ ..] => cmd_snapshot(rest),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -148,6 +151,25 @@ fn cmd_run(cfg: &model::Config) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("run: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Fails unless the snapshot was saved.
+fn cmd_snapshot(args: &[&str]) -> ExitCode {
+    let opts = match snapshot::parse_args(args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("snapshot: {e}\nusage: {}", snapshot::USAGE);
+            return ExitCode::from(2);
+        }
+    };
+    match snapshot::run(&opts) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => {
+            eprintln!("snapshot: {e}");
             ExitCode::FAILURE
         }
     }

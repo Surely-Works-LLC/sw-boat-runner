@@ -164,6 +164,23 @@ machine and runner alone. It fails while a machine is left, for example one whos
 is still running a job, so run it again until it succeeds. Then point `runs-on` back at
 another runner.
 
+## Check and save a snapshot
+
+`sw-boat-runner snapshot <sandbox-id> <name> [--machine-type T] [--fix] [--keep-fork] [--yes]`
+forks the sandbox with `noEnv` (the sandbox itself is not changed), waits for the fork to
+hydrate, and checks it: boat's `holdsCreatorLogins`, an unconfigured runner with
+`run.sh` at `/home/user/actions-runner`, enabled `actions.runner.*` systemd units,
+credential files (`gh`, git, ssh, codex, claude, netrc, docker, aws, npm, gcloud), runner `.env` cache
+directories under `/tmp` or `~/.cache`, and the size against `machine_type`'s disk (51 GB
+for small and default, 111 GB for large, 251 GB for xlarge). It prints the largest
+directories. With no FAIL it saves the fork under `<name>`, prints the size and deletes
+the fork. `--fix` disables old runner units and removes `.runner` and `.credentials` in
+the fork, and removes credential files from it after a yes. Replacing an existing name
+also asks first; `--yes` answers both. A replacement is first saved under a temporary
+`sbr-tmp-` name to read its real size, and the old snapshot is kept when it is too big.
+Ctrl-C or SIGTERM deletes the fork before exiting; a second one exits at once. `run` warns once at start about a pool whose saved
+snapshot is larger than its machine type's disk.
+
 ## Policy
 
 `repo` (`owner/name`; neither part may be `.` or `..`) and `tick_s` (default 15) sit at
