@@ -1,248 +1,88 @@
 //! One tick's decision: a snapshot and a pool in, that pool's actions out. Pure and
 //! deterministic, so the property tests and spec/BoatRunner.tla can check it directly.
-//! Guards follow docs/design.md#state-machine; where the design leaves a rule open, the
-//! rule is written next to the code that applies it.
+//!
+//! Each action has one guard, a `View` method named after its row in the table in
+//! docs/design.md#state-machine (and its `*Guard` in the spec), in the table's order. The
+//! table states each rule once. `decide` runs the guards in a fixed order because later
+//! guards read earlier decisions, such as the demand that registers and starts leave.
 
 use std::collections::BTreeSet;
 
 use crate::model::{
-    Action, Cents, JobKey, Limits, Machine, MachineState, Placement, Pool, Runner, RunnerState,
-    Snapshot,
+    Action, JobKey, Machine, MachineState, Placement, Pool, Runner, RunnerState, Snapshot,
 };
+use MachineState::{Gone, Starting, Stopped, Stopping, Up};
+use Placement::{Fork, Resume, Slot};
+use RunnerState::{Busy, Idle, Offline, Registered};
 
-/// The actions for `pool`, in this order: runner cleanup, deletes, registers, resumes,
-/// forks, stops. Inputs are sorted by id first, so their order in `snap` does not matter.
-/// `snap.queued` holds only the jobs routed to this pool (see `run::route`). Jobs or not,
-/// a pool keeps `min_up` kept machines up or starting: it resumes stopped ones if it can,
-/// and forks kept machines for the rest.
-///
-/// Ephemeral machines are the ones with `job: Some(_)`, made by a job `Fork`. One gets exactly one
-/// runner in its life, so "fresh" and "finished" are decided from `last_busy` (the last time
-/// a runner on it was `Busy` or `Registered`):
-/// - fresh: `Up`, no runner at all, and `last_busy < since`, so no runner was ever seen on
-///   it since it came up. Only a fresh machine gets a `Register`.
-/// - finished: `Stopped`, or `Up` with no runner other than `Offline` ones, and either a
-///   runner was seen (`last_busy >= since`) or it has waited longer than
-///   `register_timeout_s` for one.
-/// - expired: in its current state longer than `fork_ttl_s`.
-///
-/// A finished or expired machine is deleted, but never while a runner on it is `Busy`.
+/// The actions for `pool`, in this order: unregisters, deletes, registers, resumes, kept
+/// forks, job forks, stops. Inputs are sorted first, so their order in `snap` does not
+/// matter. `snap.queued` holds only the jobs routed to this pool (see `run::route`).
 pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
-    let now = snap.now;
-    let mut machines: Vec<&Machine> = snap
-        .machines
-        .iter()
-        .filter(|m| m.pool == pool.name)
-        .collect();
-    machines.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut runners: Vec<&Runner> = snap
-        .runners
-        .iter()
-        .filter(|r| r.pool == pool.name)
-        .collect();
-    runners.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut jobs: Vec<JobKey> = snap
-        .queued
-        .iter()
-        .filter(|j| pool.serves(&j.labels))
-        .map(|j| j.key)
-        .collect();
-    jobs.sort();
-    jobs.dedup();
-    let has = |step: Placement| pool.placement.contains(&step);
-    let kept_in = |state: MachineState| {
-        machines
-            .iter()
-            .filter(move |m| m.job.is_none() && m.state == state)
-    };
+    let v = View::new(snap, pool);
     let mut actions = Vec::new();
 
     let mut unregistered = BTreeSet::new();
-    for r in &runners {
-        let on_up = machines
-            .iter()
-            .any(|m| m.id == r.machine && m.state == MachineState::Up);
-        let timed_out = r.state == RunnerState::Registered
-            && now.saturating_sub(r.registered_at) > pool.register_timeout_s;
-        // Every runner is JIT: once offline it never comes back, and it holds its slot.
-        if !on_up || timed_out || r.state == RunnerState::Offline {
-            unregistered.insert(r.name.as_str());
-            actions.push(Action::Unregister {
-                runner: r.name.clone(),
-            });
-        }
+    for r in v.runners.iter().filter(|r| v.unregister(r)) {
+        unregistered.insert(r.name.as_str());
+        actions.push(Action::Unregister {
+            runner: r.name.clone(),
+        });
     }
 
     let mut deleted = BTreeSet::new();
-    let mut fresh = Vec::new();
-    for m in machines
-        .iter()
-        .filter(|m| m.job.is_some() && m.state != MachineState::Gone)
-    {
-        let on: Vec<&Runner> = runners_on(snap, &m.id).collect();
-        let busy = on.iter().any(|r| r.state == RunnerState::Busy);
-        let live = on.iter().any(|r| r.state != RunnerState::Offline);
-        let seen = m.last_busy >= m.since;
-        let age = now.saturating_sub(m.since);
-        let finished = match m.state {
-            MachineState::Up => !live && (seen || age > pool.register_timeout_s),
-            MachineState::Stopped => true,
-            _ => false,
-        };
-        if !busy && (finished || age > pool.fork_ttl_s) {
-            deleted.insert(m.id.as_str());
-            actions.push(Action::Delete {
-                machine: m.id.clone(),
-            });
-        } else if m.state == MachineState::Up && !seen && on.is_empty() {
-            fresh.push(*m);
-        }
-    }
-    // Only a pool that can resume ever brings a stopped kept machine back.
-    if !has(Placement::Resume) {
-        for m in kept_in(MachineState::Stopped) {
-            if runners_on(snap, &m.id).any(|r| r.state == RunnerState::Busy) {
-                continue;
-            }
-            deleted.insert(m.id.as_str());
-            actions.push(Action::Delete {
-                machine: m.id.clone(),
-            });
-        }
-    }
-    // Only `slot` registers runners on kept machines, so in a pool without it (one whose
-    // placement changed) a kept machine up or starting would hold a box until boat's TTL.
-    // A stopping one becomes stopped, which the rule above deletes; policy ties `resume`
-    // and `min_up` to `slot`, so nothing here resumes or keeps one.
-    if !has(Placement::Slot) {
-        let orphans = kept_in(MachineState::Up).chain(kept_in(MachineState::Starting));
-        for m in orphans {
-            if runners_on(snap, &m.id)
-                .any(|r| matches!(r.state, RunnerState::Busy | RunnerState::Registered))
-            {
-                continue;
-            }
-            deleted.insert(m.id.as_str());
-            actions.push(Action::Delete {
-                machine: m.id.clone(),
-            });
-        }
+    let kept = [Stopped, Up, Starting].into_iter().flat_map(|s| v.kept(s));
+    for m in v.ephemeral().chain(kept).filter(|m| v.delete(m)) {
+        deleted.insert(m.id.as_str());
+        actions.push(Action::Delete {
+            machine: m.id.clone(),
+        });
     }
 
-    let supply = runners
-        .iter()
-        .filter(|r| !unregistered.contains(r.name.as_str()))
-        .filter(|r| matches!(r.state, RunnerState::Registered | RunnerState::Idle))
-        .count();
-    let mut want = jobs.len().saturating_sub(supply);
-
-    // A fresh forked machine is already paid for, so it is filled before any free slot.
+    let mut want = v.demand(&unregistered);
     let mut registered_on = BTreeSet::new();
-    for m in fresh {
-        if want == 0 {
-            break;
-        }
+    for (m, slot) in v.register(&unregistered).take(want) {
+        registered_on.insert(m.id.as_str());
         actions.push(Action::Register {
             pool: pool.name.clone(),
             machine: m.id.clone(),
-            slot: 0,
+            slot,
         });
-        registered_on.insert(m.id.as_str());
         want -= 1;
     }
-    if has(Placement::Slot) {
-        for m in kept_in(MachineState::Up) {
-            for slot in 0..pool.slots_per_box {
-                if want == 0 {
-                    break;
-                }
-                // A slot freed by an Unregister above takes a fresh runner in the same tick.
-                if runners_on(snap, &m.id)
-                    .any(|r| r.slot == slot && !unregistered.contains(r.name.as_str()))
-                {
-                    continue;
-                }
-                actions.push(Action::Register {
-                    pool: pool.name.clone(),
-                    machine: m.id.clone(),
-                    slot,
-                });
-                registered_on.insert(m.id.as_str());
-                want -= 1;
-            }
-        }
-    }
 
-    // Machines already starting will take jobs once up; without this every tick until then
-    // would start more machines for the same demand.
-    let pending: usize = machines
-        .iter()
-        .filter(|m| m.state == MachineState::Starting && !deleted.contains(m.id.as_str()))
-        .map(|m| match m.job {
-            Some(_) => 1,
-            None => pool.slots_per_box as usize,
-        })
-        .sum();
-    want = want.saturating_sub(pending);
-
-    let mut starts = StartBudget {
-        limits: snap.limits,
-        cap: pool.paid_start_cents_per_day,
-        boxes: machines
-            .iter()
-            .filter(|m| matches!(m.state, MachineState::Up | MachineState::Starting))
-            .count(),
-        max_boxes: pool.max_boxes as usize,
-        taken: 0,
-    };
-    // `min_up` counts kept machines that are up or on their way up.
-    let held = kept_in(MachineState::Up).count() + kept_in(MachineState::Starting).count();
-    let mut short = (pool.min_up as usize).saturating_sub(held);
-    if has(Placement::Resume) {
-        // boat may have dropped the kept disk, so every resume is priced as a start.
-        for m in kept_in(MachineState::Stopped) {
-            if (want == 0 && short == 0) || !starts.take() {
-                break;
-            }
-            actions.push(Action::Resume {
-                machine: m.id.clone(),
-            });
-            short = short.saturating_sub(1);
-            want = want.saturating_sub(pool.slots_per_box as usize);
+    // Without this, every tick until a machine is up would start more for the same jobs.
+    want = want.saturating_sub(v.pending(&deleted));
+    let slots = pool.slots_per_box as usize;
+    let mut short = v.short();
+    let mut starts = 0;
+    for m in v.kept(Stopped) {
+        if !v.resume(want, short) || !v.start(&mut starts) {
+            break;
         }
-        // A kept machine still stopping is resumed once it has stopped; a fork now would
-        // leave the pool above `min_up` after that.
-        short = short.saturating_sub(kept_in(MachineState::Stopping).count());
+        actions.push(Action::Resume {
+            machine: m.id.clone(),
+        });
+        short = short.saturating_sub(1);
+        want = want.saturating_sub(slots);
     }
-    // A pool that resumes but never forks for a job would otherwise stay at its stopped
-    // and `min_up` machines. Demand left after every resume forks a kept machine, which
-    // later stops and resumes with its caches. A failed `take` above fails here too.
-    let grows = has(Placement::Resume) && !has(Placement::Fork);
-    while (short > 0 || (grows && want > 0)) && starts.take() {
+    if pool.has(Resume) {
+        short = short.saturating_sub(v.kept(Stopping).count());
+    }
+    // A start refused above is refused here too: the budget and boxes are the same.
+    while v.fork_kept(want, short) && v.start(&mut starts) {
         actions.push(Action::Fork {
             pool: pool.name.clone(),
             job: None,
         });
         short = short.saturating_sub(1);
-        want = want.saturating_sub(pool.slots_per_box as usize);
+        want = want.saturating_sub(slots);
     }
-    if has(Placement::Fork) {
-        // Every pool and state but Gone: a job forked by another pool must not be forked
-        // again here, while a job whose machine is gone may need a new one.
-        let forked: BTreeSet<JobKey> = snap
-            .machines
-            .iter()
-            .filter(|m| m.state != MachineState::Gone)
-            .filter_map(|m| m.job)
-            .collect();
-        for &job in &jobs {
-            if want == 0 {
-                break;
-            }
-            if forked.contains(&job) {
-                continue;
-            }
-            if !starts.take() {
+    if pool.has(Fork) {
+        let forked = v.forked();
+        let unforked = v.jobs.iter().filter(|j| forked.binary_search(j).is_err());
+        for &job in unforked {
+            if want == 0 || !v.start(&mut starts) {
                 break;
             }
             actions.push(Action::Fork {
@@ -253,76 +93,234 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         }
     }
 
-    // Only pools that can resume stop machines: a `pool` machine that stopped would never
-    // come back (docs/design.md#properties, IdleStops). A machine is not
-    // stopped while demand is still unmet, since a start just refused would want it back.
-    if has(Placement::Resume) && want == 0 {
-        let mut up = kept_in(MachineState::Up).count();
-        for m in kept_in(MachineState::Up) {
+    if pool.has(Resume) && want == 0 {
+        let mut up = v.kept(Up).count();
+        for m in v.kept(Up) {
             if up <= pool.min_up as usize {
                 break;
             }
-            let held = runners_on(snap, &m.id)
-                .any(|r| matches!(r.state, RunnerState::Busy | RunnerState::Registered));
-            if held
-                || now.saturating_sub(m.last_busy) < pool.idle_stop_s
-                || now.saturating_sub(m.since) < pool.min_up_s
-                || registered_on.contains(m.id.as_str())
-            {
-                continue;
+            if v.stop(m, &registered_on) {
+                actions.push(Action::Stop {
+                    machine: m.id.clone(),
+                });
+                up -= 1;
             }
-            actions.push(Action::Stop {
-                machine: m.id.clone(),
-            });
-            up -= 1;
         }
     }
     actions
 }
 
-/// Every runner on the machine, whatever its pool, so a stray runner still blocks a stop.
-fn runners_on<'a>(snap: &'a Snapshot, machine: &'a str) -> impl Iterator<Item = &'a Runner> {
-    snap.runners.iter().filter(move |r| r.machine == machine)
+/// One snapshot as one pool sees it, sorted once so that each guard is a lookup.
+struct View<'a> {
+    snap: &'a Snapshot,
+    pool: &'a Pool,
+    /// The pool's machines by id, and its runners by name.
+    machines: Vec<&'a Machine>,
+    runners: Vec<&'a Runner>,
+    /// Every runner by machine, whatever its pool: a stray runner still holds a machine.
+    by_machine: Vec<&'a Runner>,
+    /// The queued jobs the pool serves, by key, each once.
+    jobs: Vec<JobKey>,
+    /// The pool's machines `Up` or `Starting`, against `max_boxes`.
+    boxes: usize,
+}
+
+impl<'a> View<'a> {
+    fn new(snap: &'a Snapshot, pool: &'a Pool) -> Self {
+        let mut machines: Vec<&Machine> = snap
+            .machines
+            .iter()
+            .filter(|m| m.pool == pool.name)
+            .collect();
+        machines.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut runners: Vec<&Runner> = snap
+            .runners
+            .iter()
+            .filter(|r| r.pool == pool.name)
+            .collect();
+        runners.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut by_machine: Vec<&Runner> = snap.runners.iter().collect();
+        by_machine.sort_by(|a, b| a.machine.cmp(&b.machine));
+        let served = snap.queued.iter().filter(|j| pool.serves(&j.labels));
+        let mut jobs: Vec<JobKey> = served.map(|j| j.key).collect();
+        jobs.sort();
+        jobs.dedup();
+        let boxes = machines.iter().filter(|m| matches!(m.state, Up | Starting));
+        View {
+            boxes: boxes.count(),
+            snap,
+            pool,
+            machines,
+            runners,
+            by_machine,
+            jobs,
+        }
+    }
+
+    /// Register: fresh ephemeral machines first, as they are already paid for, then free
+    /// kept slots. The caller takes as many as there is demand.
+    fn register<'s>(
+        &'s self,
+        unregistered: &'s BTreeSet<&str>,
+    ) -> impl Iterator<Item = (&'a Machine, u32)> + 's {
+        let fresh = self.ephemeral().filter(|m| self.fresh(m)).map(|m| (m, 0));
+        let kept = self.kept(Up).filter(|_| self.pool.has(Slot));
+        let slots = kept.flat_map(|m| (0..self.pool.slots_per_box).map(move |s| (m, s)));
+        let free = slots.filter(|&(m, slot)| {
+            let taken = |r: &&Runner| r.slot == slot && !unregistered.contains(r.name.as_str());
+            !self.on(m).iter().any(taken)
+        });
+        fresh.chain(free)
+    }
+
+    /// No runner was ever seen on it since it came up, and it is not deleted this tick
+    /// (spec `Fresh`). Only a fresh machine gets a `Register`, so it runs one job.
+    fn fresh(&self, m: &Machine) -> bool {
+        m.is_ephemeral() && m.state == Up && !seen(m) && self.on(m).is_empty() && !self.delete(m)
+    }
+
+    /// Resume, for each `Stopped` kept machine in turn; the caller takes the start.
+    fn resume(&self, want: usize, short: usize) -> bool {
+        self.pool.has(Resume) && (want > 0 || short > 0)
+    }
+
+    /// Fork(job) skips these jobs: forked by a machine not `Gone`, in any pool.
+    fn forked(&self) -> Vec<JobKey> {
+        let live = self.snap.machines.iter().filter(|m| m.state != Gone);
+        let mut forked: Vec<JobKey> = live.filter_map(|m| m.job).collect();
+        forked.sort();
+        forked
+    }
+
+    /// Fork(none); the caller takes the start.
+    fn fork_kept(&self, want: usize, short: usize) -> bool {
+        short > 0 || (self.pool.has(Resume) && !self.pool.has(Fork) && want > 0)
+    }
+
+    /// Stop, for each kept `Up` machine while more than `min_up` stay up; the caller
+    /// checks `resume` and that no demand is unmet.
+    fn stop(&self, m: &Machine, registered_on: &BTreeSet<&str>) -> bool {
+        !holds(self.on(m), &[Busy, Registered])
+            && self.snap.now.saturating_sub(m.last_busy) >= self.pool.idle_stop_s
+            && self.age(m) >= self.pool.min_up_s
+            && !registered_on.contains(m.id.as_str())
+    }
+
+    fn delete(&self, m: &Machine) -> bool {
+        let on = self.on(m);
+        if m.is_ephemeral() {
+            let expired = self.age(m) > self.pool.fork_ttl_s;
+            m.state != Gone && !holds(on, &[Busy]) && (self.finished(m) || expired)
+        } else {
+            match m.state {
+                Stopped => !self.pool.has(Resume) && !holds(on, &[Busy]),
+                Up | Starting => !self.pool.has(Slot) && !holds(on, &[Busy, Registered]),
+                Stopping | Gone => false,
+            }
+        }
+    }
+
+    /// An ephemeral machine's job has finished (spec `Finished`).
+    fn finished(&self, m: &Machine) -> bool {
+        match m.state {
+            Up => {
+                let live = self.on(m).iter().any(|r| r.state != Offline);
+                !live && (seen(m) || self.age(m) > self.pool.register_timeout_s)
+            }
+            Stopped => true,
+            Starting | Stopping | Gone => false,
+        }
+    }
+
+    /// Every runner is JIT: once offline it never comes back, and it holds its slot.
+    fn unregister(&self, r: &Runner) -> bool {
+        let machines = run_of(&self.machines, &r.machine, |m| &m.id);
+        let timed_out = r.state == Registered
+            && self.snap.now.saturating_sub(r.registered_at) > self.pool.register_timeout_s;
+        !machines.iter().any(|m| m.state == Up) || timed_out || r.state == Offline
+    }
+
+    /// Queued jobs minus the pool's `Registered` and `Idle` runners that keep their slot.
+    fn demand(&self, unregistered: &BTreeSet<&str>) -> usize {
+        let kept = |r: &&&Runner| !unregistered.contains(r.name.as_str());
+        let ready = self.runners.iter().filter(kept);
+        let supply = ready.filter(|r| matches!(r.state, Registered | Idle));
+        self.jobs.len().saturating_sub(supply.count())
+    }
+
+    /// Jobs the pool's `Starting` machines not deleted this tick take once up.
+    fn pending(&self, deleted: &BTreeSet<&str>) -> usize {
+        let starting = self.machines.iter().filter(|m| m.state == Starting);
+        let left = starting.filter(|m| !deleted.contains(m.id.as_str()));
+        let slots = self.pool.slots_per_box as usize;
+        left.map(|m| if m.is_ephemeral() { 1 } else { slots }).sum()
+    }
+
+    /// Kept machines short of `min_up`, which counts kept machines up or starting.
+    fn short(&self) -> usize {
+        let held = self.kept(Up).count() + self.kept(Starting).count();
+        (self.pool.min_up as usize).saturating_sub(held)
+    }
+
+    /// docs/design.md#start-budget and `max_boxes`, after the starts `taken` this tick.
+    fn start(&self, taken: &mut u64) -> bool {
+        let limits = self.snap.limits;
+        // Every start this tick is priced at `next_start_cents`, the one quote the snapshot has.
+        let price = u64::from(limits.next_start_cents);
+        let spent = u64::from(limits.spent_today_cents) + (*taken + 1) * price;
+        let affordable = price == 0 || spent <= u64::from(self.pool.paid_start_cents_per_day);
+        // Past the free starts the price is not known; the next tick gets a new quote.
+        let free = limits.free_starts_left.map(u64::from);
+        let quoted = price != 0 || free.is_none_or(|left| *taken < left);
+        let room = self.boxes + (*taken as usize) < self.pool.max_boxes as usize;
+        let ok = room && limits.can_start && affordable && quoted;
+        *taken += u64::from(ok);
+        ok
+    }
+
+    fn kept(&self, state: MachineState) -> impl Iterator<Item = &'a Machine> + '_ {
+        let machines = self.machines.iter().copied();
+        machines.filter(move |m| !m.is_ephemeral() && m.state == state)
+    }
+
+    fn ephemeral(&self) -> impl Iterator<Item = &'a Machine> + '_ {
+        self.machines.iter().copied().filter(|m| m.is_ephemeral())
+    }
+
+    fn on(&self, m: &Machine) -> &[&'a Runner] {
+        run_of(&self.by_machine, &m.id, |r| &r.machine)
+    }
+
+    /// Seconds in the machine's current state.
+    fn age(&self, m: &Machine) -> u64 {
+        self.snap.now.saturating_sub(m.since)
+    }
+}
+
+/// A runner was `Busy` or `Registered` on the machine since it entered its state.
+fn seen(m: &Machine) -> bool {
+    m.last_busy >= m.since
+}
+
+fn holds(on: &[&Runner], states: &[RunnerState]) -> bool {
+    on.iter().any(|r| states.contains(&r.state))
+}
+
+/// The items whose key is `key`, from a slice sorted by that key.
+fn run_of<'s, T>(sorted: &'s [T], key: &str, key_of: impl Fn(&T) -> &String) -> &'s [T] {
+    let start = sorted.partition_point(|x| key_of(x).as_str() < key);
+    let len = sorted[start..].partition_point(|x| key_of(x) == key);
+    &sorted[start..start + len]
 }
 
 #[cfg(test)]
 #[path = "decide_reference.rs"]
 mod reference;
 
-/// docs/design.md#start-budget and `max_boxes`, counting the starts already taken this tick.
-struct StartBudget {
-    limits: Limits,
-    cap: Cents,
-    boxes: usize,
-    max_boxes: usize,
-    taken: u64,
-}
-
-impl StartBudget {
-    fn take(&mut self) -> bool {
-        // Every start this tick is priced at `next_start_cents`, the one quote the snapshot has.
-        let price = u64::from(self.limits.next_start_cents);
-        let spent = u64::from(self.limits.spent_today_cents) + (self.taken + 1) * price;
-        let affordable = price == 0 || spent <= u64::from(self.cap);
-        // Past the free starts the price is not known; the next tick gets a new quote.
-        let quoted = price != 0
-            || self
-                .limits
-                .free_starts_left
-                .is_none_or(|left| self.taken < u64::from(left));
-        if self.boxes >= self.max_boxes || !self.limits.can_start || !affordable || !quoted {
-            return false;
-        }
-        self.boxes += 1;
-        self.taken += 1;
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MachineState as Ms, QueuedJob, RunnerState as Rs};
+    use crate::model::{Limits, MachineState as Ms, QueuedJob, RunnerState as Rs};
 
     const NOW: u64 = 10_000;
 

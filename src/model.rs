@@ -50,8 +50,13 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Whether `step` is in the pool's placement (spec `Has`).
+    pub fn has(&self, step: Placement) -> bool {
+        self.placement.contains(&step)
+    }
+
     /// A job goes to a pool when it names at least one label and each is one of the pool's.
-    /// GitHub matches runner labels case-insensitively.
+    /// GitHub matches runner labels case-insensitively. The only label match in the crate.
     pub(crate) fn serves(&self, job_labels: &[String]) -> bool {
         !job_labels.is_empty()
             && job_labels
@@ -87,6 +92,14 @@ pub struct Machine {
     pub last_busy: UnixSecs,
     /// The job an ephemeral (forked) machine was made for; `None` for a kept machine.
     pub job: Option<JobKey>,
+}
+
+impl Machine {
+    /// A machine forked for one job, deleted after it (spec `IsEph`); every other machine
+    /// is kept and takes job after job.
+    pub fn is_ephemeral(&self) -> bool {
+        self.job.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
