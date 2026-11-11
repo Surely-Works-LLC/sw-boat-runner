@@ -9,12 +9,17 @@ boat new --no-auto-stop --type small    # prints the machine's id
 boat ssh <id>
 ```
 
-Inside the machine, write your `policy.toml` ([policy.toml](policy.toml) is a start), then:
+Inside the machine:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/main/examples/always-on/install.sh
-bash install.sh policy.toml    # asks for BOAT_API_KEY and GITHUB_TOKEN
+bash install.sh    # builds the daemon, then runs `sw-boat-runner setup`
 ```
+
+`setup` asks for the repository, labels and snapshot, creates a GitHub App and asks for
+`BOAT_API_KEY`. `bash install.sh policy.toml` uses your policy instead
+([policy.toml](policy.toml) is a start), and a `GITHUB_TOKEN` in the environment means a
+personal token instead of an App.
 
 The script builds the `main` branch. For production, pin a commit, in both the `curl` URL
 and `SBR_REF`, so a reinstall builds what you tested:
@@ -36,7 +41,7 @@ bash install.sh policy.toml    # asks for BOAT_API_KEY only
 rm "$HOME/app.pem"
 ```
 
-[install.sh](install.sh) asks for the two keys without echoing them, builds the daemon,
+[install.sh](install.sh) builds the daemon, and `setup` asks for the keys without echo
 and stores the policy in `/etc/sw-boat-runner` and the keys in `/etc/sw-boat-runner/env`
 (mode 0600, readable by root only). An App's private key goes to
 `/etc/sw-boat-runner/github-app.pem`, also 0600 and root's, and systemd hands the

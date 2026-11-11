@@ -37,7 +37,7 @@ next tick tries again. Presets:
 | `fork` | `fork` | none | untrusted code (fork PRs), rare jobs |
 | `hybrid` | `slot, resume, fork` | `min_up` always up; a job their slots cannot take gets its own fork | bursts above `min_up` |
 
-`hybrid` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
+`warm` is the default. Only `warm` forks kept machines for demand; `hybrid` forks them
 only up to `min_up`, so it stops only kept machines left above a lowered `min_up`. Steps
 keep the order `slot`, `resume`, `fork`, and `resume` and `min_up` need `slot`, the only
 step that registers runners on kept machines.

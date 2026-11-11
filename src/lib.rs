@@ -7,5 +7,6 @@ pub mod github_app;
 pub mod model;
 pub mod policy;
 pub mod run;
+pub mod setup;
 pub mod snapshot;
 pub mod transport;

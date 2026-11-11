@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `sw-boat-runner setup`: writes a policy, creates a GitHub App from a manifest (or takes
+  a personal token with `--pat`), stores the keys root-only and enables the systemd
+  service. `--dry-run` prints the steps. Running it again reuses the App it stored;
+  `--new-app` makes another. `examples/always-on/install.sh` now builds the binary and
+  runs it.
+- A policy needs only `repo`, `labels` and `snapshot`. `name` comes from the labels,
+  `machine_type` defaults to `default` and `max_boxes` to 2. A policy with one pool can
+  put its keys at the top level, without `[[pool]]`.
+
+### Changed
+
+- The default preset is `warm`, not `hybrid`. A pool with no `preset` no longer forks a
+  machine per job past its kept machines; set `preset = "hybrid"` to keep that.
+
 ## [0.1.0] - 2026-11-11
 
 First release. sw-boat-runner keeps self-hosted GitHub Actions runners on

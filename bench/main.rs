@@ -485,7 +485,9 @@ impl Transport for Mock {
             headers.push(("x-ratelimit-limit".to_string(), "1000000000".to_string()));
             world.github(method, path, &body)
         } else {
-            panic!("mock: {method} {url}")
+            // Only the host: a URL can hold a credential, such as setup's manifest code.
+            let host = url.split('/').nth(2).unwrap_or_default();
+            panic!("mock: unexpected {method} to {host}")
         };
         Ok(Response {
             status,
