@@ -754,17 +754,14 @@ impl<'a> Loop<'a> {
                         sent: now,
                     });
                 }
-                // boat may have started, and charged for, a machine this process never heard
-                // about, and the next fork's fresh key would not find it. Count the quote as
-                // spent and wait as after a restart: by then the machine is listed with its
-                // job label, or it never existed.
+                // boat may have started a machine this process never heard about, and the
+                // next fork's fresh key would not find it. Wait as after a restart: by then
+                // the machine is listed with its job label, or it never existed.
                 if matches!(&result, Err(Error::Boat(e)) if e.may_have_applied()) {
-                    self.spent_cents = self.spent_cents.saturating_add(starts.price);
                     let wait = now
                         .saturating_add(HTTP_TIMEOUT.as_secs())
                         .saturating_add(self.cfg.tick_s);
                     self.starts_blocked_until = self.starts_blocked_until.max(wait);
-                    starts.open = false;
                 }
                 result
             }
@@ -834,7 +831,9 @@ impl<'a> Loop<'a> {
     }
 
     /// Runs one paid-or-free start. An accepted start adds the price `decide` saw to
-    /// today's spend; a refused one closes starts until boat's `Retry-After` passes.
+    /// today's spend; a refused one closes starts until boat's `Retry-After` passes. A
+    /// start without a definite answer may have been charged and may have moved the quote,
+    /// so it adds the price too and closes starts for this tick.
     fn start(
         &mut self,
         now: UnixSecs,
@@ -864,7 +863,13 @@ impl<'a> Loop<'a> {
                 starts.open = false;
                 Err(e.into())
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                if e.may_have_applied() {
+                    self.spent_cents = self.spent_cents.saturating_add(starts.price);
+                    starts.open = false;
+                }
+                Err(e.into())
+            }
         }
     }
 }
@@ -1286,6 +1291,35 @@ mod tests {
         assert_eq!(resumes, 1);
         assert!(!reqs.contains(&format!("POST {BOAT}/sandboxes")));
         assert_eq!(tick_loop.spent_cents, 100);
+    }
+
+    /// The resume timed out after boat may have started, and charged for, the machine.
+    #[test]
+    fn a_resume_without_an_answer_counts_its_quote_and_closes_starts() {
+        let cfg = config();
+        let fake = Fake::failing(|s| {
+            if s.url.ends_with("/resume") {
+                Err(NetworkError("timed out reading response".into()))
+            } else {
+                Ok(reply(s))
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop
+            .tick(NOW, |_, _| {
+                vec![
+                    Action::Resume {
+                        machine: "bx_33333333".into(),
+                    },
+                    Action::Fork {
+                        pool: "ci".into(),
+                        job: Some(JobKey { id: 70, attempt: 1 }),
+                    },
+                ]
+            })
+            .unwrap();
+        assert!(forks(&fake).is_empty(), "{:?}", requests(&fake));
+        assert_eq!(tick_loop.spent_cents, 125);
     }
 
     #[test]
