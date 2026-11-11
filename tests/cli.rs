@@ -105,3 +105,30 @@ fn setup_dry_run_asks_no_secret_and_changes_nothing() {
     assert_eq!(out.status.code(), Some(2));
     assert!(text(&out.stdout).is_empty());
 }
+
+#[test]
+fn remote_dry_run_prints_the_plan_and_asks_no_secret() {
+    let out = Command::new(env!("CARGO_BIN_EXE_sw-boat-runner"))
+        .args(["setup", "--remote", "--dry-run", "--repo", "acme/app"])
+        .args(["--labels", "boat", "--snapshot", "snap-1"])
+        .env_remove("BOAT_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GITHUB_APP_ID")
+        .env("SBR_REF", "v9.9.9")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", text(&out.stderr));
+    assert!(stdout.contains("snapshot = \"snap-1\""), "{stdout}");
+    assert!(
+        stdout.contains("http://127.0.0.1:<random port>/callback"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("install.sh at v9.9.9"), "{stdout}");
+
+    let out = run(&["setup", "--remote", "--bin", "/x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(&["setup", "--paste"]);
+    assert_eq!(out.status.code(), Some(2));
+}

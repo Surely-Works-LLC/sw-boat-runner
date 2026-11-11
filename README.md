@@ -19,10 +19,25 @@ a day). Under the included starts, `runs-on: boat` is cheaper and faster.
 
 ## Quick start
 
-You need a boat snapshot made from a `--no-env` sandbox, with an unconfigured
-[actions/runner](https://github.com/actions/runner) at `/home/user/actions-runner`
-([Snapshots](docs/design.md#snapshots) shows how). Then, on a `small` boat machine
-(about $13 a month):
+From your laptop, with the [boat CLI](https://docs.boat.dev/cli-reference) signed in.
+Use the release you tested; the machine installs the same one.
+
+```sh
+# macOS arm64. On Linux: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
+curl -fsSLO https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.2.0/sw-boat-runner-aarch64-apple-darwin.tar.gz
+tar -xzf sw-boat-runner-aarch64-apple-darwin.tar.gz
+./sw-boat-runner setup --remote    # --dry-run first prints what it would do
+```
+
+`setup --remote` asks for the boat key without echo, then the policy (below). It opens
+the browser to create the GitHub App, and GitHub sends the browser back to a one-shot
+listener on `127.0.0.1`, so there is no code to paste. It then creates a `small` boat
+machine with no auto-stop (about $13 a month), installs the same release there with
+[install.sh](examples/always-on/install.sh), enables the service and runs `doctor`.
+The keys reach the machine only through the stdin of `boat ssh`. It ends with the
+machine's id and `boat ssh <id> journalctl -u sw-boat-runner -f` for the logs.
+
+Or run setup on the machine itself:
 
 ```sh
 boat new --no-auto-stop --type small    # prints the machine's id
@@ -32,7 +47,7 @@ curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0
 SBR_REF=v0.2.0 bash install.sh    # checks the binary, then runs `sw-boat-runner setup`
 ```
 
-`setup` asks for `repo`, `labels` and `snapshot` and writes them as the policy:
+Either way, `setup` asks for `repo`, `labels` and `snapshot` and writes them as the policy:
 
 ```toml
 repo = "acme/app"
@@ -41,11 +56,17 @@ snapshot = "snap-1"
 ```
 
 The prompts offer defaults: the repository from `gh` or the `origin` remote, labels
-`self-hosted, boat`, and your saved boat snapshots when `BOAT_API_KEY` is set. It then
-prints a short link to [a page](docs/new-app.html) on this project's GitHub Pages that
-creates a private GitHub App for you (Administration write, Actions read, no webhook),
-waits until you install it on the repository, asks for the boat key without echo, and
-enables a systemd service. Point jobs at the pool with `runs-on: [self-hosted, boat]`.
+`self-hosted, boat`, and your saved boat snapshots when `BOAT_API_KEY` is set. The
+snapshot needs an unconfigured [actions/runner](https://github.com/actions/runner) at
+`/home/user/actions-runner`, saved from a `--no-env` sandbox
+([Snapshots](docs/design.md#snapshots)). If you have none, answer `new` (or name one
+that does not exist) and setup offers to build it: a temporary `noEnv` machine gets the
+latest runner release, checked against its SHA-256, and is checked and saved as
+`sw-boat-runner snapshot` does, in about 5 minutes. Setup then prints a short link to
+[a page](docs/new-app.html) on this project's GitHub Pages that creates a private GitHub
+App for you (Administration write, Actions read, no webhook), waits until you install it
+on the repository, asks for the boat key without echo, and enables a systemd service.
+Point jobs at the pool with `runs-on: [self-hosted, boat]`.
 [examples/always-on](examples/always-on/) has the details.
 
 ## Opt-ins

@@ -76,6 +76,11 @@ boat ssh <id>                    # extract the runner, run its bin/installdepend
 boat snapshot <id> snap-1        # the name goes in the policy's `snapshot`
 ```
 
+`setup` can do this for you: for a snapshot name that is not saved, or the answer `new`,
+it builds one in a temporary `noEnv` sandbox with the latest runner release only, then
+checks and saves it as `sw-boat-runner snapshot` does
+([details](../examples/always-on/README.md#on-the-machine)).
+
 On a create, boat adds none of the account's secrets, but logins saved in the snapshot
 stay. On a resume, boat also scrubs owner secrets from the restored disk before the
 machine is reachable. The daemon labels its machines `sw-boat-runner=<pool>`, names its

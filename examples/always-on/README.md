@@ -4,6 +4,40 @@ One `small` boat machine ($0.018 an hour, about $13 a month) runs the daemon all
 time. After that, a workflow only changes `runs-on`, and the `warm` and `hybrid` presets
 can reuse machines across runs.
 
+## From your laptop
+
+`sw-boat-runner setup --remote` does all of the below from a macOS or Linux computer
+with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to:
+
+1. It asks for `BOAT_API_KEY` without echo, then the repository, labels and snapshot,
+   and offers to build the snapshot if it is missing.
+2. It creates the GitHub App. The browser opens [docs/new-app.html](../../docs/new-app.html)
+   with a `redirect` to `http://127.0.0.1:<random port>/callback`, which the page takes
+   only in exactly that form and puts in the manifest as `redirect_url`. setup listens
+   there for one request with the `state` it sent, answers "You can close this tab",
+   and stops. After 15 minutes it asks you to paste the address instead; `--paste`
+   pastes from the start, `--offline-link` uses a `data:` page. It exchanges the code
+   and waits for the installation on your computer. The App's key stays in
+   `~/.config/sw-boat-runner/github-app-<id>.pem` (mode 600) until the machine has it,
+   so a failed run can be repeated with `GITHUB_APP_ID=<id>
+   GITHUB_APP_PRIVATE_KEY_FILE=<that file> sw-boat-runner setup --remote`.
+3. It creates a `small` machine with no auto-stop (not `noEnv`: it runs no CI job).
+4. It writes the policy, the boat key and the App's key (or `GITHUB_TOKEN` with `--pat`)
+   to `~/.sbr-setup` on the machine, each through the stdin of `boat ssh` into a
+   `umask 077` file. boat keeps no history of `boat ssh` commands, and no command it
+   runs holds a key.
+5. Over `boat ssh` it runs [install.sh](install.sh) at `SBR_REF` (default: the version
+   of the binary you run), which checks the release binary and runs `setup` there with
+   those files, as in the next section. `doctor`'s output shows on your terminal, and
+   `~/.sbr-setup` is deleted.
+
+It prints the machine's id; `boat ssh <id> journalctl -u sw-boat-runner -f` shows the
+logs. Each run creates a new machine: delete an old one with `boat delete <id>`. If
+step 4 fails the machine is deleted; if step 5 fails it is kept for a look.
+`setup --remote --dry-run` prints the plan and asks no secret.
+
+## On the machine
+
 ```sh
 boat new --no-auto-stop --type small    # prints the machine's id
 boat ssh <id>
@@ -18,7 +52,18 @@ SBR_REF=v0.2.0 bash install.sh    # gets the daemon, then runs `sw-boat-runner s
 ```
 
 `setup` asks for the repository, labels (default `self-hosted, boat`) and snapshot,
-creates a GitHub App and asks for `BOAT_API_KEY`. For the App it prints a short link to
+creates a GitHub App and asks for `BOAT_API_KEY`. A snapshot missing from your saved
+boat snapshots (listed when `BOAT_API_KEY` is set), or the answer `new`, makes it offer
+to build one: "Build a runner snapshot named <name> now?". It creates a temporary
+`noEnv` sandbox of the `default` type from boat's base image, extracts the latest
+[actions/runner](https://github.com/actions/runner) release for its architecture,
+unconfigured, at `/home/user/actions-runner` after checking the SHA-256 GitHub
+publishes, runs `bin/installdependencies.sh`, creates `/home/user/ci-cache` and an
+`.env` with `XDG_CACHE_HOME` there, then checks and saves it with the code of
+`sw-boat-runner snapshot`. The sandbox is deleted on every path, Ctrl-C included. It
+holds the runner only: for toolchains, start a sandbox from it with
+`boat new --no-env --from <name>`, install them, and run
+`sw-boat-runner snapshot <id> <name>`. For the App it prints a short link to
 [docs/new-app.html](../../docs/new-app.html) on GitHub Pages, a static page that posts the
 App's manifest to GitHub and shows the code GitHub sends back, to paste into setup; it
 sends the code nowhere. `setup --offline-link` prints the page as a `data:` URL instead. `bash install.sh policy.toml` uses your policy instead

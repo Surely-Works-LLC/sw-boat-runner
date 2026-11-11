@@ -10,7 +10,7 @@ usage: sw-boat-runner check <policy.toml>
        sw-boat-runner run <policy.toml>
        sw-boat-runner drain <policy.toml>
        sw-boat-runner snapshot <sandbox-id> <name> [--machine-type T] [--fix] [--keep-fork] [--yes]
-       sw-boat-runner setup [--pat] [--dry-run] [--help]
+       sw-boat-runner setup [--remote] [--pat] [--dry-run] [--help]
        sw-boat-runner doctor [policy.toml]
        sw-boat-runner --help | --version";
 
@@ -22,7 +22,8 @@ Keeps self-hosted GitHub Actions runners on boat machines.
   run     observe, decide and act every tick_s seconds
   drain   delete the policy's runners and machines; fails while any are left
   snapshot  check a sandbox in a noEnv fork and save the fork as a CI snapshot
-  setup     install the daemon as a systemd service here; setup --help says how
+  setup     install the daemon as a systemd service here, or with --remote on a new boat
+            machine from this computer; setup --help says how
   doctor    check a setup end to end (default /etc/sw-boat-runner/policy.toml); doctor --help
 
 run, drain, snapshot, doctor and a live plan read BOAT_API_KEY, and GITHUB_TOKEN or a GitHub App's
