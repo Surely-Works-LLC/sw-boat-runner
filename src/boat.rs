@@ -392,6 +392,162 @@ impl<'t> Client<'t> {
     }
 }
 
+/// The disk a machine type gives its own files, in bytes (docs: machines). A sandbox or
+/// saved snapshot larger than this does not start on that type: boat answers 409
+/// `deploy_failed`.
+pub(crate) fn disk_budget_bytes(machine_type: &str) -> Option<u64> {
+    const GB: u64 = 1_000_000_000;
+    match machine_type {
+        "small" | "default" => Some(51 * GB),
+        "large" => Some(111 * GB),
+        "xlarge" => Some(251 * GB),
+        _ => None,
+    }
+}
+
+/// What `GET /sandboxes/{id}` says about a machine `snapshot` waits on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Detail {
+    pub id: String,
+    pub state: String,
+    #[serde(default)]
+    pub holds_creator_logins: Option<bool>,
+    /// True once every file of the snapshot the machine came from is on its disk.
+    #[serde(default)]
+    pub hydrated: Option<bool>,
+    #[serde(default)]
+    pub hydration: Option<Hydration>,
+    #[serde(default, rename = "type")]
+    pub machine_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct Hydration {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub percent: Option<u32>,
+}
+
+/// One entry of `GET /saved-snapshots`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SavedSnapshot {
+    pub name: String,
+    /// `saving`, `ready` or `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub source_sandbox_id: Option<String>,
+    /// Restored content size of the frozen state.
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+}
+
+/// A detached command's state, from `GET /sandboxes/{id}/commands/{processId}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandStatus {
+    pub running: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+}
+
+/// The calls `snapshot` makes, which the tick loop never does.
+impl Client<'_> {
+    /// `get` with the hydration progress and machine type.
+    pub(crate) fn detail(&self, id: &str) -> Result<Detail, Error> {
+        #[derive(Deserialize)]
+        struct Info {
+            sandbox: Detail,
+        }
+        let info: Info = self.call("GET", &format!("/sandboxes/{id}"), None, &[])?;
+        Ok(info.sandbox)
+    }
+
+    /// Forks a running or stopped sandbox with `noEnv`, which scrubs the creator logins
+    /// the source holds; the source is not changed. `machine_type` `None` keeps the
+    /// source's. A repeat with the same key and body returns the first fork.
+    pub(crate) fn fork_sandbox(
+        &self,
+        source: &str,
+        machine_type: Option<&str>,
+        labels: &BTreeMap<&str, String>,
+        ttl_s: u64,
+        idempotency_key: &str,
+    ) -> Result<String, Error> {
+        #[derive(Deserialize)]
+        struct Created {
+            sandbox: Sandbox,
+        }
+        assert!((1..=MAX_TTL_S).contains(&ttl_s), "ttl {ttl_s}");
+        let mut body = json!({ "labels": labels, "ttlSeconds": ttl_s, "noEnv": true });
+        if let Some(t) = machine_type {
+            body["type"] = Value::from(t);
+        }
+        let key = [("Idempotency-Key", idempotency_key)];
+        let path = format!("/sandboxes/{source}/fork");
+        let created: Created = self.call("POST", &path, Some(&body), &key)?;
+        Ok(created.sandbox.id)
+    }
+
+    /// Starts `command` detached and returns its process id for `command_status`. The
+    /// command is kept in boat's history, so it must never contain a secret.
+    pub(crate) fn exec_start(&self, id: &str, command: &str) -> Result<u64, Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Started {
+            process_id: u64,
+        }
+        let body = json!({ "command": command, "detached": true });
+        let started: Started = self.call(
+            "POST",
+            &format!("/sandboxes/{id}/commands"),
+            Some(&body),
+            &[],
+        )?;
+        Ok(started.process_id)
+    }
+
+    pub(crate) fn command_status(&self, id: &str, process_id: u64) -> Result<CommandStatus, Error> {
+        self.call(
+            "GET",
+            &format!("/sandboxes/{id}/commands/{process_id}"),
+            None,
+            &[],
+        )
+    }
+
+    /// Saves the sandbox's current state under `name`; answers at once with `saving`.
+    /// Reusing a name replaces that snapshot once the new save is ready.
+    pub(crate) fn save_snapshot(&self, sandbox: &str, name: &str) -> Result<(), Error> {
+        let body = json!({ "sandboxId": sandbox, "name": name });
+        self.send("POST", "/saved-snapshots", &body)
+    }
+
+    /// Saved snapshots, newest first; only the one called `name` when given.
+    pub(crate) fn saved_snapshots(&self, name: Option<&str>) -> Result<Vec<SavedSnapshot>, Error> {
+        #[derive(Deserialize)]
+        struct List {
+            snapshots: Vec<SavedSnapshot>,
+        }
+        let path = match name {
+            Some(n) => format!("/saved-snapshots?name={}", encode(n)),
+            None => "/saved-snapshots".to_string(),
+        };
+        let list: List = self.call("GET", &path, None, &[])?;
+        Ok(list.snapshots)
+    }
+}
+
 /// Maps a non-2xx response. A 429 always sends `Retry-After`; a 503 puts
 /// `retryAfterSeconds` in the body; `IP_RATE_LIMIT_EXCEEDED` uses `retryAfter`.
 pub(crate) fn map_error(resp: &Response) -> Error {
@@ -808,5 +964,139 @@ mod tests {
         let mut bad = sandbox(None);
         bad.labels.insert(JOB_LABEL.into(), "9".into());
         assert_eq!(bad.job(), None);
+    }
+
+    #[test]
+    fn fork_sandbox_scrubs_logins_and_keeps_the_source() {
+        let fake = Fake::new(|_| {
+            respond(
+                202,
+                &[],
+                r#"{"ok":true,"type":"sandbox.forking","id":"bx_44444444",
+                    "sandbox":{"id":"bx_44444444","state":"provisioning"}}"#,
+            )
+        });
+        let boat = Client::new(&fake, "k".into());
+        let labels = BTreeMap::from([("sw-boat-runner-snapshot", "ci-1".to_string())]);
+        let id = boat
+            .fork_sandbox("bx_22222222", Some("large"), &labels, 600, "key-1")
+            .unwrap();
+        assert_eq!(id, "bx_44444444");
+        boat.fork_sandbox("bx_22222222", None, &labels, 600, "key-2")
+            .unwrap();
+        let sent = fake.sent();
+        assert_eq!(
+            sent[0].url,
+            "https://boat.dev/api/v1/sandboxes/bx_22222222/fork"
+        );
+        assert_eq!(sent[0].header("idempotency-key"), Some("key-1"));
+        let body = |i: usize| -> Value {
+            serde_json::from_slice(sent[i].body.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(
+            body(0),
+            json!({"labels":{"sw-boat-runner-snapshot":"ci-1"},"ttlSeconds":600,
+                   "noEnv":true,"type":"large"})
+        );
+        assert_eq!(body(1).get("type"), None);
+    }
+
+    #[test]
+    fn detail_reads_hydration() {
+        let fake = Fake::new(|_| {
+            respond(
+                200,
+                &[],
+                r#"{"ok":true,"sandbox":{"id":"bx_22222222","state":"running","type":"large",
+                    "holdsCreatorLogins":false,"hydrated":false,
+                    "hydration":{"phase":"hydrating","entriesDone":5,"entriesTotal":10,"percent":50}}}"#,
+            )
+        });
+        let d = Client::new(&fake, "k".into())
+            .detail("bx_22222222")
+            .unwrap();
+        assert_eq!(d.hydrated, Some(false));
+        assert_eq!(d.hydration.unwrap().percent, Some(50));
+        assert_eq!(d.machine_type.as_deref(), Some("large"));
+        assert_eq!(d.holds_creator_logins, Some(false));
+    }
+
+    #[test]
+    fn exec_starts_detached_and_polls() {
+        let fake = Fake::new(|s| {
+            if s.method == "POST" {
+                respond(
+                    200,
+                    &[],
+                    r#"{"ok":true,"type":"command.started","success":true,"processId":17,
+                        "pid":4242,"command":"du","startedAt":"2026-11-10T00:00:00Z"}"#,
+                )
+            } else {
+                respond(
+                    200,
+                    &[],
+                    r#"{"ok":true,"success":true,"processId":17,"status":"exited",
+                        "running":false,"exitCode":0,"stdout":"a\tb\n","stderr":""}"#,
+                )
+            }
+        });
+        let boat = Client::new(&fake, "k".into());
+        assert_eq!(boat.exec_start("bx_22222222", "du").unwrap(), 17);
+        let st = boat.command_status("bx_22222222", 17).unwrap();
+        assert!(!st.running);
+        assert_eq!(st.exit_code, Some(0));
+        assert_eq!(st.stdout, "a\tb\n");
+        let sent = fake.sent();
+        assert_eq!(sent[0].body_text(), r#"{"command":"du","detached":true}"#);
+        assert_eq!(
+            sent[1].url,
+            "https://boat.dev/api/v1/sandboxes/bx_22222222/commands/17"
+        );
+    }
+
+    #[test]
+    fn saves_and_lists_saved_snapshots() {
+        let fake = Fake::new(|s| {
+            if s.method == "POST" {
+                respond(
+                    202,
+                    &[],
+                    r#"{"ok":true,"status":"saving","snapshot":{"name":"ci-1",
+                        "status":"saving","sourceSandboxId":"bx_44444444",
+                        "createdAt":"2026-11-10T00:00:00Z"}}"#,
+                )
+            } else {
+                respond(
+                    200,
+                    &[],
+                    r#"{"ok":true,"type":"snapshot.saved.list","snapshots":[{"name":"ci-1",
+                        "status":"ready","sourceSandboxId":"bx_44444444","sizeBytes":15900000000,
+                        "createdAt":"2026-11-10T00:00:00Z"}]}"#,
+                )
+            }
+        });
+        let boat = Client::new(&fake, "k".into());
+        boat.save_snapshot("bx_44444444", "ci-1").unwrap();
+        let list = boat.saved_snapshots(Some("ci-1")).unwrap();
+        assert_eq!(list[0].size_bytes, Some(15_900_000_000));
+        assert_eq!(list[0].status, "ready");
+        boat.saved_snapshots(None).unwrap();
+        let sent = fake.sent();
+        assert_eq!(
+            sent[0].body_text(),
+            r#"{"name":"ci-1","sandboxId":"bx_44444444"}"#
+        );
+        assert_eq!(
+            sent[1].url,
+            "https://boat.dev/api/v1/saved-snapshots?name=ci-1"
+        );
+        assert_eq!(sent[2].url, "https://boat.dev/api/v1/saved-snapshots");
+    }
+
+    #[test]
+    fn disk_budgets() {
+        assert_eq!(disk_budget_bytes("default"), Some(51_000_000_000));
+        assert_eq!(disk_budget_bytes("xlarge"), Some(251_000_000_000));
+        assert_eq!(disk_budget_bytes("huge"), None);
     }
 }
