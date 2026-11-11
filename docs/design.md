@@ -48,7 +48,10 @@ machine, and boat stores every command for 90 days, so the token would end up in
 command history. On a kept machine, a slot whose runner finished is free again, and a
 slot whose runner went `Offline` gets `Unregister`. Either slot takes a fresh `Register`
 in the same tick when a job is waiting. The runner's work directory stays on the
-machine, so its caches survive from job to job.
+machine, so its caches survive from job to job. A stop and resume restores the machine
+from a boat snapshot, which does not save `/tmp` or `~/.cache`, so caches meant to outlive
+a stop go elsewhere under `/home`, set in the runner's `.env`; the
+[README](../README.md#connect-a-repository) has an example.
 
 ## Start budget
 
@@ -152,14 +155,23 @@ token, shared with everything else its owner runs, and at least 5,000 of its own
 GitHub App installation token. The daemon keeps its own use well inside that with a
 token bucket in `src/github.rs`:
 
-- It fills at a quarter of `X-RateLimit-Limit` an hour, or slower when the requests left
-  above 500 (`RESERVE`) would not last until `X-RateLimit-Reset` at that rate. It holds
-  at most 60 s of its rate. Every request GitHub counts takes a token; a 304 answer to a
-  read with the cached ETag takes none.
+- It fills at the requests left above 500 (`RESERVE`) spread evenly until
+  `X-RateLimit-Reset`, `(remaining - RESERVE) / (reset - now)` a second, so the pace
+  follows what is actually left, including what others spent. The pace is capped at a
+  share of `X-RateLimit-Limit` an hour: a quarter for a personal access token, whose
+  limit its owner's other tools share, and the whole limit for a GitHub App installation
+  token, which has a limit of its own. The client knows which from its credentials. With
+  4,993 of 5,000 left and half an hour to the reset, an installation token gets 5,000 an
+  hour and a personal token 1,250.
+- It holds 120 s of its rate (`BURST_S`), and room for at least 50 requests
+  (`BURST_MIN`), so a tick that has to read several runs is not starved. Under `RESERVE`
+  it holds nothing. Every request GitHub counts takes a token; a 304 answer to a read with
+  the cached ETag takes none.
 - A tick observes only with a token in hand. A tick without one sends nothing and acts on
   nothing, rather than act on a stale snapshot, so a short budget stretches the time
   between observes. Even with no budget, the daemon observes once every 5 minutes
-  (`PACE_MAX_S`), so finished machines are still deleted.
+  (`PACE_MAX_S`), so finished machines are still deleted. The "budget spent" line is
+  logged at most once a minute.
 - Once an observe starts, its reads and the writes `decide` asks for always go, so a
   tick never acts on half a snapshot. Under 200 requests left (`RATE_FLOOR`) nothing is
   sent until the reset, leaving the rest to whoever else uses the token.
@@ -178,9 +190,14 @@ A run that is not read keeps its last read, whose queued jobs no pool serves, so
 never sees a job that may have been taken. GitHub does not promise that `updated_at`
 moves when a run queues a job, so the 60 s age is what bounds the delay: a job queued in a
 run that looks unchanged is found within 60 s while the budget covers every run, and
-later when it does not. The tests in `src/github.rs` count the requests: 30 in-progress
-runs cost 32 requests a tick before this budget, 7,680 an hour at `tick_s` 15, and about
-1,270 an hour with it, and a job one of them queues is found within 10 ticks (150 s).
+later when it does not. The tests in `src/github.rs` count the requests over an hour that
+starts with 5,000 left: 30 in-progress runs cost 32 requests a tick before this budget,
+7,680 an hour at `tick_s` 15. With it, a personal access token sends about 1,290 an hour
+and a job one of the runs queues is found within 10 ticks (150 s). An installation token
+sends about 2,300 an hour, never skips an observe, and finds the job within 4 ticks
+(60 s), as fast as `RUN_MAX_AGE_S` allows; under the old fixed quarter it took 150 s, as
+for a personal token. With 100 runs, the most one page lists, an installation token
+finds the job within 7 ticks (105 s) and a personal token within 32 (480 s).
 
 ## State machine
 

@@ -30,6 +30,8 @@ pub(crate) use script::HOME_WAIT_S;
 /// boat's file write and command calls wait up to 60 s for a machine that is starting. Also
 /// how long after a restart a create sent before the crash may still be in flight.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
+/// The "budget spent" line is logged at most once in this many seconds.
+const PACED_LOG_S: UnixSecs = 60;
 
 #[derive(Debug)]
 pub enum Error {
@@ -232,8 +234,10 @@ pub struct Loop<'a> {
     ledger: act::Ledger,
     /// False for `drain`, which needs no queued jobs.
     read_jobs: bool,
-    /// The last tick skipped its observe to stay in the GitHub request budget.
-    paced: bool,
+    /// When a tick last logged that it skipped its observe to stay in the GitHub request
+    /// budget. Ticks that skip and ticks that observe can alternate, so the line is logged
+    /// at most once every `PACED_LOG_S`.
+    paced_logged: Option<UnixSecs>,
 }
 
 impl<'a> Loop<'a> {
@@ -252,7 +256,7 @@ impl<'a> Loop<'a> {
             memory: observe::Memory::default(),
             ledger: act::Ledger::new(cfg, now),
             read_jobs: true,
-            paced: false,
+            paced_logged: None,
         }
     }
 
@@ -275,13 +279,15 @@ impl<'a> Loop<'a> {
         // A tick without budget acts on nothing rather than on a stale snapshot; see
         // docs/design.md#github-requests.
         if !self.gh.may_observe() {
-            if !self.paced {
+            if self
+                .paced_logged
+                .is_none_or(|t| now >= t.saturating_add(PACED_LOG_S))
+            {
                 eprintln!("observe: {}; observing less often", self.gh.budget_note());
-                self.paced = true;
+                self.paced_logged = Some(now);
             }
             return Ok(());
         }
-        self.paced = false;
         let observed = match self.read(now) {
             Ok(v) => v,
             Err(e) if e.is_fatal() => return Err(e),

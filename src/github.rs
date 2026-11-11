@@ -21,12 +21,19 @@ pub(crate) const RATE_FLOOR: u64 = 200;
 /// the requests between here and `RATE_FLOOR` stay for runner registrations and deletes,
 /// `drain`, and whoever else uses the token.
 pub(crate) const RESERVE: u64 = 500;
-/// The share of the token's hourly limit (`X-RateLimit-Limit`) the daemon aims to use.
-const SHARE: f64 = 0.25;
+/// The most of a personal access token's hourly limit (`X-RateLimit-Limit`) the daemon
+/// uses an hour. The token's owner and their other tools share the same limit.
+const PAT_SHARE: f64 = 0.25;
+/// The most of a GitHub App installation's hourly limit the daemon uses an hour. The
+/// installation has a limit of its own, so the daemon may use all of it above `RESERVE`.
+const APP_SHARE: f64 = 1.0;
 /// Assumed until GitHub reports the limit: a personal access token's 5,000 an hour.
 const DEFAULT_LIMIT: u64 = 5_000;
-/// The budget saves up at most this many seconds of its rate for a busy tick.
-const BURST_S: f64 = 60.0;
+/// The budget saves up at most this many seconds of its rate for a busy tick...
+const BURST_S: f64 = 120.0;
+/// ...and never less room than this many requests, so a tick that reads several runs
+/// is not starved when the rate is low.
+const BURST_MIN: f64 = 50.0;
 /// While the budget allows, an in-progress run's jobs are read at least this often, even
 /// when the run looks unchanged.
 pub(crate) const RUN_MAX_AGE_S: u64 = 60;
@@ -161,13 +168,15 @@ pub(crate) fn runner_state(online: bool, busy: bool, seen_online: bool) -> Runne
     }
 }
 
-/// A token bucket over GitHub requests. It fills at `SHARE` of the hourly limit, or
-/// slower when the requests left above `RESERVE` would not last until the reset at that
-/// rate, and every request GitHub counts (anything but a 304) takes one token. Required
+/// A token bucket over GitHub requests. It fills at the requests left above `RESERVE`
+/// spread over the time to the reset, but no faster than `share` of the hourly limit an
+/// hour, and every request GitHub counts (anything but a 304) takes one token. Required
 /// reads and writes always go, down to `RATE_FLOOR`, and may take it below zero; optional
 /// reads wait for a token, and a tick observes only with a token in hand.
 struct Budget {
     tokens: f64,
+    /// `PAT_SHARE` or `APP_SHARE`.
+    share: f64,
     refilled: Option<UnixSecs>,
     limit: u64,
     /// The last `X-RateLimit-Remaining` and `X-RateLimit-Reset`.
@@ -178,22 +187,29 @@ struct Budget {
 impl Budget {
     /// Tokens per second at `now`.
     fn rate(&self, now: UnixSecs) -> f64 {
-        let share = self.limit as f64 * SHARE / 3_600.0;
+        let cap = self.limit as f64 * self.share / 3_600.0;
         match self.left {
             Some((left, reset)) if now < reset => {
                 let spare = left.saturating_sub(RESERVE) as f64;
-                share.min(spare / (reset - now) as f64)
+                cap.min(spare / (reset - now) as f64)
             }
-            _ => share,
+            _ => cap,
         }
     }
 
     fn refill(&mut self, now: UnixSecs) {
         let rate = self.rate(now);
+        // Under `RESERVE` nothing is saved, so the pace drops to `PACE_MAX_S` at once.
+        let room = if rate > 0.0 {
+            (rate * BURST_S).max(BURST_MIN)
+        } else {
+            0.0
+        };
         let elapsed = self
             .refilled
             .map_or(BURST_S, |t| now.saturating_sub(t) as f64);
-        self.tokens = (self.tokens + rate * elapsed).min(rate * BURST_S);
+        let gained = rate * elapsed;
+        self.tokens = (self.tokens + gained).min(room);
         self.refilled = Some(now);
     }
 
@@ -257,6 +273,10 @@ pub(crate) struct Client<'t> {
 
 impl<'t> Client<'t> {
     pub(crate) fn new(t: &'t dyn Transport, auth: Auth, repo: String) -> Self {
+        let share = match auth {
+            Auth::Token(_) => PAT_SHARE,
+            Auth::App(_) => APP_SHARE,
+        };
         Client {
             t,
             auth,
@@ -266,6 +286,7 @@ impl<'t> Client<'t> {
             limited: None,
             budget: Budget {
                 tokens: 0.0,
+                share,
                 refilled: None,
                 limit: DEFAULT_LIMIT,
                 left: None,
@@ -945,26 +966,46 @@ mod tests {
 
     /// A repository with `runs` in-progress runs, each with one running job. `queued_in`
     /// adds a queued job a pool serves to a run, `touched` changes a run's `updated_at`.
+    /// GitHub's count starts at `left` with an hour to the reset and drops with every
+    /// request.
     struct Busy {
         fake: Fake,
         state: std::rc::Rc<std::cell::RefCell<BusyState>>,
+        auth: fn() -> Auth,
     }
 
     #[derive(Default)]
     struct BusyState {
         queued_in: Option<u64>,
         touched: Option<u64>,
+        left: u64,
     }
 
     const T0: UnixSecs = 1_000_000;
     const TICK_S: UnixSecs = 15;
+    const HOUR_TICKS: u64 = 3_600 / TICK_S;
+
+    fn pat() -> Auth {
+        Auth::Token("t".into())
+    }
+
+    fn app() -> Auth {
+        Auth::App(Box::new(crate::github_app::tests::test_app(Some(77))))
+    }
 
     impl Busy {
-        fn new(runs: u64, left: u64) -> Self {
-            let state = std::rc::Rc::new(std::cell::RefCell::new(BusyState::default()));
+        fn new(runs: u64, left: u64, auth: fn() -> Auth) -> Self {
+            let state = std::rc::Rc::new(std::cell::RefCell::new(BusyState {
+                left,
+                ..BusyState::default()
+            }));
             let st = state.clone();
             let fake = Fake::new(move |s| {
-                let st = st.borrow();
+                if s.url.ends_with("/access_tokens") {
+                    let body = r#"{"token":"ghs_1","expires_at":"2099-01-01T00:00:00Z"}"#;
+                    return respond(201, &[], body);
+                }
+                let mut st = st.borrow_mut();
                 let body = if s.url.contains("status=queued") {
                     json!({"workflow_runs": []})
                 } else if s.url.contains("status=in_progress") {
@@ -985,8 +1026,9 @@ mod tests {
                     }
                     json!({ "jobs": jobs })
                 };
-                let left = left.to_string();
-                let reset = (T0 + 7_200).to_string();
+                st.left = st.left.saturating_sub(1);
+                let left = st.left.to_string();
+                let reset = (T0 + 3_600).to_string();
                 let headers = [
                     ("X-RateLimit-Limit", "5000"),
                     ("X-RateLimit-Remaining", left.as_str()),
@@ -994,44 +1036,103 @@ mod tests {
                 ];
                 respond(200, &headers, &body.to_string())
             });
-            Busy { fake, state }
+            Busy { fake, state, auth }
+        }
+
+        fn client(&self) -> Client<'_> {
+            Client::new(&self.fake, (self.auth)(), "o/r".into())
+        }
+
+        /// Requests sent to the repository so far, leaving out installation token mints.
+        fn sent(&self) -> usize {
+            let sent = self.fake.sent();
+            sent.iter().filter(|s| s.url.contains("/repos/")).count()
         }
 
         /// One tick as the loop runs it: the requests it sent and the queued job ids found,
         /// or `None` when the budget skipped the observe.
         fn tick(&self, gh: &mut Client, t: u64) -> (usize, Option<Vec<u64>>) {
-            let before = self.fake.sent().len();
+            let before = self.sent();
             gh.begin_tick(T0 + t * TICK_S);
             let found = gh.may_observe().then(|| {
                 let large = |l: &[String]| l.iter().any(|l| l == "large");
                 let jobs = gh.queued_jobs(&large).unwrap();
                 jobs.iter().map(|j| j.key.id).collect()
             });
-            (self.fake.sent().len() - before, found)
+            (self.sent() - before, found)
+        }
+
+        /// Requests sent in an hour of ticks, and the ticks that skipped their observe.
+        fn hour(&self) -> (usize, usize) {
+            let mut gh = self.client();
+            let ticks: Vec<_> = (0..HOUR_TICKS).map(|t| self.tick(&mut gh, t)).collect();
+            eprintln!(
+                "first ticks {:?}",
+                ticks[..12].iter().map(|t| t.0).collect::<Vec<_>>()
+            );
+            let sent = ticks.iter().map(|t| t.0).sum();
+            let skipped = ticks.iter().filter(|t| t.1.is_none()).count();
+            (sent, skipped)
         }
     }
 
     /// The old loop read all 30 runs' jobs every tick: 32 requests a tick, 7,680 an hour at
-    /// `tick_s` 15. Now the first tick reads them all once, and after that the budget holds
-    /// the hour to a quarter of the 5,000 limit.
+    /// `tick_s` 15. Now the first tick reads them all once, and after that a personal access
+    /// token's budget holds the hour to a quarter of its 5,000 limit.
     #[test]
-    fn thirty_in_progress_runs_stay_in_budget() {
-        let busy = Busy::new(30, 4_000);
-        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
-        let per_tick: Vec<usize> = (0..240).map(|t| busy.tick(&mut gh, t).0).collect();
-        assert_eq!(per_tick[0], 32);
-        let hour: usize = per_tick.iter().sum();
-        eprintln!("first ticks {:?}, hour {hour}", &per_tick[..12]);
-        // 1,250 an hour, the 60 s the bucket starts with, and the first tick's required reads.
-        assert!(hour <= 1_250 + 21 + 32, "{hour} requests in an hour");
+    fn thirty_in_progress_runs_stay_in_a_pat_budget() {
+        let busy = Busy::new(30, 5_000, pat);
+        let (hour, skipped) = busy.hour();
+        eprintln!("PAT: {hour} requests in an hour, {skipped} ticks skipped");
+        // 1,250 an hour, the 120 s the bucket starts with, and the first tick's reads.
+        assert!(hour <= 1_250 + 42 + 32, "{hour} requests in an hour");
         assert!(hour >= 1_100, "{hour} requests in an hour");
+    }
+
+    /// An installation token has a limit of its own, so the daemon paces itself on what is
+    /// left above `RESERVE` until the reset, at most the whole limit an hour. With 30 runs
+    /// that covers every read the runs need, so no tick skips its observe, and GitHub's
+    /// count never drops under `RESERVE`.
+    #[test]
+    fn thirty_in_progress_runs_stay_in_an_app_budget() {
+        let busy = Busy::new(30, 5_000, app);
+        let (hour, skipped) = busy.hour();
+        eprintln!("App: {hour} requests in an hour, {skipped} ticks skipped");
+        assert_eq!(skipped, 0);
+        assert!(hour <= 4_500, "{hour} requests in an hour");
+        assert!(busy.state.borrow().left >= RESERVE);
+    }
+
+    /// The pace follows what is left: a token that others spent down gets a slower budget,
+    /// and one with plenty left until a near reset is held to its share of the limit.
+    #[test]
+    fn the_rate_follows_what_is_left() {
+        let mut b = Budget {
+            tokens: 0.0,
+            share: APP_SHARE,
+            refilled: None,
+            limit: 5_000,
+            left: None,
+            observed: None,
+        };
+        let per_hour = |b: &Budget| (b.rate(T0) * 3_600.0).round();
+        assert_eq!(per_hour(&b), 5_000.0);
+        b.left = Some((4_993, T0 + 1_800));
+        assert_eq!(per_hour(&b), 5_000.0);
+        b.left = Some((2_300, T0 + 3_600));
+        assert_eq!(per_hour(&b), 1_800.0);
+        b.left = Some((450, T0 + 600));
+        assert_eq!(per_hour(&b), 0.0);
+        b.share = PAT_SHARE;
+        b.left = Some((4_993, T0 + 1_800));
+        assert_eq!(per_hour(&b), 1_250.0);
     }
 
     /// Ticks until a job queued in `run` after `settle` ticks is found, for a run that
     /// looks unchanged.
-    fn ticks_to_find(runs: u64, run: u64, settle: u64) -> u64 {
-        let busy = Busy::new(runs, 4_000);
-        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
+    fn ticks_to_find(runs: u64, run: u64, settle: u64, auth: fn() -> Auth) -> u64 {
+        let busy = Busy::new(runs, 5_000, auth);
+        let mut gh = busy.client();
         for t in 0..settle {
             busy.tick(&mut gh, t);
         }
@@ -1043,31 +1144,33 @@ mod tests {
     }
 
     /// The most ticks over every run and every phase of the budget.
-    fn worst_ticks_to_find(runs: u64) -> u64 {
+    fn worst_ticks_to_find(runs: u64, auth: fn() -> Auth) -> u64 {
         (1..=runs)
-            .flat_map(|run| (40..52).map(move |settle| ticks_to_find(runs, run, settle)))
+            .flat_map(|run| (40..52).map(move |settle| ticks_to_find(runs, run, settle, auth)))
             .max()
             .unwrap()
     }
 
     /// An in-progress run whose `updated_at` does not move still has its newly queued job
-    /// found: on the first tick `RUN_MAX_AGE_S` after its last read when few runs share the budget, and within
-    /// the time the budget takes to read every run when 30 do.
+    /// found: on the first tick `RUN_MAX_AGE_S` after its last read when the budget covers
+    /// every run, and within the time the budget takes to read every run when it does not.
     #[test]
     fn a_newly_queued_job_in_a_seen_run_is_found() {
-        let one = worst_ticks_to_find(1);
+        let one = worst_ticks_to_find(1, pat);
         assert_eq!(one, RUN_MAX_AGE_S / TICK_S);
-        let thirty = worst_ticks_to_find(30);
-        eprintln!("worst ticks to find: 1 run {one}, 30 runs {thirty}");
-        assert!(thirty <= 12, "{thirty} ticks");
+        let pat30 = worst_ticks_to_find(30, pat);
+        let app30 = worst_ticks_to_find(30, app);
+        eprintln!("worst ticks to find: 1 run {one}, 30 runs {pat30} (PAT), {app30} (App)");
+        assert!(pat30 <= 10, "{pat30} ticks");
+        assert_eq!(app30, RUN_MAX_AGE_S / TICK_S);
     }
 
     /// A changed `updated_at` is read on the next tick, and a run with a queued job a pool
     /// serves is read every tick, so the job drops out once it is taken.
     #[test]
     fn changed_and_wanted_runs_are_read_at_once() {
-        let busy = Busy::new(30, 4_000);
-        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
+        let busy = Busy::new(30, 5_000, pat);
+        let mut gh = busy.client();
         for t in 0..40 {
             busy.tick(&mut gh, t);
         }
@@ -1101,8 +1204,8 @@ mod tests {
     /// cleanup goes on, until `RATE_FLOOR` stops every request.
     #[test]
     fn a_low_budget_stretches_observation() {
-        let busy = Busy::new(30, 450);
-        let mut gh = Client::new(&busy.fake, Auth::Token("t".into()), "o/r".into());
+        let busy = Busy::new(30, 450, app);
+        let mut gh = busy.client();
         let observed: Vec<u64> = (0..80)
             .filter(|&t| busy.tick(&mut gh, t).1.is_some())
             .collect();

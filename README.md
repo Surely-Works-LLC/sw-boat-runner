@@ -41,8 +41,11 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
 1. Install it:
 
    ```sh
-   cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.1.0
+   cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --branch main
    ```
+
+   For production, pin a commit you have tested with `--rev <commit hash>` instead of
+   `--branch main`.
 
 2. Make a boat snapshot with an extracted
    [actions/runner](https://github.com/actions/runner) release at
@@ -62,6 +65,19 @@ can use it; changing `runs-on` alone is not enough. There are three ways:
    boat new --no-env --type large   # the pool's machine_type; prints the machine's id
    boat ssh <id>                    # extract the runner, run its bin/installdependencies.sh
    boat snapshot <id> snap-1        # the name goes in the policy's `snapshot`
+   ```
+
+   Keep the snapshot small: every start that is not a resume of a kept machine copies it
+   to a new disk. boat snapshots do not save `/tmp` or `~/.cache` (except
+   `~/.cache/ms-playwright` and deno's cache), and a stop saves a machine the same way,
+   so build caches a warm or kept machine should keep across a stop and resume
+   must live elsewhere under `/home`, such as `/home/user/ci-cache`. Point tools at it in
+   the runner's `.env` file, `/home/user/actions-runner/.env`, which every slot's copy of
+   the runner reads:
+
+   ```sh
+   CARGO_TARGET_DIR=/home/user/ci-cache/target
+   XDG_CACHE_HOME=/home/user/ci-cache/xdg
    ```
 
 3. Set `BOAT_API_KEY` to a boat key for the account that owns the snapshot, and give the
@@ -188,17 +204,18 @@ A fine-grained personal access token shares its owner's limit of 5,000 REST requ
 hour with everything else the owner runs. A GitHub App installation token has its own
 limit, at least 5,000 an hour; it expires after an hour, and the daemon renews it.
 
-The daemon aims to use at most a quarter of the limit GitHub reports
-(`X-RateLimit-Limit`), 1,250 requests an hour for a personal token. When fewer requests
-are left, it spreads those above 500 evenly until the limit resets. A 304 answer to a
-cached read is free and not counted. Each tick reads the runner list, the queued and the
-in-progress runs, and the jobs of every queued run. An in-progress run's jobs are read
-when the run is new, while it has a queued job a pool serves, when its `updated_at`
-changes, and at least every 60 s while the budget allows. On a quiet repository that is
-a few requests a tick, mostly 304s. With 30 in-progress runs the old loop sent 32
-requests a tick, 7,680 an hour; it now sends about 1,270 an hour, and a job that such a
-run queues is found within 150 s. Under 500 requests left the daemon observes once every
-5 minutes, so cleanup goes on, and under 200 it sends nothing until the reset.
+The daemon spreads the requests left above 500 (`RESERVE`) evenly until the limit
+resets, and caps its pace at a share of the limit GitHub reports (`X-RateLimit-Limit`):
+a quarter for a personal token, 1,250 requests an hour, and all of it for an App
+installation token, 5,000 an hour. A 304 answer to a cached read is free and not counted.
+Each tick reads the runner list, the queued and the in-progress runs, and the jobs of
+every queued run. An in-progress run's jobs are read when the run is new, while it has a
+queued job a pool serves, when its `updated_at` changes, and at least every 60 s while the
+budget allows. On a quiet repository that is a few requests a tick, mostly 304s. With 30
+in-progress runs the old loop sent 32 requests a tick, 7,680 an hour. Now a personal
+token sends about 1,290 an hour and a job such a run queues is found within 150 s; an App
+sends about 2,300 and finds it within 60 s. Under 500 requests left the daemon observes
+once every 5 minutes, so cleanup goes on, and under 200 it sends nothing until the reset.
 [docs/design.md](docs/design.md#github-requests) has the details.
 
 ## Verification

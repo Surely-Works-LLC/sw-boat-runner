@@ -13,10 +13,11 @@ To release `vX.Y.Z`:
 
 1. Set `version` in `Cargo.toml` and run `cargo check` so `Cargo.lock` follows.
 2. Add a `CHANGELOG.md` entry for the version, dated.
-3. Change every `v0.1.0`-style pin to the new tag: the `cargo install` lines in the
-   README and `examples/always-on/install.sh`, the `install.sh` URL in
-   `examples/always-on/README.md`, `@` and `ref` in `examples/in-workflow/README.md`, and
-   the `ref` default in `.github/workflows/runners.yml`.
+3. Change every `v0.1.0`-style pin to the new tag: `@` and `ref` in
+   `examples/in-workflow/README.md` and the `ref` default in
+   `.github/workflows/runners.yml`. The `cargo install` line in the README, the
+   `SBR_REF` default in `examples/always-on/install.sh` and the `install.sh` URL in
+   `examples/always-on/README.md` follow `main`; point them at the tag if you like.
 4. Merge, then tag the merge commit `vX.Y.Z` and push the tag.
 
 Contributions are dual-licensed under MIT or Apache-2.0, as the project is, unless you
