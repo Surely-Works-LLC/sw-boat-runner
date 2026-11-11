@@ -285,6 +285,10 @@ fn runners_on<'a>(snap: &'a Snapshot, machine: &'a str) -> impl Iterator<Item = 
     snap.runners.iter().filter(move |r| r.machine == machine)
 }
 
+#[cfg(test)]
+#[path = "decide_reference.rs"]
+mod reference;
+
 /// docs/design.md#start-budget and `max_boxes`, counting the starts already taken this tick.
 struct StartBudget {
     limits: Limits,
@@ -661,6 +665,53 @@ mod tests {
         assert_eq!(decide(&s, &hybrid), [register("m1", 0), resume("m2")]);
     }
 
+    /// 1,000 machines, 4,000 runners and 2,000 queued jobs in one `hybrid` pool.
+    fn large_tick() -> (Snapshot, Pool) {
+        let mut p = pool("hybrid", "slots_per_box = 4");
+        p.min_up = 600;
+        p.max_boxes = 2000;
+        let state = |i: usize| match i % 10 {
+            0 => Ms::Stopped,
+            1 => Ms::Starting,
+            _ => Ms::Up,
+        };
+        let machines: Vec<Machine> = (0..1000)
+            .map(|i| Machine {
+                job: (i >= 700).then(|| key(i as u64)),
+                ..machine(&format!("bx_{i:04}"), state(i))
+            })
+            .collect();
+        let states = [Rs::Busy, Rs::Idle, Rs::Registered, Rs::Offline];
+        let runners = (0..4000)
+            .map(|i| {
+                runner(
+                    &format!("bx_{:04}", i % 1000),
+                    (i / 1000) as u32,
+                    states[i % 4],
+                )
+            })
+            .collect();
+        let jobs: Vec<u64> = (500..2500).collect();
+        (snap(machines, runners, &jobs), p)
+    }
+
+    /// `cargo test --release -- --ignored --nocapture decide_timing` prints the time.
+    #[test]
+    #[ignore = "timing, not a check"]
+    fn decide_timing() {
+        let (s, p) = large_tick();
+        let time = |f: fn(&Snapshot, &Pool) -> Vec<Action>| {
+            let rounds = 20;
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(f(std::hint::black_box(&s), &p));
+            }
+            start.elapsed() / rounds
+        };
+        println!("decide: {:?} per tick", time(decide));
+        println!("reference: {:?} per tick", time(reference::decide));
+    }
+
     mod properties {
         use super::*;
         use proptest::collection::vec;
@@ -786,6 +837,61 @@ mod tests {
                 .iter()
                 .filter(|a| matches!(a, Action::Resume { .. } | Action::Fork { .. }))
                 .count()
+        }
+
+        /// Wider than `arb_pool`: any placement order, limits of 0, and `min_up` without
+        /// slot, so the differential test also covers pools the policy rejects.
+        fn arb_any_pool() -> impl Strategy<Value = Pool> {
+            use Placement::{Fork, Resume, Slot};
+            let step = prop_oneof![Just(Slot), Just(Resume), Just(Fork)];
+            let times = (0u64..200, 0u64..200, 0u64..200, 0u64..400);
+            (vec(step, 0..4), 0u32..5, 0u32..5, 0u32..3, times, 0u32..30).prop_map(
+                |(placement, max_boxes, min_up, slots, times, cap)| Pool {
+                    name: "p".into(),
+                    labels: vec!["a".into(), "B".into()],
+                    machine_type: "large".into(),
+                    snapshot: "s".into(),
+                    placement,
+                    min_up,
+                    max_boxes,
+                    slots_per_box: slots,
+                    idle_stop_s: times.0,
+                    min_up_s: times.1,
+                    register_timeout_s: times.2,
+                    fork_ttl_s: times.3,
+                    paid_start_cents_per_day: cap,
+                },
+            )
+        }
+
+        /// Wider than `arb_snapshot`: machine ids and runner names may repeat, runners may
+        /// sit on machines of no pool, and boat may report the free starts left.
+        fn arb_any_snapshot() -> impl Strategy<Value = Snapshot> {
+            (
+                arb_snapshot(),
+                vec(0usize..6, 0..8),
+                vec(0usize..6, 0..8),
+                proptest::option::of(0u32..4),
+            )
+                .prop_map(|(mut snap, machine_ids, runner_names, free)| {
+                    for (m, id) in snap.machines.iter_mut().zip(machine_ids) {
+                        m.id = format!("m{id}");
+                    }
+                    for (r, name) in snap.runners.iter_mut().zip(runner_names) {
+                        r.name = format!("r{name}");
+                    }
+                    snap.limits.free_starts_left = free;
+                    snap
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(20_000))]
+            /// The rewrite returns exactly what the frozen pre-rewrite `decide` returned.
+            #[test]
+            fn matches_the_reference(snap in arb_any_snapshot(), pool in arb_any_pool()) {
+                prop_assert_eq!(decide(&snap, &pool), reference::decide(&snap, &pool));
+            }
         }
 
         proptest! {
