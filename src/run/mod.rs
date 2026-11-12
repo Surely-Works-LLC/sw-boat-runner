@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::boat;
 use crate::github;
 use crate::github_app;
-use crate::model::{Action, Cents, Config, MachineState, Pool, Snapshot, UnixSecs};
+use crate::model::{Action, Cents, Config, MachineState, Pool, RunnerState, Snapshot, UnixSecs};
 use crate::transport::{Transport, Ureq};
 
 pub(crate) use script::HOME_WAIT_S;
@@ -35,6 +35,15 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 /// The "pacing" line is logged at most once in this many seconds: pacing is normal,
 /// so a minute-by-minute line would only be noise.
 const PACED_LOG_S: UnixSecs = 600;
+/// After an error no tick can fix, `run` tries again after this wait, doubling to
+/// `FATAL_RETRY_MAX_S`, and exits once `FATAL_GIVE_UP_S` have passed since the first one.
+/// A restart would set today's spend to the largest cap (`FixCrashSpend`), close starts
+/// for the request timeout (`FixKeptInflight`) and delete every Up job fork
+/// (`FixCrashSeen`), so a key that comes back, or billing that a human adds, is better met
+/// by the same process; and a service manager that restarts on exit does not spin.
+const FATAL_RETRY_MIN_S: u64 = 15;
+const FATAL_RETRY_MAX_S: u64 = 600;
+const FATAL_GIVE_UP_S: u64 = 1800;
 
 #[derive(Debug)]
 pub enum Error {
@@ -45,6 +54,10 @@ pub enum Error {
     GitHub(github::Error),
     /// A start after starts closed for this tick.
     StartsClosed,
+    /// boat refused a start with a 403, which can be the pool's alone (a `machine_type`
+    /// the plan does not allow): that pool's starts back off and other pools go on. A
+    /// 403 for the whole account fails the next tick's reads, which is fatal.
+    PoolForbidden(boat::Error),
     /// An action naming a pool or machine the snapshot does not have.
     Invalid(String),
 }
@@ -54,10 +67,17 @@ impl Error {
         match self {
             Error::MissingEnv(_) | Error::Config(_) => true,
             Error::Boat(e) => e.is_fatal(),
-            Error::GitHub(e) => e.is_fatal(),
-            Error::StartsClosed | Error::Invalid(_) => false,
+            Error::GitHub(e) => github_is_fatal(e),
+            Error::StartsClosed | Error::PoolForbidden(_) | Error::Invalid(_) => false,
         }
     }
+}
+
+/// Whether a GitHub error is one no later tick can fix: today a 401, a 403 that is not a
+/// rate limit, or a refused App. One place, so a finer split of GitHub's errors can
+/// replace it.
+pub(crate) fn github_is_fatal(e: &github::Error) -> bool {
+    e.is_fatal()
 }
 
 impl fmt::Display for Error {
@@ -65,7 +85,7 @@ impl fmt::Display for Error {
         match self {
             Error::MissingEnv(name) => write!(f, "{name} is not set"),
             Error::Config(m) => write!(f, "{m}"),
-            Error::Boat(e) => write!(f, "{e}"),
+            Error::Boat(e) | Error::PoolForbidden(e) => write!(f, "{e}"),
             Error::GitHub(e) => write!(f, "{e}"),
             Error::StartsClosed => write!(f, "starts closed for this tick"),
             Error::Invalid(m) => write!(f, "invalid action: {m}"),
@@ -124,6 +144,9 @@ pub fn run(
         }
         Err(e) => eprintln!("listing every pool's machines: {e}"),
     }
+    for warning in crate::policy::warnings(cfg) {
+        eprintln!("warning: {warning}");
+    }
     let stopped = || stop.load(Ordering::SeqCst);
     // Sleeps until the next tick is due, or a signal.
     let mut wait = |d: Duration| {
@@ -144,6 +167,39 @@ pub fn run(
         &mut wait,
         &mut std::thread::sleep,
     )
+}
+
+/// When `serve` tries a full tick again after errors no tick can fix, and when it gives
+/// up.
+#[derive(Default)]
+struct Retry {
+    /// When the first of the errors in a row came, the last wait, and when the next full
+    /// tick is due.
+    since: Option<UnixSecs>,
+    wait_s: u64,
+    next: UnixSecs,
+    /// A cleanup tick failed with such an error too, so none is sent until `next`: an
+    /// observe the error refuses would only repeat it every tick.
+    cleanup_failed: bool,
+}
+
+impl Retry {
+    /// Notes a fatal error of a full tick at `now`. Returns the wait before the next full
+    /// tick, or `None` to give up.
+    fn after_fatal(&mut self, now: UnixSecs) -> Option<u64> {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) >= FATAL_GIVE_UP_S {
+            return None;
+        }
+        self.wait_s = (self.wait_s * 2).clamp(FATAL_RETRY_MIN_S, FATAL_RETRY_MAX_S);
+        self.next = now.saturating_add(self.wait_s);
+        self.cleanup_failed = false;
+        Some(self.wait_s)
+    }
+
+    fn failing(&self) -> bool {
+        self.since.is_some()
+    }
 }
 
 /// A flag SIGINT and SIGTERM set. The shutdown hook goes first, so it sees the flag unset
@@ -348,6 +404,31 @@ pub struct Loop<'a> {
     /// budget. Ticks that skip and ticks that observe can alternate, so the line is logged
     /// at most once every `PACED_LOG_S`.
     paced_logged: Option<UnixSecs>,
+    /// Time since some fixed instant. A tick's `now` is when it began, but its requests can
+    /// take up to `HTTP_TIMEOUT` each, so what is timed from a request's answer adds the
+    /// time gone since then (see `act::Tick::at`).
+    clock: Box<dyn Fn() -> Duration>,
+    /// `clock` when the current tick began at its `now`.
+    began: Duration,
+    /// Set by `wind_down`: a stop goes ahead when GitHub refuses the runner delete with
+    /// an error no tick can fix.
+    winding_down: bool,
+    /// When the last observe succeeded, and the runners it found.
+    last_observe: Option<LastObserve>,
+}
+
+#[derive(Clone)]
+struct LastObserve {
+    at: UnixSecs,
+    runners: Vec<crate::model::Runner>,
+}
+
+/// What a tick carries out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Full,
+    /// Unregisters, deletes and stops only, between the tries after a fatal error.
+    Cleanup,
 }
 
 impl<'a> Loop<'a> {
@@ -369,7 +450,103 @@ impl<'a> Loop<'a> {
             ledger: act::Ledger::new(cfg, now),
             read_jobs: true,
             paced_logged: None,
+            clock: {
+                let start = Instant::now();
+                Box::new(move || start.elapsed())
+            },
+            began: Duration::ZERO,
+            winding_down: false,
+            last_observe: None,
         }
+    }
+
+    /// Before the process exits on an error no tick fixed: one more observe, then the
+    /// unregisters, deletes and stops `decide` asks for, and a stop of every kept `Up`
+    /// machine with no `Busy` or `Registered` runner, so no machine bills on until boat's
+    /// TTL with no daemon to stop it. Each stop and delete removes the machine's runners
+    /// first, so a runner that took a job since keeps its machine; but a stop goes ahead
+    /// when GitHub refuses the runner delete with an error no tick can fix, as nothing
+    /// could ever stop the machine otherwise. When GitHub refuses the observe, the kept
+    /// machines that had no runner at the last observe and none registered since are
+    /// stopped from boat's listing alone. Nothing starts. Errors are only logged: this is
+    /// the last thing the process does.
+    fn wind_down(&mut self, now: UnixSecs, decide: &dyn Fn(&Snapshot, &Pool) -> Vec<Action>) {
+        self.began = (self.clock)();
+        self.winding_down = true;
+        self.gh.begin_tick(now);
+        let observed = match self.read(now) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("exit: observe: {e}; stopping from boat's listing alone");
+                self.wind_down_from_boat();
+                return;
+            }
+        };
+        let snap = &observed.snapshot;
+        let mut actions: Vec<Action> = plan(self.cfg, snap, decide)
+            .into_iter()
+            .map(|(_, a)| a)
+            .filter(act::is_cleanup)
+            .collect();
+        let held = |id: &str| {
+            snap.runners.iter().any(|r| {
+                r.machine == id && matches!(r.state, RunnerState::Busy | RunnerState::Registered)
+            })
+        };
+        for m in &snap.machines {
+            let decided = actions.iter().any(|a| match a {
+                Action::Delete { machine } | Action::Stop { machine } => machine == &m.id,
+                _ => false,
+            });
+            if !m.is_ephemeral() && m.state == MachineState::Up && !held(&m.id) && !decided {
+                eprintln!("exit: stopping {} in pool {}", m.id, m.pool);
+                actions.push(Action::Stop {
+                    machine: m.id.clone(),
+                });
+            }
+        }
+        if let Err(e) = self.act(now, observed, actions) {
+            eprintln!("exit: {e}");
+        }
+    }
+
+    /// `wind_down` without a snapshot: stops each kept machine boat lists up that had no
+    /// runner at the last observe and got none since (`Memory::idle_since`). With no
+    /// observe yet, nothing is known about runners, so nothing is stopped.
+    fn wind_down_from_boat(&mut self) {
+        let Some(last) = self.last_observe.clone() else {
+            return;
+        };
+        for pool in &self.cfg.pools {
+            let listed = match self.boat.list(&pool.name) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("exit: list pool {}: {e}", pool.name);
+                    continue;
+                }
+            };
+            for sb in listed {
+                let up = boat::machine_state(&sb.state) == MachineState::Up;
+                let had_runner = last.runners.iter().any(|r| r.machine == sb.id);
+                if sb.job().is_some()
+                    || !up
+                    || had_runner
+                    || !self.memory.idle_since(&sb.id, last.at)
+                {
+                    continue;
+                }
+                eprintln!("exit: stopping {} in pool {}", sb.id, pool.name);
+                if let Err(e) = self.boat.stop(&sb.id) {
+                    eprintln!("exit: stop {}: {e}", sb.id);
+                }
+            }
+        }
+    }
+
+    /// Replaces the clock that times what waits for a request's answer (see `clock`):
+    /// the time since some fixed instant, for a test that runs requests on virtual time.
+    pub fn set_clock(&mut self, clock: Box<dyn Fn() -> Duration>) {
+        self.clock = clock;
     }
 
     /// A loop with the credentials in `BOAT_API_KEY`, and `GITHUB_TOKEN` or the
@@ -386,6 +563,18 @@ impl<'a> Loop<'a> {
         now: UnixSecs,
         decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>,
     ) -> Result<(), Error> {
+        self.tick_as(now, decide, Mode::Full)
+    }
+
+    /// A tick that, in `Mode::Cleanup`, carries out only the unregisters, deletes and
+    /// stops `decide` asks for.
+    fn tick_as(
+        &mut self,
+        now: UnixSecs,
+        decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>,
+        mode: Mode,
+    ) -> Result<(), Error> {
+        self.began = (self.clock)();
         self.ledger.begin_tick(now);
         self.gh.begin_tick(now);
         // A tick without budget acts on nothing rather than on a stale snapshot; see
@@ -411,6 +600,7 @@ impl<'a> Loop<'a> {
         let actions = plan(self.cfg, &observed.snapshot, decide)
             .into_iter()
             .map(|(_, a)| a)
+            .filter(|a| mode == Mode::Full || act::is_cleanup(a))
             .collect();
         self.act(now, observed, actions)
     }
@@ -483,6 +673,12 @@ impl<'a> Loop<'a> {
     /// early once `stop` is set. Then drains with `opts.drain_on_stop`, still knowing the
     /// forks boat has not listed, pausing with `sleep`, which a set `stop` must not cut
     /// short. Returns the machines that drain left, else 0.
+    ///
+    /// After an error no tick can fix, the full tick is tried again on a back-off
+    /// (`Retry`); the ticks between still run every `tick_s`, cleanup only: unregisters,
+    /// deletes and stops, no registers or starts, so finished forks and idle machines do
+    /// not bill through the wait. Once such errors outlast `FATAL_GIVE_UP_S` it runs
+    /// `wind_down` and returns the error, with no drain.
     fn serve(
         &mut self,
         decide: &dyn Fn(&Snapshot, &Pool) -> Vec<Action>,
@@ -493,9 +689,42 @@ impl<'a> Loop<'a> {
         sleep: &mut dyn FnMut(Duration),
     ) -> Result<usize, Error> {
         let period = self.cfg.tick_s.max(1);
+        let mut retry = Retry::default();
         while !stop() {
             let started = clock();
-            self.tick(started, decide)?;
+            if !retry.failing() || started >= retry.next {
+                match self.tick(started, decide) {
+                    Ok(()) => {
+                        if let Some(since) = retry.since {
+                            let s = started.saturating_sub(since);
+                            eprintln!("recovered after {s}s of errors");
+                        }
+                        retry = Retry::default();
+                    }
+                    Err(e) => match retry.after_fatal(started) {
+                        Some(wait_s) => {
+                            let since = retry.since.unwrap_or(started);
+                            let gone = started.saturating_sub(since);
+                            let left = FATAL_GIVE_UP_S.saturating_sub(gone);
+                            eprintln!(
+                                "error: {e}. This needs a human; cleanup only, the full tick \
+                                 again in {wait_s}s, exiting if it lasts {left}s more"
+                            );
+                        }
+                        None => {
+                            eprintln!("error: {e}. Giving up after {FATAL_GIVE_UP_S}s");
+                            let now = clock();
+                            self.wind_down(now, decide);
+                            return Err(e);
+                        }
+                    },
+                }
+            } else if !retry.cleanup_failed {
+                if let Err(e) = self.tick_as(started, decide, Mode::Cleanup) {
+                    eprintln!("cleanup tick: {e}; none until the next try");
+                    retry.cleanup_failed = true;
+                }
+            }
             if stop() {
                 break;
             }
@@ -906,6 +1135,7 @@ mod tests {
                 spent_today_cents: 10,
                 free_starts_left: None,
             },
+            queued_at: Default::default(),
         };
         let forks = |snap: &Snapshot, decide: fn(&Snapshot, &Pool) -> Vec<Action>| {
             plan(&cfg, snap, decide)
@@ -939,6 +1169,205 @@ mod tests {
         let mut tick_loop = started(&cfg, &fake);
         let err = tick_loop.tick(NOW, |_, _| Vec::new()).unwrap_err();
         assert!(matches!(err, Error::Boat(boat::Error::BillingRequired)));
+    }
+
+    /// `serve` with no drain against `fake`, on `clock`, which only its waits move (one
+    /// second at a time, so a stop is seen within a second), until `stop_at` if given.
+    /// Returns the result.
+    fn serve_on(
+        cfg: &Config,
+        fake: &Fake,
+        clock: &std::rc::Rc<std::cell::Cell<UnixSecs>>,
+        decide: &dyn Fn(&Snapshot, &Pool) -> Vec<Action>,
+        stop_at: Option<UnixSecs>,
+    ) -> Result<usize, Error> {
+        let mut tick_loop = started(cfg, fake);
+        let c = clock.clone();
+        tick_loop.clock = Box::new(move || Duration::from_secs(c.get()));
+        let stop = || stop_at.is_some_and(|t| clock.get() >= t);
+        let mut wait = |d: Duration| {
+            for _ in 0..d.as_secs() {
+                if stop() {
+                    break;
+                }
+                clock.set(clock.get() + 1);
+            }
+        };
+        let mut sleep = |d: Duration| clock.set(clock.get() + d.as_secs());
+        tick_loop.serve(
+            decide,
+            RunOpts::default(),
+            &stop,
+            &mut || clock.get(),
+            &mut wait,
+            &mut sleep,
+        )
+    }
+
+    fn clock_at_now() -> std::rc::Rc<std::cell::Cell<UnixSecs>> {
+        std::rc::Rc::new(std::cell::Cell::new(NOW))
+    }
+
+    /// boat answers everything with a 401. The loop does not exit at once, as a restart
+    /// would reset today's spend, close starts and delete the job forks that are up: the
+    /// full tick is tried again after 15 s, doubling to 10 min, and the loop exits after
+    /// 30 min. A cleanup tick fails the same way, so none runs again until the next try.
+    #[test]
+    fn a_fatal_error_backs_off_then_ends_the_loop() {
+        let cfg = config();
+        let clock = clock_at_now();
+        let observes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (c, o) = (clock.clone(), observes.clone());
+        let fake = Fake::new(move |s| {
+            if s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                o.borrow_mut().push(c.get() - NOW);
+            }
+            if s.url.starts_with(BOAT) {
+                respond(401, &[], r#"{"code":"unauthorized"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let err = serve_on(&cfg, &fake, &clock, &|_, _| Vec::new(), None).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Boat(boat::Error::Unauthorized { status: 401, .. })
+        ));
+        let full = [0, 15, 45, 105, 225, 465, 945, 1545, 2145];
+        let mut want = Vec::new();
+        for (i, t) in full.iter().enumerate() {
+            want.push(*t);
+            if let Some(next) = full.get(i + 1) {
+                if t + 15 < *next {
+                    want.push(t + 15);
+                }
+            }
+        }
+        // The last observe is `wind_down`'s.
+        want.push(2145);
+        assert_eq!(*observes.borrow(), want);
+    }
+
+    /// The error goes away on the third try: full ticks go on at `tick_s`, and a later
+    /// error starts the back-off afresh, at 15 s.
+    #[test]
+    fn a_fatal_error_that_clears_resets_the_back_off() {
+        let cfg = config();
+        let clock = clock_at_now();
+        let forked_at = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (c, f) = (clock.clone(), forked_at.clone());
+        let fake = Fake::new(move |s| {
+            let t = c.get() - NOW;
+            if s.url.ends_with("/v1/limits") && (t <= 30 || (105..=110).contains(&t)) {
+                return respond(402, &[], r#"{"code":"billing_required"}"#);
+            }
+            if s.method == "POST" && s.url == format!("{BOAT}/sandboxes") {
+                f.borrow_mut().push(t);
+            }
+            reply(s)
+        });
+        let decide = |_: &Snapshot, _: &Pool| vec![fork(None)];
+        let left = serve_on(&cfg, &fake, &clock, &decide, Some(NOW + 130)).unwrap();
+        assert_eq!(left, 0);
+        assert_eq!(*forked_at.borrow(), [45, 60, 75, 90, 120]);
+    }
+
+    /// Every fork gets boat's 401 until the loop gives up. Through the back-off a cleanup
+    /// tick runs every `tick_s` and deletes what `decide` asks for, and on exit the kept
+    /// machine that no runner holds is stopped, so it does not bill until boat's 30-day
+    /// TTL with no daemon to stop it.
+    #[test]
+    fn giving_up_stops_kept_machines_no_runner_holds() {
+        let cfg = config();
+        let clock = clock_at_now();
+        let ticks = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (c, k) = (clock.clone(), ticks.clone());
+        let fake = Fake::new(move |s| {
+            if s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                k.borrow_mut().push(c.get() - NOW);
+            }
+            if s.method == "POST" && s.url == format!("{BOAT}/sandboxes") {
+                respond(401, &[], r#"{"code":"unauthorized"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let decide = |_: &Snapshot, _: &Pool| vec![delete("bx_44444444"), fork(Some(70))];
+        assert!(serve_on(&cfg, &fake, &clock, &decide, None).is_err());
+        let ticks = ticks.borrow();
+        assert!(ticks.windows(2).all(|w| w[1] - w[0] <= 15), "{ticks:?}");
+        let reqs = requests(&fake);
+        let deletes = reqs
+            .iter()
+            .filter(|r| **r == format!("DELETE {BOAT}/sandboxes/bx_44444444"))
+            .count();
+        assert_eq!(deletes, ticks.len(), "every tick, and the last, deletes it");
+        let tail: Vec<_> = reqs.iter().rev().take(2).rev().cloned().collect();
+        assert_eq!(
+            tail,
+            [
+                format!("DELETE {GH}/runners/11"),
+                format!("POST {BOAT}/sandboxes/bx_22222222/stop"),
+            ]
+        );
+    }
+
+    /// A stop request during the back-off's wait ends `serve` within a second.
+    #[test]
+    fn a_stop_during_the_back_off_returns_promptly() {
+        let cfg = config();
+        let clock = clock_at_now();
+        let fake = Fake::new(|s| {
+            if s.url.starts_with(BOAT) {
+                respond(401, &[], r#"{"code":"unauthorized"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        // Full tries at 0, 15 and 45; the next is due at 105.
+        let left = serve_on(&cfg, &fake, &clock, &|_, _| Vec::new(), Some(NOW + 50)).unwrap();
+        assert_eq!(left, 0);
+        assert!(clock.get() <= NOW + 51, "{}", clock.get() - NOW);
+    }
+
+    /// On the way out, GitHub refuses to delete runner 11 with a 401. The stop of its
+    /// kept machine goes ahead: nothing else would ever stop it.
+    #[test]
+    fn wind_down_stops_when_github_refuses_the_runner_delete() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") {
+                respond(401, &[], r#"{"message":"Bad credentials"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.wind_down(NOW, &|_, _| Vec::new());
+        let stop = format!("POST {BOAT}/sandboxes/bx_22222222/stop");
+        assert!(requests(&fake).contains(&stop), "{:?}", requests(&fake));
+    }
+
+    /// GitHub refuses the last observe with a 401. The kept machine boat lists up, which
+    /// had no runner at the last good observe, is stopped from boat's listing alone.
+    #[test]
+    fn wind_down_without_github_stops_kept_machines_from_boats_listing() {
+        let cfg = config();
+        let github_down = std::rc::Rc::new(std::cell::Cell::new(false));
+        let down = github_down.clone();
+        let fake = Fake::new(move |s| {
+            if down.get() && s.url.starts_with(GH) {
+                return respond(401, &[], r#"{"message":"Bad credentials"}"#);
+            }
+            let kept = r#"{"id":"bx_88888888","state":"idle","labels":{"sw-boat-runner":"ci"}}"#;
+            lagging_reply(s, kept, "")
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.tick(NOW, |_, _| Vec::new()).unwrap();
+        github_down.set(true);
+        tick_loop.wind_down(NOW + 15, &|_, _| Vec::new());
+        let stop = format!("POST {BOAT}/sandboxes/bx_88888888/stop");
+        assert!(requests(&fake).contains(&stop), "{:?}", requests(&fake));
     }
 
     fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

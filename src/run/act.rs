@@ -2,6 +2,7 @@
 //! (docs/design.md#start-budget).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -9,7 +10,7 @@ use super::observe::Observed;
 use super::{Error, HTTP_TIMEOUT, Loop, script};
 use crate::boat;
 use crate::github;
-use crate::model::{Action, Cents, Config, JobKey, Snapshot, UnixSecs};
+use crate::model::{Action, Cents, Config, JobKey, Placement, Snapshot, UnixSecs};
 
 pub(super) const DAY_S: u64 = 86_400;
 /// boat's 409 code for a resume of a machine whose disk it has deleted, which it may do
@@ -19,6 +20,9 @@ const DISK_EXPIRED: &str = "snapshot_data_expired";
 /// the most it doubles to.
 const BACKOFF_MIN_S: u64 = 15;
 const BACKOFF_MAX_S: u64 = 600;
+/// The first wait of a pool whose starts boat refuses with a 403, such as a
+/// `machine_type` the plan does not allow. It doubles to `BACKOFF_MAX_S`.
+const REFUSED_MIN_S: u64 = 60;
 
 /// The start budget and back-off, kept from tick to tick. Only this module writes it.
 pub(super) struct Ledger {
@@ -29,6 +33,9 @@ pub(super) struct Ledger {
     blocked_until: UnixSecs,
     /// Starts that failed last time they were sent; see `Failing`.
     failing: HashMap<(String, StartKind), Failing>,
+    /// The price booked for the last start boat accepted or may have accepted, until a
+    /// later quote is read; see `quote_seen`.
+    unconfirmed: Option<Cents>,
 }
 
 /// The kinds of action that cost a start, which back off apart in each pool.
@@ -46,9 +53,18 @@ struct Failing {
     error: String,
     backoff_s: u64,
     until: UnixSecs,
-    /// Forks deleted for holding their creator's logins. A fork boat accepts proves
+    why: Why,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// The same error twice in a row; forgotten once `decide` stops asking for the start.
+    Repeated,
+    /// Machines removed for holding their creator's logins. A fork boat accepts proves
     /// nothing then, so only a machine of the pool found without them clears it.
-    logins: bool,
+    Logins,
+    /// boat refused the pool's starts with a 403; an accepted start clears it.
+    Refused,
 }
 
 impl Ledger {
@@ -69,6 +85,27 @@ impl Ledger {
             // (`FixKeptInflight`).
             blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             failing: HashMap::new(),
+            unconfirmed: None,
+        }
+    }
+
+    /// Books `price` for a start boat accepted, or may have, at the quote `decide` saw.
+    fn book(&mut self, price: Cents) {
+        self.spent_cents = self.spent_cents.saturating_add(price);
+        self.unconfirmed = Some(price);
+    }
+
+    /// The quote after a start. boat quotes only the next start, so a quote above the
+    /// price booked for the last one means that start may have cost the new price:
+    /// someone else on the account took the last included start first, or the price
+    /// went up. The difference is booked too, so the cap holds; when it was this
+    /// daemon's own start that used the last included one, that counts a free start as
+    /// paid, which only delays paid starts.
+    pub(super) fn quote_seen(&mut self, cents: Cents) {
+        if let Some(booked) = self.unconfirmed.take() {
+            self.spent_cents = self
+                .spent_cents
+                .saturating_add(cents.saturating_sub(booked));
         }
     }
 
@@ -76,6 +113,7 @@ impl Ledger {
         if now / DAY_S != self.day {
             self.day = now / DAY_S;
             self.spent_cents = 0;
+            self.unconfirmed = None;
         }
     }
 
@@ -95,46 +133,72 @@ impl Ledger {
         self.failing.get(key).is_some_and(|f| now < f.until)
     }
 
-    /// Forgets the starts `decide` no longer asks for, except a logins back-off.
+    /// Forgets the starts `decide` no longer asks for, except a logins or refusal back-off.
     fn keep_asked(&mut self, asked: &HashSet<(String, StartKind)>) {
-        self.failing.retain(|k, f| f.logins || asked.contains(k));
+        self.failing
+            .retain(|k, f| f.why != Why::Repeated || asked.contains(k));
     }
 
     /// A start boat accepted ends its back-off, except a logins back-off.
     fn succeeded(&mut self, key: &(String, StartKind)) {
-        if !self.failing.get(key).is_some_and(|f| f.logins) {
+        if !self.failing.get(key).is_some_and(|f| f.why == Why::Logins) {
             self.failing.remove(key);
         }
     }
 
-    /// A fork of `pool` held its creator's logins: the pool's forks wait, doubling while
-    /// new forks keep holding them. Returns the wait.
-    fn fork_held_logins(&mut self, now: UnixSecs, pool: &str, error: String) -> u64 {
-        let key = (pool.to_string(), StartKind::Fork);
+    /// Backs off `key` for `why`, starting at `min_s` and doubling while the same `why`
+    /// repeats. Returns the wait.
+    fn back_off(
+        &mut self,
+        now: UnixSecs,
+        key: (String, StartKind),
+        why: Why,
+        min_s: u64,
+        error: String,
+    ) -> u64 {
         let backoff_s = match self.failing.get(&key) {
-            Some(f) if f.logins => (f.backoff_s * 2).clamp(BACKOFF_MIN_S, BACKOFF_MAX_S),
-            _ => BACKOFF_MIN_S,
+            Some(f) if f.why == why => (f.backoff_s * 2).clamp(min_s, BACKOFF_MAX_S),
+            _ => min_s,
         };
         let until = now.saturating_add(backoff_s);
-        let logins = true;
-        self.failing.insert(
-            key,
-            Failing {
-                error,
-                backoff_s,
-                until,
-                logins,
-            },
-        );
+        let failing = Failing {
+            error,
+            backoff_s,
+            until,
+            why,
+        };
+        self.failing.insert(key, failing);
         backoff_s
+    }
+
+    /// A machine of `pool` held its creator's logins: the pool's forks, of jobs and of kept
+    /// machines alike, wait, doubling while new ones keep holding them. Returns the wait.
+    fn fork_held_logins(&mut self, now: UnixSecs, pool: &str, error: String) -> u64 {
+        let key = (pool.to_string(), StartKind::Fork);
+        self.back_off(now, key, Why::Logins, BACKOFF_MIN_S, error)
     }
 
     /// A machine of `pool` held none of its creator's logins, which ends a logins back-off.
     fn pool_free_of_logins(&mut self, pool: &str) {
         let key = (pool.to_string(), StartKind::Fork);
-        if self.failing.get(&key).is_some_and(|f| f.logins) {
+        if self.failing.get(&key).is_some_and(|f| f.why == Why::Logins) {
             self.failing.remove(&key);
         }
+    }
+
+    /// boat refused a start of `pool` with a 403: every start of the pool waits, doubling
+    /// while boat keeps refusing, and other pools go on. Returns the wait.
+    fn pool_refused(&mut self, now: UnixSecs, pool: &str, error: String) -> u64 {
+        let mut wait_s = 0;
+        for kind in [StartKind::Fork, StartKind::Resume] {
+            let key = (pool.to_string(), kind);
+            // A logins back-off stays: only a clean machine ends it.
+            if self.failing.get(&key).is_some_and(|f| f.why == Why::Logins) {
+                continue;
+            }
+            wait_s = self.back_off(now, key, Why::Refused, REFUSED_MIN_S, error.clone());
+        }
+        wait_s
     }
 
     /// Logs a failed start. The same error twice in a row backs the start off; a repeat
@@ -157,14 +221,14 @@ impl Ledger {
             eprintln!("{action:?}: {e} (again; next try in {backoff_s}s)");
         }
         let until = now.saturating_add(backoff_s);
-        let logins = false;
+        let why = Why::Repeated;
         self.failing.insert(
             key,
             Failing {
                 error,
                 backoff_s,
                 until,
-                logins,
+                why,
             },
         );
     }
@@ -185,10 +249,45 @@ enum Starts {
 /// What one tick's actions share.
 struct Tick<'s> {
     now: UnixSecs,
+    /// `Loop::clock` when the tick began at `now`, before its observe.
+    began: Duration,
     snapshot: &'s Snapshot,
     /// GitHub ids of the snapshot's runners that are still there.
     runner_ids: HashMap<String, u64>,
     starts: Starts,
+    /// Machines this tick leaves alone: a runner whose start failed is still registered
+    /// on them.
+    skip: HashSet<String>,
+}
+
+impl Tick<'_> {
+    /// The time now, from the clock reading `elapsed`: `now` plus the time this tick's
+    /// requests took. What waits for a request's answer is timed from here, not from
+    /// `now`, which can be several request timeouts earlier.
+    fn at(&self, elapsed: Duration) -> UnixSecs {
+        self.now
+            .saturating_add(elapsed.saturating_sub(self.began).as_secs())
+    }
+}
+
+/// The unregisters, deletes and stops: what frees capacity and stops the bill. An error
+/// no tick can fix still lets the rest of these run.
+pub(super) fn is_cleanup(a: &Action) -> bool {
+    matches!(
+        a,
+        Action::Unregister { .. } | Action::Delete { .. } | Action::Stop { .. }
+    )
+}
+
+/// The machine an action works on, if any.
+fn machine_of(a: &Action) -> Option<&str> {
+    match a {
+        Action::Delete { machine }
+        | Action::Stop { machine }
+        | Action::Register { machine, .. }
+        | Action::Resume { machine } => Some(machine),
+        Action::Unregister { .. } | Action::Fork { .. } => None,
+    }
 }
 
 /// Execution order for one tick: free capacity before using it, cheap before paid.
@@ -220,8 +319,16 @@ fn backoff_key(snap: &Snapshot, a: &Action) -> Option<(String, StartKind)> {
 }
 
 impl Loop<'_> {
+    /// The time now, for what is timed from a request's answer; see `Tick::at`.
+    fn at(&self, t: &Tick) -> UnixSecs {
+        t.at((self.clock)())
+    }
+
     /// Carries out `actions` in `rank` order. Returns `Err` only for errors no later tick
-    /// can fix; others are logged, and a GitHub rate limit ends the tick.
+    /// can fix, and only once every other unregister, delete and stop has run: such an
+    /// error skips this tick's registers and starts, never its cleanup. A 403 to one
+    /// pool's start backs that pool's starts off and is not fatal (`boat::Error::
+    /// is_forbidden`). Other errors are logged, and a GitHub rate limit ends the tick.
     pub(super) fn act(
         &mut self,
         now: UnixSecs,
@@ -239,6 +346,7 @@ impl Loop<'_> {
         let limits = snapshot.limits;
         let mut tick = Tick {
             now,
+            began: self.began,
             snapshot,
             runner_ids: observed.runner_ids,
             starts: if limits.can_start {
@@ -249,8 +357,30 @@ impl Loop<'_> {
             } else {
                 Starts::Closed
             },
+            skip: HashSet::new(),
         };
+        let mut fatal: Option<Error> = None;
+        // Runners whose start failed last tick hold a slot and count as supply until they
+        // are gone, so they go first.
+        for a in &observed.abandoned {
+            match self.delete_runner(a.id) {
+                Ok(()) => self.memory.forget_abandoned(&a.name),
+                Err(e) => {
+                    eprintln!("unregister {} (its start failed): {e}", a.name);
+                    tick.skip.insert(a.machine.clone());
+                    if e.is_fatal() {
+                        fatal.get_or_insert(e);
+                    }
+                }
+            }
+        }
         for action in &actions {
+            if fatal.is_some() && !is_cleanup(action) {
+                continue;
+            }
+            if machine_of(action).is_some_and(|m| tick.skip.contains(m)) {
+                continue;
+            }
             let key = backoff_key(snapshot, action);
             if key
                 .as_ref()
@@ -264,7 +394,22 @@ impl Loop<'_> {
                         self.ledger.succeeded(k);
                     }
                 }
-                Err(e) if e.is_fatal() => return Err(e),
+                Err(Error::PoolForbidden(b)) => {
+                    let pool = key.map(|(pool, _)| pool).unwrap_or_default();
+                    let wait_s = self.ledger.pool_refused(now, &pool, b.to_string());
+                    eprintln!(
+                        "error: {action:?}: {b}. boat refuses pool {pool}'s starts; it makes \
+                         none for {wait_s}s, and other pools go on. Check its machine_type \
+                         and snapshot against the boat plan"
+                    );
+                }
+                Err(e) if e.is_fatal() => {
+                    eprintln!(
+                        "error: {action:?}: {e}; the tick's other unregisters, deletes and \
+                         stops still run, its registers and starts do not"
+                    );
+                    fatal.get_or_insert(e);
+                }
                 Err(e @ Error::GitHub(github::Error::RateLimited { .. })) => {
                     eprintln!("{action:?}: {e}; rest of tick skipped");
                     break;
@@ -279,7 +424,7 @@ impl Loop<'_> {
                 },
             }
         }
-        Ok(())
+        fatal.map_or(Ok(()), Err)
     }
 
     fn execute(&mut self, t: &mut Tick, action: &Action) -> Result<(), Error> {
@@ -290,7 +435,13 @@ impl Loop<'_> {
             },
             Action::Delete { machine } => self.delete_machine(t, machine),
             Action::Stop { machine } => {
-                self.remove_runners(t, machine)?;
+                match self.remove_runners(t, machine) {
+                    // On the way out nothing else could stop it; see `Loop::wind_down`.
+                    Err(Error::GitHub(e)) if self.winding_down && super::github_is_fatal(&e) => {
+                        eprintln!("exit: {machine}: {e}; stopping it anyway");
+                    }
+                    r => r?,
+                }
                 Ok(self.boat.stop(machine)?)
             }
             Action::Register {
@@ -299,7 +450,7 @@ impl Loop<'_> {
                 slot,
             } => {
                 if self.free_of_logins(t, pool, machine)? {
-                    self.register(t.now, pool, machine, *slot)
+                    self.register(t, pool, machine, *slot)
                 } else {
                     Ok(())
                 }
@@ -346,9 +497,11 @@ impl Loop<'_> {
 
     /// Whether `machine` holds none of its creator's logins, so a runner may go on it.
     /// boat's `noEnv` create keeps logins saved in the snapshot, and a CI job could read
-    /// them. A job's fork that holds them is deleted and the pool's forks back off; a kept
-    /// machine waits for its next start, whose `noEnv` resume scrubs them, and is logged
-    /// once. A machine boat does not say about counts as holding them.
+    /// them. A machine that holds them is taken out of the way, so a replacement can serve
+    /// the pool: a job's fork, or a kept machine in a pool without `resume`, is deleted; a
+    /// kept machine in a pool with `resume` is stopped, as its `noEnv` resume scrubs them.
+    /// Either way the pool's forks back off, since a fork of the same snapshot holds them
+    /// too. A machine boat does not say about counts as holding them.
     fn free_of_logins(&mut self, t: &mut Tick, pool: &str, machine: &str) -> Result<bool, Error> {
         if self.memory.holds_logins(machine) {
             return Ok(false);
@@ -370,43 +523,65 @@ impl Loop<'_> {
              with --no-env; a CI job there could read them",
             p.snapshot
         );
-        if sb.job().is_some() {
-            let msg = format!("error: {error}. No runner registered; deleting it");
-            let backoff_s = self.ledger.fork_held_logins(t.now, pool, error);
-            eprintln!("{msg}, next fork in {backoff_s}s");
-            self.delete_machine(t, machine)?;
+        let stop = sb.job().is_none() && p.has(Placement::Resume);
+        let what = if stop {
+            "stopping it, as its resume scrubs them"
         } else {
-            eprintln!("error: {error}. No runner registered until it is stopped and resumed");
+            "deleting it"
+        };
+        let msg = format!("error: {error}. No runner registered; {what}");
+        let backoff_s = self.ledger.fork_held_logins(t.now, pool, error);
+        eprintln!("{msg}; the pool's next fork in {backoff_s}s");
+        if stop {
+            self.remove_runners(t, machine)?;
+            self.boat.stop(machine)?;
+            // Until boat lists it stopping, `decide` may still ask for a runner on it.
             self.memory.note_holds_logins(machine);
+        } else {
+            self.delete_machine(t, machine)?;
         }
         Ok(false)
     }
 
-    /// If the file write or the command fails, the GitHub runner stays `Registered` and
-    /// `decide` unregisters it after `register_timeout_s`.
-    fn register(
-        &mut self,
-        now: UnixSecs,
-        pool: &str,
-        machine: &str,
-        slot: u32,
-    ) -> Result<(), Error> {
+    /// If the file write or the command fails after GitHub issued the jit config, the
+    /// runner would stay `Registered`, hold its slot and count as supply until
+    /// `register_timeout_s`. It is noted instead, and the next tick deletes it and leaves
+    /// it out of the snapshot (`Memory::abandon`).
+    fn register(&mut self, t: &Tick, pool: &str, machine: &str, slot: u32) -> Result<(), Error> {
         let p = self.pool(pool)?;
+        let now = self.at(t);
         let name = github::runner_name(pool, machine, slot, now);
         let jit = self.gh.generate_jitconfig(&name, &p.labels)?;
         self.memory.mark_used(machine, now);
-        self.boat
-            .write_file(machine, &script::jit_path(slot), jit.expose())?;
-        self.boat
-            .exec_detached(machine, &script::start_command(slot))?;
+        let started = self
+            .boat
+            .write_file(machine, &script::jit_path(slot), jit.expose())
+            .and_then(|()| {
+                self.boat
+                    .exec_detached(machine, &script::start_command(slot))
+            });
+        if let Err(e) = started {
+            eprintln!("{name}: {e}; its registration is deleted next tick");
+            let at = self.at(t);
+            self.memory.abandon(name, machine, at);
+            return Err(e.into());
+        }
         Ok(())
     }
 
     fn resume(&mut self, t: &mut Tick, machine: &str) -> Result<(), Error> {
         match self.start(t, |b| b.resume(machine)) {
             Ok(()) => {
-                self.memory.resumed(machine, t.now);
+                let at = self.at(t);
+                self.memory.resumed(machine, at);
                 Ok(())
+            }
+            // boat may have resumed it, and charged for it, without an answer. Held as a
+            // resume in flight, it is not resumed again before the listing shows it.
+            Err(Error::Boat(e)) if e.may_have_applied() => {
+                let at = self.at(t);
+                self.memory.resumed(machine, at);
+                Err(e.into())
             }
             // boat deleted the disk of a machine that stayed stopped too long. It can never
             // resume, so delete it; the pool then forks a new one if it needs to.
@@ -432,7 +607,8 @@ impl Loop<'_> {
             |b: &boat::Client| b.fork(&p.snapshot, &p.machine_type, &p.name, job, ttl_s, &key);
         match self.start(t, forked) {
             Ok(id) => {
-                self.memory.forked(id, &p.name, job, t.now);
+                let at = self.at(t);
+                self.memory.forked(id, &p.name, job, at);
                 Ok(())
             }
             Err(e) => {
@@ -442,7 +618,8 @@ impl Loop<'_> {
                 // existed.
                 if matches!(&e, Error::Boat(b) if b.may_have_applied()) {
                     let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
-                    self.ledger.block_until(t.now.saturating_add(lag_s));
+                    let at = self.at(t);
+                    self.ledger.block_until(at.saturating_add(lag_s));
                 }
                 Err(e)
             }
@@ -461,7 +638,7 @@ impl Loop<'_> {
         let price = self.open_starts(t)?;
         match call(&self.boat) {
             Ok(v) => {
-                self.ledger.spent_cents = self.ledger.spent_cents.saturating_add(price);
+                self.ledger.book(price);
                 t.starts = Starts::Open {
                     price,
                     recheck: true,
@@ -469,13 +646,16 @@ impl Loop<'_> {
                 Ok(v)
             }
             Err(e @ boat::Error::Refused { retry_after_s, .. }) => {
-                self.ledger.block_until(t.now.saturating_add(retry_after_s));
+                let at = self.at(t);
+                self.ledger.block_until(at.saturating_add(retry_after_s));
                 t.starts = Starts::Closed;
                 Err(e.into())
             }
+            // Refused for this request, maybe for this pool alone; see `is_forbidden`.
+            Err(e) if e.is_forbidden() => Err(Error::PoolForbidden(e)),
             Err(e) => {
                 if e.may_have_applied() {
-                    self.ledger.spent_cents = self.ledger.spent_cents.saturating_add(price);
+                    self.ledger.book(price);
                     t.starts = Starts::Closed;
                 }
                 Err(e.into())
@@ -491,7 +671,11 @@ impl Loop<'_> {
             return Err(Error::StartsClosed);
         };
         if recheck {
-            match self.boat.limits() {
+            let quote = self.boat.limits();
+            if let Ok(q) = &quote {
+                self.ledger.quote_seen(q.cents);
+            }
+            match quote {
                 Ok(q) if q.allows && q.cents == price => {
                     let recheck = false;
                     t.starts = Starts::Open { price, recheck };
@@ -516,7 +700,7 @@ mod tests {
     use super::super::testkit::*;
     use super::*;
     use crate::decide::decide;
-    use crate::model::Pool;
+    use crate::model::{Placement, Pool};
     use crate::transport::NetworkError;
     use crate::transport::fake::{Fake, Reply, Sent, respond};
 
@@ -580,7 +764,44 @@ mod tests {
             .tick(NOW, |_, _| vec![fork(Some(70)), fork(Some(71))])
             .unwrap();
         assert_eq!(forks(&fake).len(), 1, "{:?}", requests(&fake));
-        assert_eq!(tick_loop.ledger.spent_cents, 125);
+        // The start may have cost the new 30 cents, so 5 more are booked.
+        assert_eq!(tick_loop.ledger.spent_cents, 130);
+    }
+
+    /// Cap 10 cents, four jobs queued. The observe quotes an included start, but someone
+    /// else on the account takes it first, and boat charges this fork the 5-cent paid
+    /// price. The quote read after it shows 5 cents, and the 5 are booked, so one more
+    /// paid start fits the cap and boat is paid 10 cents. Before, the fork was booked at
+    /// 0 and two more paid starts went out: 15 cents against a cap of 10.
+    #[test]
+    fn a_start_charged_above_its_quote_counts_against_the_cap() {
+        let mut cfg = config();
+        cfg.pools[0].paid_start_cents_per_day = 10;
+        let forked = std::cell::Cell::new(0);
+        let fake = Fake::new(move |s| {
+            if s.method == "POST" && s.url == format!("{BOAT}/sandboxes") {
+                forked.set(forked.get() + 1);
+            }
+            if s.url.ends_with("/v1/limits") {
+                let dollars = if forked.get() > 0 { "0.05" } else { "0" };
+                let body = format!(r#"{{"canStart":true,"nextStartDollars":{dollars}}}"#);
+                return respond(200, &[], &body);
+            }
+            let job = |id| {
+                format!(
+                    r#"{{"id":{id},"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}}"#
+                )
+            };
+            let jobs = [70, 71, 72, 73].map(job).join(",");
+            lagging_reply(s, "", &jobs)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.ledger.spent_cents = 0;
+        for k in 0..4 {
+            tick_loop.tick(NOW + 15 * k, decide).unwrap();
+        }
+        assert_eq!(forks(&fake).len(), 2, "{:?}", requests(&fake));
+        assert_eq!(tick_loop.ledger.spent_cents, 10);
     }
 
     #[test]
@@ -844,6 +1065,8 @@ mod tests {
             ];
             let mut tick = Tick {
                 now: NOW,
+                began: (tick_loop.clock)(),
+                skip: HashSet::new(),
                 snapshot: &observed.snapshot,
                 runner_ids: observed.runner_ids.clone(),
                 starts: Starts::Closed,
@@ -859,6 +1082,234 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every kind of action, each on its own machine or runner: Unregister of runner 14,
+    /// Delete of `bx_44444444` (runner 12, then the machine), Stop of `bx_22222222`
+    /// (runner 11, then the stop), Register on `bx_22222222`, Resume of `bx_33333333`
+    /// and a Fork. Each entry is a request and the action it belongs to.
+    const MATRIX: [(&str, &str); 12] = [
+        ("unregister", "DELETE GH/runners/14"),
+        ("delete", "DELETE GH/runners/12"),
+        ("delete", "DELETE BOAT/sandboxes/bx_44444444"),
+        ("stop", "DELETE GH/runners/11"),
+        ("stop", "POST BOAT/sandboxes/bx_22222222/stop"),
+        ("register", "GET BOAT/sandboxes/bx_22222222"),
+        ("register", "POST GH/runners/generate-jitconfig"),
+        ("register", "PUT BOAT/sandboxes/bx_22222222/files"),
+        ("register", "POST BOAT/sandboxes/bx_22222222/commands"),
+        ("resume", "POST BOAT/sandboxes/bx_33333333/resume"),
+        ("fork", "GET BOAT/limits"),
+        ("fork", "POST BOAT/sandboxes"),
+    ];
+
+    fn matrix_request(r: &str) -> String {
+        r.replace("GH", GH).replace("BOAT", BOAT)
+    }
+
+    /// The fatal-error matrix: boat answering 401, 402 or 403 and GitHub answering 401 or
+    /// 403 to the first call of each kind of action that reaches it. The loop ends (the
+    /// tick returns `Err`) for each but a 403 to a start, which backs that pool off. In
+    /// every case every other unregister, delete and stop is still sent, except the calls
+    /// of the failing action after the one that failed (`FixStaleAct`); after a fatal
+    /// error no register or start is sent.
+    #[test]
+    fn the_fatal_error_matrix() {
+        let cfg = config();
+        let actions = || {
+            vec![
+                unregister("sbr-ci-bx_77777777-0-900"),
+                delete("bx_44444444"),
+                stop("bx_22222222"),
+                register("bx_22222222", 1),
+                resume("bx_33333333"),
+                fork(None),
+            ]
+        };
+        for (service, status) in [
+            ("BOAT", 401),
+            ("BOAT", 402),
+            ("BOAT", 403),
+            ("GH", 401),
+            ("GH", 403),
+        ] {
+            // Each call to `service`, of every kind of action that makes one.
+            let calls = MATRIX
+                .iter()
+                .filter(|(_, r)| r.split(' ').nth(1).unwrap().starts_with(service));
+            for &(kind, target) in calls {
+                let target = matrix_request(target);
+                let fail = target.clone();
+                // The limits read is the fork's only after a start; the tick's own read
+                // must work, so only the second fails.
+                let limits_reads = std::cell::Cell::new(0);
+                let fake = Fake::new(move |s| {
+                    let r = format!("{} {}", s.method, s.url);
+                    if r.ends_with("/v1/limits") {
+                        limits_reads.set(limits_reads.get() + 1);
+                        if r == fail && limits_reads.get() > 1 {
+                            return respond(status, &[], r#"{"code":"x","message":"no"}"#);
+                        }
+                    } else if r == fail {
+                        return respond(status, &[], r#"{"code":"x","message":"no"}"#);
+                    }
+                    if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                        return respond(
+                            200,
+                            &[],
+                            r#"{"total_count":3,"runners":[
+                            {"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"online","busy":false},
+                            {"id":12,"name":"sbr-ci-bx_44444444-0-900","status":"offline","busy":false},
+                            {"id":14,"name":"sbr-ci-bx_77777777-0-900","status":"offline","busy":false}]}"#,
+                        );
+                    }
+                    reply(s)
+                });
+                let mut tick_loop = started(&cfg, &fake);
+                // Starts at 0 cents, so the resume and the fork both fit the budget.
+                tick_loop.ledger.spent_cents = 0;
+                let case = format!("{service} {status} on {kind} ({target})");
+                let result = tick_loop.tick(NOW, |_, _| actions());
+                // The start call itself, not the account-wide limits read before it.
+                let start = target.ends_with("/resume") || target.ends_with("/v1/sandboxes");
+                let ends = !(service == "BOAT" && status == 403 && start);
+                assert_eq!(result.is_err(), ends, "{case}: {result:?}");
+
+                let sent = requests(&fake);
+                let failed_at = MATRIX
+                    .iter()
+                    .position(|(_, r)| matrix_request(r) == target)
+                    .unwrap();
+                for (i, (k, r)) in MATRIX.iter().enumerate() {
+                    let r = matrix_request(r);
+                    let was_sent = sent.contains(&r);
+                    let cleanup = matches!(*k, "unregister" | "delete" | "stop");
+                    let same_after = *k == kind && i > failed_at;
+                    if r.ends_with("/v1/limits") {
+                        continue;
+                    }
+                    if i == failed_at {
+                        assert!(was_sent, "{case}: {r} not sent");
+                    } else if cleanup {
+                        assert_eq!(was_sent, !same_after, "{case}: {r}");
+                    } else if i > failed_at && ends {
+                        // After a fatal error nothing registers or starts.
+                        assert!(!was_sent, "{case}: {r} sent after a fatal error");
+                    }
+                }
+                if !ends {
+                    // A 403 to a start backs off the pool's starts, the other kind too.
+                    assert!(
+                        tick_loop
+                            .ledger
+                            .backing_off(&("ci".into(), StartKind::Fork), NOW + 1),
+                        "{case}"
+                    );
+                    assert!(
+                        tick_loop
+                            .ledger
+                            .backing_off(&("ci".into(), StartKind::Resume), NOW + 1),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// boat refuses pool `big`'s forks with a 403 (a machine type the plan does not
+    /// allow). Pool `ci` still forks, `big` backs off and the loop goes on.
+    #[test]
+    fn a_403_to_one_pools_start_backs_that_pool_off_only() {
+        let mut cfg = config();
+        let mut big = cfg.pools[0].clone();
+        big.name = "big".into();
+        big.machine_type = "xlarge".into();
+        cfg.pools.insert(0, big);
+        let fake = Fake::new(|s| {
+            if s.method == "POST"
+                && s.url == format!("{BOAT}/sandboxes")
+                && s.body_text().contains("xlarge")
+            {
+                let body =
+                    r#"{"code":"machine_type_not_allowed","message":"xlarge needs a higher plan"}"#;
+                respond(403, &[], body)
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.ledger.spent_cents = 0;
+        let both = |_: &Snapshot, p: &Pool| {
+            vec![Action::Fork {
+                pool: p.name.clone(),
+                job: None,
+            }]
+        };
+        let xlarge = |f: &Fake| {
+            forks(f)
+                .iter()
+                .filter(|s| s.body_text().contains("xlarge"))
+                .count()
+        };
+        tick_loop.tick(NOW, both).unwrap();
+        assert_eq!((xlarge(&fake), forks(&fake).len()), (1, 2));
+        // Within its wait `big` sends nothing; `ci` goes on.
+        tick_loop.tick(NOW + 15, both).unwrap();
+        assert_eq!((xlarge(&fake), forks(&fake).len()), (1, 3));
+        tick_loop.tick(NOW + REFUSED_MIN_S, both).unwrap();
+        assert_eq!(xlarge(&fake), 2);
+        let key = ("big".to_string(), StartKind::Fork);
+        assert_eq!(tick_loop.ledger.failing[&key].backoff_s, 2 * REFUSED_MIN_S);
+    }
+
+    /// GitHub issued the jit config, then the file write failed. The next tick deletes the
+    /// registration and leaves it out of the snapshot, so its slot takes a new runner at
+    /// once instead of after `register_timeout_s`.
+    #[test]
+    fn a_failed_start_deletes_its_registration_and_frees_the_slot() {
+        let cfg = config();
+        let writes = std::cell::Cell::new(0);
+        let jit_name = "sbr-ci-bx_22222222-1-1000";
+        let fake = Fake::new(move |s| {
+            if s.method == "PUT" {
+                writes.set(writes.get() + 1);
+                if writes.get() == 1 {
+                    return respond(500, &[], r#"{"code":"internal"}"#);
+                }
+            }
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                // GitHub lists the runner the failed start registered, never online.
+                let body = format!(
+                    r#"{{"total_count":2,"runners":[
+                    {{"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"online","busy":false}},
+                    {{"id":21,"name":"{jit_name}","status":"offline","busy":false}}]}}"#
+                );
+                return respond(200, &[], &body);
+            }
+            reply(s)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop
+            .tick(NOW, |_, _| vec![register("bx_22222222", 1)])
+            .unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        tick_loop
+            .tick(NOW + 15, |s, _| {
+                seen.borrow_mut()
+                    .extend(s.runners.iter().map(|r| r.name.clone()));
+                vec![register("bx_22222222", 1)]
+            })
+            .unwrap();
+        assert_eq!(*seen.borrow(), ["sbr-ci-bx_22222222-0-900"]);
+        let reqs = requests(&fake);
+        let deleted = reqs
+            .iter()
+            .position(|r| *r == format!("DELETE {GH}/runners/21"));
+        let second = reqs
+            .iter()
+            .rposition(|r| r.ends_with("/generate-jitconfig"));
+        assert!(deleted.is_some() && deleted < second, "{reqs:?}");
+        assert_eq!(registers(&fake), 2);
     }
 
     /// `bx_66666666` in pool ci, listed in `state`, a job's fork when `job`. boat says
@@ -931,7 +1382,7 @@ mod tests {
             assert_eq!((logins.count(&get), logins.count(&delete)), (1, 1));
             let f = &tick_loop.ledger.failing[&key];
             assert!(
-                f.logins && f.error.contains(r#"Snapshot "runner-base""#),
+                f.why == Why::Logins && f.error.contains(r#"Snapshot "runner-base""#),
                 "{}",
                 f.error
             );
@@ -943,7 +1394,7 @@ mod tests {
             // doubles it.
             tick_loop.tick(NOW + BACKOFF_MIN_S, fork_70).unwrap();
             assert_eq!(forks(&logins.fake).len(), 1);
-            assert!(tick_loop.ledger.failing[&key].logins);
+            assert!(tick_loop.ledger.failing[&key].why == Why::Logins);
             tick_loop.tick(NOW + 30, register_66).unwrap();
             assert_eq!(tick_loop.ledger.failing[&key].backoff_s, 2 * BACKOFF_MIN_S);
             assert_eq!(registers(&logins.fake), 0);
@@ -955,23 +1406,50 @@ mod tests {
         }
     }
 
-    /// A kept machine holding its creator's logins gets no runner and is not deleted. boat
-    /// is asked again once the machine has started again, which a `noEnv` resume scrubs.
+    /// A kept machine holding its creator's logins gets no runner. In a pool that cannot
+    /// resume nothing would ever scrub it, so it is deleted, and the pool's forks back off
+    /// as for a job's fork: before, `decide` asked for a runner on it every tick, none
+    /// came, and the pool's jobs starved while it billed until boat's 30-day TTL.
     #[test]
-    fn a_kept_machine_holding_logins_waits_for_its_next_start() {
-        let cfg = config();
+    fn a_kept_machine_holding_logins_in_a_pool_without_resume_is_deleted() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot];
+        let logins = Logins::new(false, Some(true));
+        let mut tick_loop = started(&cfg, &logins.fake);
+        let delete = format!("DELETE {BOAT}/sandboxes/bx_66666666");
+        tick_loop.tick(NOW, register_66).unwrap();
+        assert_eq!(registers(&logins.fake), 0);
+        assert_eq!(logins.count(&delete), 1);
+        let key = ("ci".to_string(), StartKind::Fork);
+        assert!(tick_loop.ledger.failing[&key].why == Why::Logins);
+        // A kept fork of the same snapshot waits too.
+        tick_loop.tick(NOW + 5, |_, _| vec![fork(None)]).unwrap();
+        assert!(forks(&logins.fake).is_empty());
+        tick_loop
+            .tick(NOW + BACKOFF_MIN_S, |_, _| vec![fork(None)])
+            .unwrap();
+        assert_eq!(forks(&logins.fake).len(), 1);
+    }
+
+    /// In a pool with resume, the kept machine is stopped instead: a `noEnv` resume scrubs
+    /// the logins, and the resumed machine takes a runner.
+    #[test]
+    fn a_kept_machine_holding_logins_in_a_pool_with_resume_is_stopped_and_resumed() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
         let logins = Logins::new(false, Some(true));
         let mut tick_loop = started(&cfg, &logins.fake);
         let get = format!("GET {BOAT}/sandboxes/bx_66666666");
+        let stop = format!("POST {BOAT}/sandboxes/bx_66666666/stop");
         tick_loop.tick(NOW, register_66).unwrap();
+        // boat still lists it up: it is not asked about or stopped again.
         tick_loop.tick(NOW + 15, register_66).unwrap();
-        assert_eq!(logins.count(&get), 1);
+        assert_eq!((logins.count(&get), logins.count(&stop)), (1, 1));
         assert_eq!(registers(&logins.fake), 0);
         assert_eq!(
             logins.count(&format!("DELETE {BOAT}/sandboxes/bx_66666666")),
             0
         );
-        assert!(tick_loop.ledger.failing.is_empty());
 
         *logins.state.borrow_mut() = ("archived", Some(true));
         tick_loop.tick(NOW + 30, |_, _| Vec::new()).unwrap();
@@ -979,5 +1457,6 @@ mod tests {
         tick_loop.tick(NOW + 45, register_66).unwrap();
         assert_eq!(logins.count(&get), 2);
         assert_eq!(registers(&logins.fake), 1);
+        assert!(tick_loop.ledger.failing.is_empty());
     }
 }

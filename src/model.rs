@@ -1,6 +1,8 @@
 //! Types shared by the policy file, `decide`, and the boat and GitHub clients.
 //! Names follow docs/design.md and spec/BoatRunner.tla.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub type UnixSecs = u64;
@@ -93,6 +95,9 @@ pub struct Machine {
     pub last_busy: UnixSecs,
     /// The job an ephemeral (forked) machine was made for; `None` for a kept machine.
     pub job: Option<JobKey>,
+    /// When this process last saw `job` queued; in memory only, `None` when it never did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_queued_at: Option<UnixSecs>,
 }
 
 impl Machine {
@@ -146,6 +151,10 @@ pub struct Snapshot {
     pub runners: Vec<Runner>,
     pub queued: Vec<QueuedJob>,
     pub limits: Limits,
+    /// When this process last saw a job queued that each pool serves first, by pool; in
+    /// memory only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub queued_at: BTreeMap<String, UnixSecs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

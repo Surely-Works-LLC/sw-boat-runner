@@ -105,7 +105,7 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
 | `register_timeout_s` | 900 | Time a runner may take to come online. Keep it above 600, the runner's wait for the snapshot copy. |
-| `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. |
+| `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. Keep it above `register_timeout_s` plus 300; `check` warns. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only included starts. |
 
 | Preset | Placement | Idle machines |

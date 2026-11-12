@@ -53,7 +53,9 @@ pub enum Error {
     /// 402: the wallet needs billing; nothing will start until a human acts.
     BillingRequired,
     /// 401 or 403: bad key, suspended org, or a machine type the plan does not allow.
+    /// `status` tells them apart: see `is_forbidden`.
     Unauthorized {
+        status: u16,
         code: String,
         message: String,
     },
@@ -70,6 +72,14 @@ impl Error {
     /// Errors that no later tick can fix.
     pub(crate) fn is_fatal(&self) -> bool {
         matches!(self, Error::BillingRequired | Error::Unauthorized { .. })
+    }
+
+    /// A 403. On a read it is the account's (a suspended org, a key without access), but
+    /// on a start it can be this request's alone: a `machine_type` the plan does not
+    /// allow refuses one pool's starts and nothing else. The caller tells them apart by
+    /// what it asked; a 403 for the whole account shows on the next tick's reads.
+    pub(crate) fn is_forbidden(&self) -> bool {
+        matches!(self, Error::Unauthorized { status: 403, .. })
     }
 
     /// Failures without a definite answer, so boat may have done what was asked: a
@@ -107,7 +117,7 @@ impl fmt::Display for Error {
             Error::Network(e) => return write!(f, "boat network error: {e}"),
             Error::Refused { code, message, .. } => ("refused the call".into(), code, message),
             Error::Conflict { code, message } => ("conflict".into(), code, message),
-            Error::Unauthorized { code, message } => ("unauthorized".into(), code, message),
+            Error::Unauthorized { code, message, .. } => ("unauthorized".into(), code, message),
             Error::Other {
                 status,
                 code,
@@ -892,7 +902,11 @@ pub(crate) fn map_error(resp: &Response) -> Error {
         },
         409 => Error::Conflict { code, message },
         402 => Error::BillingRequired,
-        401 | 403 => Error::Unauthorized { code, message },
+        401 | 403 => Error::Unauthorized {
+            status: resp.status,
+            code,
+            message,
+        },
         404 => Error::NotFound,
         status => Error::Other {
             status,
@@ -972,6 +986,9 @@ mod tests {
         assert!(err(402, &[], r#"{"code":"billing_required"}"#).is_fatal());
         assert!(err(401, &[], r#"{"code":"unauthorized"}"#).is_fatal());
         assert!(err(403, &[], r#"{"code":"org_suspended"}"#).is_fatal());
+        assert!(err(403, &[], r#"{"code":"machine_type_not_allowed"}"#).is_forbidden());
+        assert!(!err(401, &[], r#"{"code":"unauthorized"}"#).is_forbidden());
+        assert!(!err(402, &[], r#"{"code":"billing_required"}"#).is_forbidden());
         assert_eq!(err(404, &[], ""), Error::NotFound);
         assert_eq!(
             err(500, &[], r#"{"code":"internal","message":"boom"}"#),

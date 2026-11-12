@@ -1,0 +1,104 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_c1",
+      "pool": "ci",
+      "state": "up",
+      "since": 999900,
+      "last_busy": 999899,
+      "job": {
+        "id": 21,
+        "attempt": 1
+      },
+      "job_queued_at": 999900
+    },
+    {
+      "id": "bx_c2",
+      "pool": "ci",
+      "state": "up",
+      "since": 999900,
+      "last_busy": 999950,
+      "job": {
+        "id": 22,
+        "attempt": 1
+      },
+      "job_queued_at": 999900
+    },
+    {
+      "id": "bx_c3",
+      "pool": "ci",
+      "state": "up",
+      "since": 999900,
+      "last_busy": 1000000,
+      "job": {
+        "id": 23,
+        "attempt": 1
+      },
+      "job_queued_at": 999900
+    },
+    {
+      "id": "bx_c4",
+      "pool": "ci",
+      "state": "up",
+      "since": 999970,
+      "last_busy": 999969,
+      "job": {
+        "id": 24,
+        "attempt": 1
+      },
+      "job_queued_at": 999990
+    },
+    {
+      "id": "bx_c5",
+      "pool": "ci",
+      "state": "starting",
+      "since": 999990,
+      "last_busy": 999989,
+      "job": {
+        "id": 25,
+        "attempt": 1
+      },
+      "job_queued_at": 1000000
+    }
+  ],
+  "runners": [
+    {
+      "name": "sbr-ci-bx_c2-0-999950",
+      "pool": "ci",
+      "machine": "bx_c2",
+      "slot": 0,
+      "registered_at": 999950,
+      "state": "registered"
+    },
+    {
+      "name": "sbr-ci-bx_c3-0-999900",
+      "pool": "ci",
+      "machine": "bx_c3",
+      "slot": 0,
+      "registered_at": 999900,
+      "state": "busy"
+    }
+  ],
+  "queued": [
+    {
+      "key": {
+        "id": 25,
+        "attempt": 1
+      },
+      "labels": [
+        "self-hosted",
+        "Linux",
+        "pool-a"
+      ]
+    }
+  ],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  },
+  "queued_at": {
+    "ci": 1000000
+  }
+}

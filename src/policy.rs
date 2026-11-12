@@ -130,17 +130,29 @@ const MAX_DERIVED_NAME: usize = 24;
 
 /// Settings that are valid but likely to waste starts, for `check` to print.
 pub fn warnings(cfg: &Config) -> Vec<String> {
-    cfg.pools
-        .iter()
-        .filter(|p| p.register_timeout_s <= HOME_WAIT_S)
-        .map(|p| {
-            format!(
+    let mut out = Vec::new();
+    for p in &cfg.pools {
+        if p.register_timeout_s <= HOME_WAIT_S {
+            out.push(format!(
                 "pool {:?}: register_timeout_s ({}) is not above the {HOME_WAIT_S}s a runner \
                  may wait for boat's snapshot copy, so a slow copy unregisters it",
                 p.name, p.register_timeout_s
-            )
-        })
-        .collect()
+            ));
+        }
+        // boat archives a job's fork at `fork_ttl_s` from its create, so a TTL that does
+        // not cover the boot and the runner's `register_timeout_s` can end a fork before
+        // its runner takes the job. A warning, not an error: a policy that loaded before
+        // keeps loading.
+        if p.fork_ttl_s <= p.register_timeout_s.saturating_add(FORK_TTL_MARGIN_S) {
+            out.push(format!(
+                "pool {:?}: fork_ttl_s ({}) is not above register_timeout_s ({}) plus \
+                 {FORK_TTL_MARGIN_S}s for the boot, so a fork can expire before its runner \
+                 comes online",
+                p.name, p.fork_ttl_s, p.register_timeout_s
+            ));
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -221,6 +233,9 @@ impl RawPool {
         }
     }
 }
+
+/// What `fork_ttl_s` must leave a fork beyond `register_timeout_s`, for its boot.
+const FORK_TTL_MARGIN_S: u64 = 300;
 
 fn validate(p: &Pool) -> Result<(), String> {
     // Runner names are `sbr-<pool>-<machine>-...`. `github::parse_runner_name` would read a
@@ -473,6 +488,24 @@ max_boxes = 4
             w[0].contains("pool \"ci\"") && w[0].contains("600"),
             "{w:?}"
         );
+    }
+
+    /// A `fork_ttl_s` too short for `register_timeout_s` still loads, so a policy from an
+    /// earlier release never stops the daemon after an upgrade; `check` and `run` warn.
+    #[test]
+    fn a_short_fork_ttl_loads_with_a_warning() {
+        for (extra, ttl, timeout) in [
+            ("fork_ttl_s = 1200", 1200, 900),
+            ("register_timeout_s = 3400", 3600, 3400),
+        ] {
+            let cfg = parse(&policy(extra)).unwrap();
+            let w = warnings(&cfg);
+            let want =
+                format!("fork_ttl_s ({ttl}) is not above register_timeout_s ({timeout}) plus 300s");
+            assert!(w.iter().any(|w| w.contains(&want)), "{w:?}");
+        }
+        let ok = parse(&policy("fork_ttl_s = 1201")).unwrap();
+        assert!(warnings(&ok).is_empty());
     }
 
     /// The cells of each row of a Markdown table whose first cell is a `code` name.

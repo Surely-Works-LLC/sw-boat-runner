@@ -1,0 +1,10 @@
+# Pins: Delete orphaned: a fork with no runner goes 60 s after its job was last seen queued; one with a Registered runner waits for the pool to have no queued job, a Busy one and one whose job left the queue a moment ago stay.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "Linux", "pool-a"]
+machine_type = "xlarge"
+snapshot = "snap-1"
+preset = "fork"
+max_boxes = 8

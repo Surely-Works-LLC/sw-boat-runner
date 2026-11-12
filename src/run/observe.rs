@@ -14,7 +14,20 @@ use crate::model::{
 pub(super) struct Observed {
     pub snapshot: Snapshot,
     pub runner_ids: HashMap<String, u64>,
+    /// Runners whose start failed, still listed and never online; left out of `snapshot`.
+    pub abandoned: Vec<Abandoned>,
 }
+
+/// A runner GitHub issued a jit config for whose file write or start command then failed.
+pub(super) struct Abandoned {
+    pub name: String,
+    pub id: u64,
+    pub machine: String,
+}
+
+/// How far ahead of a job fork's `fork_ttl_s` a `Busy` runner on it is warned about, at
+/// most: boat archives the machine at its TTL, job or no job.
+const TTL_WARN_S: u64 = 600;
 
 /// What boat and GitHub do not report, kept from tick to tick. Only this module writes it.
 #[derive(Default)]
@@ -27,6 +40,15 @@ pub(super) struct Memory {
     inflight: Vec<Inflight>,
     /// Whether an observe has succeeded since this process started.
     warm: bool,
+    /// Runners whose start failed, by name: their machine and when they were noted.
+    abandoned: HashMap<String, (String, UnixSecs)>,
+    /// Job forks already warned about for a `Busy` runner near their TTL.
+    ttl_warned: HashSet<String>,
+    /// When each job a listed fork was made for was last seen queued (`decide`'s
+    /// `orphaned` times its grace from it).
+    queued_seen: HashMap<JobKey, UnixSecs>,
+    /// When a job each pool serves first was last seen queued, by pool.
+    pool_queued: std::collections::BTreeMap<String, UnixSecs>,
 }
 
 struct Seen {
@@ -85,6 +107,27 @@ impl Memory {
         }
     }
 
+    /// Notes a runner whose start failed after GitHub issued its jit config. While GitHub
+    /// lists it and it has never been online, it is left out of the snapshot, so its slot
+    /// is free and it covers no job, and `act` deletes it. One that comes online after all
+    /// (a start command that ran without an answer) is a runner like any other.
+    pub(super) fn abandon(&mut self, name: String, machine: &str, now: UnixSecs) {
+        self.abandoned.insert(name, (machine.to_string(), now));
+    }
+
+    /// `act` deleted the runner, or GitHub has no such runner.
+    pub(super) fn forget_abandoned(&mut self, name: &str) {
+        self.abandoned.remove(name);
+    }
+
+    /// Whether `machine` has had no `Busy` or `Registered` runner, and no `Register`,
+    /// since `t`.
+    pub(super) fn idle_since(&self, machine: &str, t: UnixSecs) -> bool {
+        self.machines
+            .get(machine)
+            .is_some_and(|seen| seen.last_busy < t)
+    }
+
     /// Whether `machine` was found holding its creator's logins since it last changed state.
     pub(super) fn holds_logins(&self, machine: &str) -> bool {
         self.machines
@@ -103,11 +146,16 @@ impl Memory {
     fn runners(
         &mut self,
         cfg: &Config,
+        now: UnixSecs,
+        lag_s: u64,
         listed: Vec<GhRunner>,
-    ) -> (Vec<Runner>, HashMap<String, u64>) {
+    ) -> (Vec<Runner>, HashMap<String, u64>, Vec<Abandoned>) {
         let mut ids = HashMap::new();
         let mut runners = Vec::new();
+        let mut abandoned = Vec::new();
+        let mut listed_names = HashSet::new();
         for r in listed {
+            listed_names.insert(r.name.clone());
             let Some(n) = github::parse_runner_name(&r.name) else {
                 continue;
             };
@@ -119,6 +167,18 @@ impl Memory {
                 self.online.insert(r.name.clone());
             }
             let state = github::runner_state(online, r.busy, self.online.contains(&r.name));
+            if let Some((machine, _)) = self.abandoned.get(&r.name) {
+                if state == RunnerState::Registered {
+                    abandoned.push(Abandoned {
+                        name: r.name,
+                        id: r.id,
+                        machine: machine.clone(),
+                    });
+                    continue;
+                }
+                eprintln!("warn: {} came online after its start failed; kept", r.name);
+                self.abandoned.remove(&r.name);
+            }
             ids.insert(r.name.clone(), r.id);
             runners.push(Runner {
                 name: r.name,
@@ -130,7 +190,42 @@ impl Memory {
             });
         }
         self.online.retain(|name| ids.contains_key(name));
-        (runners, ids)
+        // One GitHub has not listed within a request timeout and a tick is gone.
+        self.abandoned.retain(|name, (_, noted)| {
+            listed_names.contains(name) || now.saturating_sub(*noted) <= lag_s
+        });
+        (runners, ids, abandoned)
+    }
+
+    /// Warns, once per machine, about a job fork whose `Busy` runner may outlast its TTL:
+    /// boat archives the machine then and the job fails. `since` is when boat first listed
+    /// it up, after its create, so the warning can only come late, not early.
+    fn warn_near_ttl(&mut self, cfg: &Config, now: UnixSecs, snap: &Snapshot) {
+        for m in &snap.machines {
+            let Some(pool) = cfg.pools.iter().find(|p| p.name == m.pool) else {
+                continue;
+            };
+            let busy = snap
+                .runners
+                .iter()
+                .any(|r| r.machine == m.id && r.state == RunnerState::Busy);
+            let window = TTL_WARN_S.min(pool.fork_ttl_s / 5);
+            let age = now.saturating_sub(m.since);
+            let near = m.is_ephemeral()
+                && m.state == MachineState::Up
+                && busy
+                && age >= pool.fork_ttl_s.saturating_sub(window);
+            if near && self.ttl_warned.insert(m.id.clone()) {
+                eprintln!(
+                    "warn: {} in pool {} runs a job {age}s after it came up; boat archives \
+                     it at fork_ttl_s ({}s) from its create, job or no job. Raise fork_ttl_s \
+                     if jobs run this long",
+                    m.id, m.pool, pool.fork_ttl_s
+                );
+            }
+        }
+        let listed: HashSet<&str> = snap.machines.iter().map(|m| m.id.as_str()).collect();
+        self.ttl_warned.retain(|id| listed.contains(id.as_str()));
     }
 
     /// boat's listing, by pool, with when each machine changed state and was last busy,
@@ -178,6 +273,7 @@ impl Memory {
                     pool,
                     state,
                     job,
+                    job_queued_at: job.and_then(|j| self.queued_seen.get(&j).copied()),
                 }
             })
             .collect();
@@ -223,10 +319,26 @@ impl Memory {
                     since: s.sent,
                     last_busy: s.sent.saturating_sub(1),
                     job: *job,
+                    job_queued_at: job.and_then(|j| self.queued_seen.get(&j).copied()),
                 }),
             }
         }
+        let jobs: HashSet<JobKey> = machines.iter().filter_map(|m| m.job).collect();
+        self.queued_seen.retain(|j, _| jobs.contains(j));
         machines
+    }
+
+    /// Notes that `queued` were seen queued at `now`, each job for the first pool in the
+    /// file that serves it, as `run::plan` routes it.
+    fn saw_queued(&mut self, cfg: &Config, now: UnixSecs, queued: &[crate::model::QueuedJob]) {
+        for j in queued {
+            self.queued_seen.insert(j.key, now);
+            if let Some(p) = cfg.pools.iter().find(|p| p.serves(&j.labels)) {
+                self.pool_queued.insert(p.name.clone(), now);
+            }
+        }
+        self.pool_queued
+            .retain(|name, _| cfg.pools.iter().any(|p| &p.name == name));
     }
 }
 
@@ -254,9 +366,12 @@ impl Loop<'_> {
             Vec::new()
         };
         let quote = self.boat.limits()?;
+        self.ledger.quote_seen(quote.cents);
 
-        let (runners, runner_ids) = self.memory.runners(self.cfg, gh_runners);
         let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
+        let (runners, runner_ids, abandoned) =
+            self.memory.runners(self.cfg, now, lag_s, gh_runners);
+        self.memory.saw_queued(self.cfg, now, &queued);
         let machines = self.memory.machines(now, lag_s, listed, &runners);
         let limits = Limits {
             can_start: quote.allows && self.ledger.starts_open(now),
@@ -270,10 +385,17 @@ impl Loop<'_> {
             runners,
             queued,
             limits,
+            queued_at: self.memory.pool_queued.clone(),
         };
+        self.memory.warn_near_ttl(self.cfg, now, &snapshot);
+        self.last_observe = Some(super::LastObserve {
+            at: now,
+            runners: snapshot.runners.clone(),
+        });
         Ok(Observed {
             snapshot,
             runner_ids,
+            abandoned,
         })
     }
 }
@@ -397,6 +519,74 @@ mod tests {
         assert_eq!(resumes(&fake), 1);
         tick_loop.tick(NOW + lag_s + 1, decide).unwrap();
         assert_eq!(resumes(&fake), 2);
+    }
+
+    /// The resume of `bx_33333333` timed out: boat may have resumed it, and charged for
+    /// it. boat still lists it archived on the next tick, which must not resume it again.
+    #[test]
+    fn a_resume_without_an_answer_is_not_resumed_again() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        cfg.pools[0].paid_start_cents_per_day = 0;
+        let fake = crate::transport::fake::Fake::failing(|s| {
+            if s.url.ends_with("/resume") {
+                return Err(crate::transport::NetworkError(
+                    "timed out reading response".into(),
+                ));
+            }
+            Ok(lagging_reply(s, ARCHIVED_33, JOB_70))
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop.tick(NOW + 15, decide).unwrap();
+        assert_eq!(resumes(&fake), 1);
+        assert_eq!(
+            observed(&mut tick_loop, NOW + 30),
+            [("bx_33333333".to_string(), MachineState::Starting)]
+        );
+    }
+
+    /// The tick began at `NOW`, but each request took 30 s, so boat answered the fork at
+    /// `NOW + 210`. The fork waits for its listing from then, not from `NOW`.
+    #[test]
+    fn a_fork_is_timed_from_its_answer_not_from_the_tick() {
+        let cfg = config();
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let e = elapsed.clone();
+        let fake = crate::transport::fake::Fake::new(move |s| {
+            e.set(e.get() + 30);
+            lagging_reply(s, "", JOB_70)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let e = elapsed.clone();
+        tick_loop.clock = Box::new(move || std::time::Duration::from_secs(e.get()));
+        tick_loop.tick(NOW, |_, _| vec![fork(Some(70))]).unwrap();
+        // Six reads, then the fork, whose answer came 7 × 30 s after the tick began.
+        assert_eq!(pending_forks(&tick_loop), [NOW + 210]);
+    }
+
+    /// A job fork whose runner is still `Busy` 10 minutes before `fork_ttl_s` is warned
+    /// about once: boat archives it at its TTL, job or no job.
+    #[test]
+    fn a_busy_fork_near_its_ttl_is_warned_about_once() {
+        let cfg = config();
+        let fake = crate::transport::fake::Fake::new(|s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                let body = r#"{"total_count":1,"runners":[
+                    {"id":15,"name":"sbr-ci-bx_66666666-0-900","status":"online","busy":true}]}"#;
+                return crate::transport::fake::respond(200, &[], body);
+            }
+            let fork = r#"{"id":"bx_66666666","state":"running",
+                "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}"#;
+            lagging_reply(s, fork, "")
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let warned = |l: &Loop| l.memory.ttl_warned.contains("bx_66666666");
+        observed(&mut tick_loop, NOW);
+        observed(&mut tick_loop, NOW + 2_999);
+        assert!(!warned(&tick_loop));
+        observed(&mut tick_loop, NOW + 3_000);
+        assert!(warned(&tick_loop));
     }
 
     #[test]
