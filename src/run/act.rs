@@ -694,9 +694,16 @@ impl Loop<'_> {
             self.memory.abandon(name, machine, at);
             return Err(e.into());
         }
-        // The name and machine only: the jit config is a secret.
+        // The name, machine and queue only: the jit config is a secret.
+        let queue = match self
+            .memory
+            .queue_wait(self.cfg, pool, &t.snapshot.queued, now)
+        {
+            Some((jobs, wait)) => format!(": {jobs} queued, oldest {wait}s"),
+            None => String::new(),
+        };
         self.log(format_args!(
-            "register {name} on {machine} (pool {pool}, slot {slot})"
+            "register {name} on {machine} (pool {pool}, slot {slot}){queue}"
         ));
         Ok(())
     }
@@ -1635,7 +1642,10 @@ mod tests {
         tick_loop.tick(NOW + 15, decide).unwrap();
         assert_eq!(
             log.take(),
-            ["register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0)"]
+            [
+                "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
+              oldest 15s"
+            ]
         );
         // The runner ran its job and is gone, so the fork is finished.
         tick_loop.tick(NOW + 30, decide).unwrap();
@@ -1644,6 +1654,34 @@ mod tests {
         tick_loop.tick(NOW + 45, decide).unwrap();
         assert_eq!(log.take(), Vec::<String>::new());
         assert_eq!(registers(&fake), 1);
+    }
+
+    /// A runner this process registered logs once, when GitHub first lists it online, how
+    /// long it took from its register; one registered before the process started does not.
+    #[test]
+    fn logs_when_a_runner_it_registered_comes_online() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                return respond(
+                    200,
+                    &[],
+                    r#"{"total_count":2,"runners":[
+                        {"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"online","busy":true},
+                        {"id":14,"name":"sbr-ci-bx_22222222-1-980","status":"online","busy":true}]}"#,
+                );
+            }
+            reply(s)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let log = capture_log(&mut tick_loop);
+        tick_loop.observe(NOW).unwrap();
+        assert_eq!(
+            log.take(),
+            ["online sbr-ci-bx_22222222-1-980 20s after its register"]
+        );
+        tick_loop.observe(NOW + 15).unwrap();
+        assert_eq!(log.take(), Vec::<String>::new());
     }
 
     /// `drain` gives every delete and unregister the reason `drain`.
