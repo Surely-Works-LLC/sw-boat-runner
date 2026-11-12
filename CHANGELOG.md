@@ -109,7 +109,7 @@ All notable changes to this project are documented here. The format follows
 ### Added
 
 - `setup --remote` stops when a boat machine already runs the daemon for the
-  repository (labelled `sw-boat-runner-daemon`, or named `sw-boat-runner <repo>`), and
+  repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
   `--replace` deletes that machine once the new one's service is active.
 - A rerun of `setup` with a stored or given GitHub App checks that the App is installed
   on the policy's repository before it writes anything, and uses the installation

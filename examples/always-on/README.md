@@ -9,7 +9,7 @@ can reuse machines across runs.
 `sw-boat-runner setup --remote` does all of the below from a macOS or Linux computer
 with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to
 (`boat api-key create` makes a key). First it lists your boat machines and stops if one
-already runs the daemon for the repository: one labelled `sw-boat-runner-daemon` for it,
+already runs the daemon for the repository: one labelled `sw-boat-runner-host` for it,
 or called `sw-boat-runner <owner>/<name>`. Keep that one, delete it with
 `boat delete <id> --yes`, or pass `--replace`, which deletes it once the new machine's
 service is active. Then:

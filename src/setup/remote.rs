@@ -27,7 +27,7 @@ const MACHINE_NAME: &str = "sw-boat-runner";
 /// Label holding this run's id, so a machine whose create got no answer can be found.
 const RUN_LABEL: &str = "sw-boat-runner-daemon-run";
 /// Label marking the daemon machine of one repository, with `repo_key` as its value.
-const DAEMON_LABEL: &str = "sw-boat-runner-daemon";
+const HOST_LABEL: &str = "sw-boat-runner-host";
 /// The directory on the machine that holds the secrets until install.sh has run.
 const STAGE: &str = "$HOME/.sbr-setup";
 const REPO: &str = "Surely-Works-LLC/sw-boat-runner";
@@ -613,7 +613,7 @@ fn create_machine(boat: &boat::Client, repo: &str, io: &mut dyn Io) -> Result<St
         machine_type: MACHINE_TYPE.into(),
         ttl_s: None,
         no_env: false,
-        labels: BTreeMap::from([(RUN_LABEL, run_id.clone()), (DAEMON_LABEL, repo_key(repo))]),
+        labels: BTreeMap::from([(RUN_LABEL, run_id.clone()), (HOST_LABEL, repo_key(repo))]),
         name: format!("{MACHINE_NAME} {repo}"),
     };
     let key = format!("sw-boat-runner-daemon-{run_id}");
@@ -651,7 +651,7 @@ fn kept(id: &str) -> String {
     )
 }
 
-/// The `DAEMON_LABEL` value for `repo`: hex, which boat takes as a label value, of the
+/// The `HOST_LABEL` value for `repo`: hex, which boat takes as a label value, of the
 /// repository's name without case, as GitHub compares it.
 fn repo_key(repo: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, repo.to_lowercase().as_bytes());
@@ -668,7 +668,7 @@ struct Daemon {
     state: String,
 }
 
-/// The daemon machines `setup --remote` made for `repo`: by `DAEMON_LABEL`, or, for
+/// The daemon machines `setup --remote` made for `repo`: by `HOST_LABEL`, or, for
 /// those made before the label, by the name it gives them. From `boat list --all --json`,
 /// and boat's label search when that list is cut short.
 fn existing_daemons(boat: &boat::Client, repo: &str) -> Result<Vec<Daemon>, String> {
@@ -690,7 +690,7 @@ fn existing_daemons(boat: &boat::Client, repo: &str) -> Result<Vec<Daemon>, Stri
     let mut found = daemons_in(&listed, repo);
     if listed["pageInfo"]["hasMore"] == Value::Bool(true) {
         let labelled = boat
-            .list_labelled(DAEMON_LABEL, &repo_key(repo))
+            .list_labelled(HOST_LABEL, &repo_key(repo))
             .map_err(|e| format!("look for a daemon machine for {repo}: {e}"))?;
         for m in labelled {
             if !gone(&m.state) && !found.iter().any(|d| d.id == m.id) {
@@ -717,7 +717,7 @@ fn daemons_in(listed: &Value, repo: &str) -> Vec<Daemon> {
         .into_iter()
         .flatten()
         .filter(|m| {
-            m["labels"][DAEMON_LABEL].as_str() == Some(key.as_str())
+            m["labels"][HOST_LABEL].as_str() == Some(key.as_str())
                 || m["name"]
                     .as_str()
                     .is_some_and(|n| n.eq_ignore_ascii_case(&name))
@@ -1049,7 +1049,7 @@ mod tests {
             "pageInfo": {"hasMore": false},
             "sandboxes": [
                 {"id": "bx_aaaaaaaa", "state": "idle", "name": "renamed",
-                 "labels": {DAEMON_LABEL: key}},
+                 "labels": {HOST_LABEL: key}},
                 // Made before the label: found by name.
                 {"id": "bx_bbbbbbbb", "state": "stopped", "name": "sw-boat-runner acme/app",
                  "labels": {}},
@@ -1057,6 +1057,9 @@ mod tests {
                 {"id": "bx_dddddddd", "state": "idle", "name": "sw-boat-runner acme/app2"},
                 {"id": "bx_eeeeeeee", "state": "idle", "name": "mjth-ci",
                  "labels": {"sw-boat-runner": "acme"}},
+                // A pool fork with the daemon-identity label of #36: not a host.
+                {"id": "bx_ffffffff", "state": "idle", "name": "acme-ci",
+                 "labels": {"sw-boat-runner-daemon": key}},
             ]
         });
         let found = daemons_in(&listed, "acme/app");
