@@ -93,7 +93,9 @@ impl App {
         now.saturating_add_signed(self.skew.get())
     }
 
-    /// Learns GitHub's clock from the `Date` of an answer received at `now`.
+    /// Learns GitHub's clock from the `Date` of an answer received at `now`, which must be
+    /// the time the answer arrived, not when its tick began: a slow request would read as
+    /// skew.
     pub(crate) fn note_date(&self, now: UnixSecs, date: Option<&str>) {
         let Some(server) = date.and_then(parse_http_date) else {
             return;
@@ -132,14 +134,26 @@ impl App {
     /// The installation token, minted again when none is held or it expires within
     /// `REFRESH_EARLY_S` of `now` (on GitHub's clock). A JWT GitHub refuses for its time
     /// is signed again once on the clock of GitHub's answer.
+    #[cfg(test)]
     pub(crate) fn token(
         &mut self,
         t: &dyn Transport,
         repo: &str,
         now: UnixSecs,
     ) -> Result<String, Error> {
+        self.token_at(t, repo, &|| now)
+    }
+
+    /// `token` with `now` read at each step, so a JWT is signed, and each answer's `Date`
+    /// compared, at the time it happens.
+    pub(crate) fn token_at(
+        &mut self,
+        t: &dyn Transport,
+        repo: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<String, Error> {
         if let Some(held) = &self.token {
-            if self.github_now(now).saturating_add(REFRESH_EARLY_S) < held.expires {
+            if self.github_now(now()).saturating_add(REFRESH_EARLY_S) < held.expires {
                 return Ok(held.token.clone());
             }
         }
@@ -158,9 +172,9 @@ impl App {
         &mut self,
         t: &dyn Transport,
         repo: &str,
-        now: UnixSecs,
+        now: &dyn Fn() -> UnixSecs,
     ) -> Result<Installation, Error> {
-        let jwt = self.jwt(now)?;
+        let jwt = self.jwt(now())?;
         let installation = match self.installation {
             Some(id) => id,
             None => {
@@ -186,7 +200,7 @@ impl App {
         }
         let jwt = self.jwt(now)?;
         let url = format!("{API}/repos/{repo}/installation");
-        let (status, body) = self.send(t, "GET", &url, &jwt, None, now)?;
+        let (status, body) = self.send(t, "GET", &url, &jwt, None, &|| now)?;
         match status {
             200..=299 => serde_json::from_slice::<Out>(&body)
                 .map(|out| Some(out.id))
@@ -220,7 +234,7 @@ impl App {
         let jwt = self.jwt(now)?;
         let url = format!("{API}/app/installations/{installation}");
         let what = format!("read installation {installation}");
-        let body = self.call(t, "GET", &url, &jwt, None, &what, now)?;
+        let body = self.call(t, "GET", &url, &jwt, None, &what, &|| now)?;
         serde_json::from_slice::<Out>(&body)
             .map(|out| out.permissions)
             .map_err(|_| Error::Parse("installation response".into()))
@@ -242,7 +256,7 @@ impl App {
         t: &dyn Transport,
         jwt: &str,
         repo: &str,
-        now: UnixSecs,
+        now: &dyn Fn() -> UnixSecs,
     ) -> Result<u64, Error> {
         #[derive(Deserialize)]
         struct Out {
@@ -264,7 +278,7 @@ impl App {
         jwt: &str,
         installation: u64,
         repo: &str,
-        now: UnixSecs,
+        now: &dyn Fn() -> UnixSecs,
     ) -> Result<Installation, Error> {
         #[derive(Deserialize)]
         struct Out {
@@ -304,7 +318,7 @@ impl App {
         jwt: &str,
         body: Option<&Value>,
         what: &str,
-        now: UnixSecs,
+        now: &dyn Fn() -> UnixSecs,
     ) -> Result<Vec<u8>, Error> {
         let (status, body) = self.send(t, method, url, jwt, body, now)?;
         if (200..300).contains(&status) {
@@ -336,7 +350,7 @@ impl App {
         url: &str,
         jwt: &str,
         body: Option<&Value>,
-        now: UnixSecs,
+        now: &dyn Fn() -> UnixSecs,
     ) -> Result<(u16, Vec<u8>), Error> {
         let auth = format!("Bearer {jwt}");
         let mut headers = vec![
@@ -352,7 +366,7 @@ impl App {
         let resp = t
             .send(method, url, &headers, bytes.as_deref())
             .map_err(|e| Error::Network(e.0))?;
-        self.note_date(now, resp.header("date"));
+        self.note_date(now(), resp.header("date"));
         Ok((resp.status, resp.body))
     }
 }

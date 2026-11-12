@@ -341,6 +341,10 @@ pub(crate) struct Client<'t> {
     /// The cache was aged since `begin_tick`. Aging waits for the tick's first request, so
     /// a tick that sends nothing, such as one the budget skips, keeps every ETag.
     aged: bool,
+    /// Seconds on a monotonic clock, and its reading at `begin_tick`, so the time an
+    /// answer arrives is `now` plus what the tick has taken so far.
+    elapsed: Box<dyn Fn() -> u64>,
+    tick_mark: u64,
 }
 
 impl<'t> Client<'t> {
@@ -366,7 +370,19 @@ impl<'t> Client<'t> {
             },
             runs: HashMap::new(),
             aged: true,
+            elapsed: {
+                let origin = std::time::Instant::now();
+                Box::new(move || origin.elapsed().as_secs())
+            },
+            tick_mark: 0,
         }
+    }
+
+    /// A client whose monotonic clock is `elapsed`, for tests of slow requests.
+    #[cfg(test)]
+    fn with_clock(mut self, elapsed: impl Fn() -> u64 + 'static) -> Self {
+        self.elapsed = Box::new(elapsed);
+        self
     }
 
     /// Sets the clock and refills the budget. The tick's first request then drops cached
@@ -374,6 +390,7 @@ impl<'t> Client<'t> {
     /// one observe's URLs, and a tick that sends nothing ages nothing.
     pub(crate) fn begin_tick(&mut self, now: UnixSecs) {
         self.now = now;
+        self.tick_mark = (self.elapsed)();
         self.aged = false;
         self.budget.refill(now);
     }
@@ -458,7 +475,8 @@ impl<'t> Client<'t> {
         }
 
         if let Auth::App(app) = &self.auth {
-            app.note_date(self.now, resp.header("date"));
+            let arrived = self.now + (self.elapsed)().saturating_sub(self.tick_mark);
+            app.note_date(arrived, resp.header("date"));
         }
         let remaining = resp.number("x-ratelimit-remaining");
         let retry_after = resp.number("retry-after");
@@ -548,7 +566,11 @@ impl<'t> Client<'t> {
     ) -> Result<Response, Error> {
         let token = match &mut self.auth {
             Auth::Token(token) => token.clone(),
-            Auth::App(app) => app.token(self.t, &self.repo, self.now)?,
+            Auth::App(app) => {
+                let (now, mark, elapsed) = (self.now, self.tick_mark, &self.elapsed);
+                let at = || now + elapsed().saturating_sub(mark);
+                app.token_at(self.t, &self.repo, &at)?
+            }
         };
         let auth = format!("Bearer {token}");
         let mut headers = vec![
@@ -1690,5 +1712,61 @@ mod tests {
         assert!(matches!(err, Error::Clock(_)), "{err:?}");
         assert!(!err.is_fatal());
         assert_eq!(fake.sent().len(), 1);
+    }
+
+    /// Skew is measured when an answer arrives, not when its tick began: after a tick of
+    /// slow requests, the next tick's JWT is not signed in GitHub's future.
+    #[test]
+    fn slow_requests_do_not_read_as_clock_skew() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        // Seconds since T0 on this machine's clock, which agrees with GitHub's. Every
+        // request takes 80 s.
+        let wall = Rc::new(Cell::new(0u64));
+        let http_date = |t: UnixSecs| {
+            let s = t % 86_400;
+            let (h, m, s) = (s / 3_600, s / 60 % 60, s % 60);
+            format!("Mon, 12 Jan 1970 {h:02}:{m:02}:{s:02} GMT")
+        };
+        let w = wall.clone();
+        let fake = Fake::new(move |s| {
+            let sent_at = T0 + w.get();
+            w.set(w.get() + 80);
+            let date = http_date(T0 + w.get());
+            if s.url.ends_with("/access_tokens") {
+                let jwt = s
+                    .header("authorization")
+                    .unwrap()
+                    .trim_start_matches("Bearer ");
+                let claims = jwt.split('.').nth(1).unwrap();
+                let claims: Value = serde_json::from_slice(
+                    &base64::Engine::decode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        claims,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if claims["iat"].as_u64().unwrap() > sent_at {
+                    let body = r#"{"message":"'Issued at' claim ('iat') must be an Integer"}"#;
+                    return respond(401, &[("Date", date.as_str())], body);
+                }
+                // Lives 400 s, so the next tick mints again.
+                let body = r#"{"token":"ghs_1","expires_at":"1970-01-12T13:53:20Z"}"#;
+                return respond(201, &[("Date", date.as_str())], body);
+            }
+            respond(200, &[("Date", date.as_str())], r#"{"runners":[]}"#)
+        });
+        let w = wall.clone();
+        let mut gh = Client::new(&fake, app(), "o/r".into()).with_clock(move || w.get());
+        gh.begin_tick(T0);
+        gh.runners().unwrap();
+        assert_eq!(wall.get(), 160);
+        gh.begin_tick(T0 + wall.get());
+        gh.runners().unwrap();
+        let sent = fake.sent();
+        let mints = sent.iter().filter(|s| s.url.ends_with("/access_tokens"));
+        // One mint a tick, none refused and retried.
+        assert_eq!(mints.count(), 2);
     }
 }
