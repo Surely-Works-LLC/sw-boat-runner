@@ -20,7 +20,10 @@ a day). Under the included starts, `runs-on: boat` is cheaper and faster.
 ## Quick start
 
 From your laptop, with the [boat CLI](https://docs.boat.dev/cli-reference) signed in.
-Use the release you tested; the machine installs the same one.
+Use the release you tested; the machine installs the same one. Releases run on Linux
+x86_64 and arm64 with glibc 2.35 or newer, and `--remote` also on macOS arm64; on an
+Intel Mac, build from source (`cargo install`, as in
+[Any other host](examples/always-on/README.md#any-other-host)).
 
 ```sh
 # macOS arm64. On Linux: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
@@ -29,9 +32,12 @@ tar -xzf sw-boat-runner-aarch64-apple-darwin.tar.gz
 ./sw-boat-runner setup --remote    # --dry-run first prints what it would do
 ```
 
-`setup --remote` asks for the boat key without echo, then the policy (below). It opens
-the browser to create the GitHub App, and GitHub sends the browser back to a one-shot
-listener on `127.0.0.1`, so there is no code to paste. It then creates a `small` boat
+`setup --remote` asks for the boat key without echo, then the policy (below). The key
+comes from `boat api-key create` (shown once) and must belong to the account the boat
+CLI is signed in to. It opens the browser to create the GitHub App, and GitHub sends the
+browser back to a one-shot listener on `127.0.0.1`, so there is no code to paste unless
+the browser is on another computer. It stops if a machine already runs the daemon for
+the repository (`--replace` swaps it for the new one). It then creates a `small` boat
 machine with no auto-stop (about $13 a month), installs the same release there with
 [install.sh](examples/always-on/install.sh), enables the service and runs `doctor`.
 The keys reach the machine only through the stdin of `boat ssh`. It ends with the
@@ -62,17 +68,27 @@ snapshot needs an unconfigured [actions/runner](https://github.com/actions/runne
 ([Snapshots](docs/design.md#snapshots)). If you have none, answer `new` (or name one
 that does not exist) and setup offers to build it: a temporary `noEnv` machine gets the
 latest runner release, checked against its SHA-256, and is checked and saved as
-`sw-boat-runner snapshot` does, in about 5 minutes. Setup then prints a short link to
+`sw-boat-runner snapshot` does, in about 5 minutes. It holds only the runner: to add
+toolchains, install them in `boat new --no-env --from <name>` and save it again with
+`sw-boat-runner snapshot <id> <name>`. Setup then prints a short link to
 [a page](docs/new-app.html) on this project's GitHub Pages that creates a private GitHub
 App for you (Administration write, Actions read, no webhook), waits until you install it
 on the repository, asks for the boat key without echo, and enables a systemd service.
 Point jobs at the pool with `runs-on: [self-hosted, boat]`.
 [examples/always-on](examples/always-on/) has the details.
 
+To change the policy later, edit `/etc/sw-boat-runner/policy.toml` on the machine and run
+`sudo systemctl restart sw-boat-runner`. To remove a `--remote` install, stop the service
+and drain the pools on the machine
+([how](examples/always-on/README.md#on-the-machine)), `boat delete <id> --yes` the
+machine, and delete the App in the GitHub settings of its owner (Developer settings,
+GitHub Apps).
+
 ## Opt-ins
 
 - `setup --pat`: a fine-grained token (Administration read and write, Actions read)
-  instead of an App. It shares your rate limit. `setup --help` lists the other flags.
+  instead of an App. It shares your rate limit. Without `--pat`, setup ignores
+  `GITHUB_TOKEN`. `setup --help` lists the other flags.
 - `preset`: `warm` (default), `pool`, `fork` or `hybrid`, see [Policy](#policy).
 - `sw-boat-runner doctor` checks a setup end to end (clock, boat key, snapshot, App
   permissions, service, runners) and says how to fix each failure. `setup` runs it last.
@@ -115,7 +131,8 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | `fork` | `fork` | none; each job gets a new machine, deleted afterwards |
 | `hybrid` | `slot, resume, fork` | `min_up` stay up; overflow jobs get a new machine each |
 
-Use `fork` for untrusted code such as pull requests from forks. Kept machines cost
+Use `fork` for untrusted code such as pull requests from forks. A forked machine lives at
+most `fork_ttl_s` (default 3600 s), so raise it for jobs that run longer. Kept machines cost
 machine time while up. boat snapshots do not save `/tmp` or `~/.cache`, so keep caches
 under a home subdirectory such as `/home/user/ci-cache`. [docs/design.md](docs/design.md)
 has the full design and the [GitHub request budget](docs/design.md#github-requests).
@@ -132,7 +149,7 @@ Or fork it, or build your own. These prompts hand either job to a coding agent.
 ```text
 Fork https://github.com/Surely-Works-LLC/sw-boat-runner and pin the latest release's
 commit. Review what runs with my keys: .github/workflows/, examples/always-on/install.sh,
-src/setup.rs, and how src/github_app.rs handles the App key and tokens. Report anything
+src/setup/, and how src/github_app.rs handles the App key and tokens. Report anything
 that sends secrets anywhere but GitHub and boat. Build from source at that commit, set up
 the daemon for <OWNER/REPO> with snapshot <SNAPSHOT> per README.md, and never put keys
 in commands or logs. Confirm a test job with runs-on: [self-hosted, boat] runs.

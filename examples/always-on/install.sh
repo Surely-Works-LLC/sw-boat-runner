@@ -3,16 +3,17 @@
 # repository, labels and snapshot, creates a GitHub App, asks for BOAT_API_KEY without
 # echo, and installs the systemd service. `sw-boat-runner setup --help` lists its flags.
 # usage: bash install.sh [policy.toml] [setup flags...]
-# With a policy file, setup uses it instead of asking. A GITHUB_TOKEN in the environment
-# without GITHUB_APP_ID means a personal token (setup --pat); GITHUB_APP_ID and
-# GITHUB_APP_PRIVATE_KEY_FILE mean an App you already have.
+# With a policy file, setup uses it instead of asking. GITHUB_APP_ID and
+# GITHUB_APP_PRIVATE_KEY_FILE mean an App you already have. A personal token is used
+# only when you ask for it, with SBR_PAT=1 or --pat; otherwise GITHUB_TOKEN and GH_TOKEN
+# are unset for setup, since every boat machine has its creator's GITHUB_TOKEN.
 # SBR_REF picks the version: unset for the latest release, a tag starting with v and a
 # digit, a commit hash or a branch. For a release (Linux x86_64 or arm64) it downloads the
 # static binary, checks it against the release's SHA256SUMS and, when `gh` is installed
-# and logged in, its build provenance attestation. A release with no binary for this
-# machine is built from its tag with cargo; a commit or branch is built with cargo. Any
-# other failure (network, server error, checksum or attestation mismatch) stops the script.
-# Pin a tag or commit for production.
+# and logged in, its build provenance attestation. Only two cases build with cargo: a
+# commit or branch, and a release on a host with glibc older than 2.35. Any other failure
+# (network, a missing release file, a server error, a checksum or attestation mismatch)
+# stops the script. Pin a tag or commit for production.
 set -euo pipefail
 
 repo=Surely-Works-LLC/sw-boat-runner
@@ -23,8 +24,13 @@ if [ $# -gt 0 ] && [[ $1 != -* ]]; then
     args+=(--policy "$1")
     shift
 fi
-if [ -n "${GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_APP_ID:-}" ]; then
+pat=''
+for a in "$@"; do
+    if [ "$a" = --pat ]; then pat=1; fi
+done
+if [ "${SBR_PAT:-}" = 1 ] && [ -z "$pat" ]; then
     args+=(--pat)
+    pat=1
 fi
 
 tmp=$(mktemp -d)
@@ -37,10 +43,11 @@ fetch() {
         { echo "could not download $1; not installing" >&2; return 1; }
 }
 
-# Sets bin to the release binary for this machine, or sets tag and returns 1 when the
-# release has no binary for it, to be built from that tag. Anything else stops the script.
+# Sets bin to the release binary for this machine, or sets tag and returns 1 when this
+# host's glibc is too old for it, to be built from that tag. Anything else stops the
+# script: a release that lacks a file is not built from source behind your back.
 download() {
-    local target url base file code checked
+    local target url base file code checked sum f
     tag=$ref
     if [ -z "$tag" ]; then
         if ! url=$(curl --proto '=https' -fsSLI -o /dev/null -w '%{url_effective}' \
@@ -57,7 +64,11 @@ download() {
     case "$(uname -s)/$(uname -m)" in
         Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
         Linux/aarch64 | Linux/arm64) target=aarch64-unknown-linux-gnu ;;
-        *) return 1 ;;
+        *)
+            echo "$tag has no binary for $(uname -s) $(uname -m); not installing." >&2
+            echo "Set SBR_REF to the tag's commit to build it with cargo." >&2
+            exit 1
+            ;;
     esac
     # The Linux binaries need glibc 2.35 or newer; older hosts build the tag from source.
     if [[ $target == *-linux-gnu ]]; then
@@ -69,33 +80,40 @@ download() {
     fi
     base=https://github.com/$repo/releases/download/$tag
     file=sw-boat-runner-$target.tar.gz
-    code=$(fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS") || exit 1
-    case $code in
-        200) ;;
-        404) return 1 ;;
-        *) echo "SHA256SUMS of $tag: HTTP $code; not installing" >&2; exit 1 ;;
-    esac
-    code=$(fetch "$base/$file" "$tmp/$file") || exit 1
-    case $code in
-        200) ;;
-        404) return 1 ;;
-        *) echo "$file of $tag: HTTP $code; not installing" >&2; exit 1 ;;
-    esac
-    # An empty match fails too: sha256sum finds no checksum line.
-    if ! (cd "$tmp" && awk -v f="$file" '$2 == f' SHA256SUMS | sha256sum --strict -c -); then
+    for f in SHA256SUMS "$file"; do
+        code=$(fetch "$base/$f" "$tmp/$f") || exit 1
+        if [ "$code" != 200 ]; then
+            echo "$f of $tag: HTTP $code; not installing." >&2
+            if [ "$code" = 404 ]; then
+                echo "To build $tag from source, set SBR_REF to its commit." >&2
+            fi
+            exit 1
+        fi
+    done
+    # No line for the file fails too; not every sha256sum fails on empty input.
+    sum=$(awk -v f="$file" '$2 == f' "$tmp/SHA256SUMS")
+    if [ -z "$sum" ] || ! (cd "$tmp" && printf '%s\n' "$sum" | sha256sum --strict -c -); then
         echo "$file from $tag does not match its SHA256SUMS; not installing" >&2
         exit 1
     fi
-    if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+    if ! command -v gh >/dev/null || ! gh auth status >/dev/null 2>&1; then
+        checked="SHA-256 checked; attestation not checked (needs gh, logged in)"
+    elif ! gh attestation --help >/dev/null 2>&1; then
+        # `gh attestation` came in gh 2.49.
+        echo "warning: $(gh --version | head -1) has no \`gh attestation\`; not checking the attestation" >&2
+        checked="SHA-256 checked; attestation not checked (gh too old)"
+    else
         if ! gh attestation verify "$tmp/$file" -R "$repo"; then
             echo "$file from $tag failed its attestation check; not installing" >&2
             exit 1
         fi
         checked="SHA-256 and build provenance attestation checked"
-    else
-        checked="SHA-256 checked; attestation not checked (needs gh, logged in)"
     fi
-    tar -xzf "$tmp/$file" -C "$tmp" sw-boat-runner
+    # set -e does not apply here: download runs as an `if` condition.
+    if ! tar -xzf "$tmp/$file" -C "$tmp" sw-boat-runner; then
+        echo "could not unpack $file; not installing" >&2
+        exit 1
+    fi
     bin=$tmp/sw-boat-runner
     echo "sw-boat-runner $tag for $target, $checked"
 }
@@ -106,7 +124,6 @@ if [ -n "$ref" ] && ! [[ $ref =~ ^v[0-9] ]]; then
     if [[ $ref =~ ^[0-9a-f]{7,40}$ ]]; then from=(--rev "$ref"); else from=(--branch "$ref"); fi
 elif ! download; then
     from=(--tag "$tag")
-    echo "$tag has no release binary for this machine; building it with cargo"
 fi
 if [ -z "${bin:-}" ]; then
     echo "building ${from[*]} with cargo"
@@ -127,4 +144,11 @@ if ! "$bin" setup --help >/dev/null 2>&1; then
     exit 1
 fi
 # setup copies this binary to /usr/local/bin. Not exec, so the EXIT trap removes $tmp.
-"$bin" setup ${args[@]+"${args[@]}"} "$@"
+if [ -n "$pat" ]; then
+    "$bin" setup ${args[@]+"${args[@]}"} "$@"
+else
+    (
+        unset GITHUB_TOKEN GH_TOKEN
+        "$bin" setup ${args[@]+"${args[@]}"} "$@"
+    )
+fi

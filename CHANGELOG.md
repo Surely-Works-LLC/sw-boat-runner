@@ -91,6 +91,41 @@ All notable changes to this project are documented here. The format follows
   300 s; a fork's TTL then may end before its runner comes online.
 - `run` warns once about a job fork whose `Busy` runner comes within 10 minutes of
   `fork_ttl_s`, after which boat archives the machine.
+### Changed
+
+- `setup` and `setup --remote` ignore `GITHUB_TOKEN` unless `--pat` is given, and say
+  so. They used to refuse to run while it was set. A rerun whose
+  `/etc/sw-boat-runner/env` holds a personal token and no App keeps that token, so an
+  upgrade of a 0.2.0 `--pat` install stays on it; `--new-app` switches to an App.
+- `install.sh` passes `--pat` only with `SBR_PAT=1` or `--pat`, and otherwise unsets
+  `GITHUB_TOKEN` and `GH_TOKEN` for `setup`. Before, the `GITHUB_TOKEN` every boat
+  machine has (its creator's) made setup install that personal token instead of
+  creating an App.
+- `install.sh` stops when a release lacks the binary or `SHA256SUMS` (404) or has no
+  binary for the platform, instead of installing rustup and building the tag. Only a
+  commit, a branch, or glibc older than 2.35 builds with cargo. A `gh` too old for
+  `gh attestation` gets a warning instead of a failure.
+- `setup --remote` takes a pasted code or redirect address while it waits for the
+  browser, for a browser on another computer, instead of only after 15 minutes.
+
+### Added
+
+- `setup --remote` stops when a boat machine already runs the daemon for the
+  repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
+  `--replace` deletes that machine once `doctor` finds no FAIL on the new one.
+- A rerun of `setup` with a stored or given GitHub App checks that the App is installed
+  on the policy's repository before it writes anything, and uses the installation
+  GitHub names for it.
+- The unit `setup` writes sets `TimeoutStopSec=300`, so systemd waits for the daemon to
+  finish its tick on SIGTERM.
+- `tests/install_sh.rs` runs `install.sh` with fake `curl`, `uname`, `getconf`, `gh` and
+  `cargo`; CI runs shellcheck on it.
+
+### Fixed
+
+- `setup --remote` waits for `boat ssh` when writing its input fails, and an install
+  failure says the machine is kept, may hold the keys in `~/.sbr-setup`, and gives
+  `boat delete <id> --yes`.
 
 ## [0.2.0] - 2026-11-11
 

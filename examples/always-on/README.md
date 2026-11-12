@@ -7,7 +7,12 @@ can reuse machines across runs.
 ## From your laptop
 
 `sw-boat-runner setup --remote` does all of the below from a macOS or Linux computer
-with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to:
+with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to
+(`boat api-key create` makes a key). First it lists your boat machines and stops if one
+already runs the daemon for the repository: one labelled `sw-boat-runner-host` for it,
+or called `sw-boat-runner <owner>/<name>`. Keep that one, delete it with
+`boat delete <id> --yes`, or pass `--replace`, which deletes it once `doctor` finds no
+FAIL on the new machine. Then:
 
 1. It asks for `BOAT_API_KEY` without echo, then the repository, labels and snapshot,
    and offers to build the snapshot if it is missing.
@@ -15,8 +20,9 @@ with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs
    with a `redirect` to `http://127.0.0.1:<random port>/callback`, which the page takes
    only in exactly that form and puts in the manifest as `redirect_url`. setup listens
    there for one request with the `state` it sent, answers "You can close this tab",
-   and stops. After 15 minutes it asks you to paste the address instead; `--paste`
-   pastes from the start, `--offline-link` uses a `data:` page. It exchanges the code
+   and stops. While it waits you can paste the address the browser ends on (or just the
+   code) instead, for a browser on another computer; after 15 minutes only a paste
+   works. `--paste` skips the listener, `--offline-link` uses a `data:` page. It exchanges the code
    and waits for the installation on your computer. The App's key stays in
    `~/.config/sw-boat-runner/github-app-<id>.pem` (mode 600) until the machine has it,
    so a failed run can be repeated with `GITHUB_APP_ID=<id>
@@ -32,8 +38,8 @@ with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs
    `~/.sbr-setup` is deleted.
 
 It prints the machine's id; `boat ssh <id> journalctl -u sw-boat-runner -f` shows the
-logs. Each run creates a new machine: delete an old one with `boat delete <id>`. If
-step 4 fails the machine is deleted; if step 5 fails it is kept for a look.
+logs. If step 4 fails the machine is deleted; if step 5 fails it is kept for a look, may
+still hold the keys in `~/.sbr-setup`, and `boat delete <id> --yes` removes it.
 `setup --remote --dry-run` prints the plan and asks no secret.
 
 ## On the machine
@@ -66,20 +72,25 @@ holds the runner only: for toolchains, start a sandbox from it with
 `sw-boat-runner snapshot <id> <name>`. For the App it prints a short link to
 [docs/new-app.html](../../docs/new-app.html) on GitHub Pages, a static page that posts the
 App's manifest to GitHub and shows the code GitHub sends back, to paste into setup; it
-sends the code nowhere. `setup --offline-link` prints the page as a `data:` URL instead. `bash install.sh policy.toml` uses your policy instead
-([policy.toml](policy.toml) is a start), and a `GITHUB_TOKEN` in the environment means a
-personal token instead of an App.
+sends the code nowhere. `setup --offline-link` prints the page as a `data:` URL instead. `bash install.sh
+policy.toml` uses your policy instead ([policy.toml](policy.toml) is a start).
+`SBR_PAT=1 bash install.sh` (or `--pat`) uses the `GITHUB_TOKEN` in the environment as a
+personal token instead of an App. Without it the script unsets `GITHUB_TOKEN` and
+`GH_TOKEN` for setup: every boat machine has its creator's `GITHUB_TOKEN`, a token too
+broad for the daemon.
 
 Pin the same tag in the URL and in `SBR_REF`, so a reinstall gets what you tested. On
 Linux x86_64 or arm64 the script downloads that release's static binary and checks it
 against the release's `SHA256SUMS`; if `gh` is installed and logged in, it also checks
 the binary's build provenance attestation with `gh attestation verify`, and otherwise
-says the attestation was not checked. On other machines, or for a release with no binary
-for the machine, it builds that tag with cargo. A network error, a server error or a
-failed check stops the script; it never falls back to another version. Without
+says the attestation was not checked (or warns, when `gh` is too old for
+`gh attestation`). With glibc older than 2.35 it builds that tag with cargo. Anything
+else stops the script, and it never falls back to another version: a network error, a
+server error, a failed check, another platform, or a release without the binary or
+`SHA256SUMS` (a 404). To build such a release from source, set `SBR_REF` to its commit. Without
 `SBR_REF` it installs the latest release, and stops if that release has no `setup`.
-`SBR_REF` can also be a commit hash or a branch name, which are built with cargo; `main`
-is built only when you ask for it. [Verifying a release](#verifying-a-release) shows the
+`SBR_REF` can also be a commit hash or a branch name, which are built with cargo
+(installing rustup first if cargo is missing); `main` is built only when you ask for it. [Verifying a release](#verifying-a-release) shows the
 same checks by hand.
 
 To use a GitHub App instead of a personal token, copy its private key to the machine

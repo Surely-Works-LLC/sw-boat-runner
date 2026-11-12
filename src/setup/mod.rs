@@ -46,7 +46,7 @@ usage: sw-boat-runner setup [--repo owner/name] [--labels a,b] [--snapshot name]
                             [--policy file] [--pat] [--new-app] [--offline-link]
                             [--dry-run] [--bin path]
        sw-boat-runner setup --remote [--repo, --labels, --snapshot, --policy, --pat,
-                            --offline-link, --paste, --dry-run]
+                            --offline-link, --paste, --replace, --dry-run]
 
 Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
 
@@ -63,7 +63,8 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
                                  the origin remote here, labels self-hosted, boat, and (with
                                  BOAT_API_KEY set) your saved boat snapshots
   --policy FILE                  use this policy instead of the three prompts
-  --pat                          a fine-grained personal token (GITHUB_TOKEN) instead of an App
+  --pat                          a fine-grained personal token (GITHUB_TOKEN) instead of an
+                                 App. Without --pat, setup ignores GITHUB_TOKEN
   --new-app                      create a new App even when /etc/sw-boat-runner/env names one
   --offline-link                 print the App's manifest page as a long data: URL instead
                                  of the short link to the project's GitHub Pages page
@@ -72,11 +73,15 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
   --remote                       run from your laptop: create the App here (the browser
                                  comes back to a one-shot listener on 127.0.0.1), then a
                                  small always-on boat machine, and install the daemon on
-                                 it over `boat ssh` (needs the boat CLI, logged in). Each
-                                 run creates a new machine. SBR_REF picks the release it
-                                 installs (default: this binary's version)
+                                 it over `boat ssh` (needs the boat CLI, logged in). It
+                                 stops if a machine already runs the daemon for the
+                                 repository. SBR_REF picks the release it installs
+                                 (default: this binary's version)
   --paste                        with --remote: paste the code GitHub returns instead of
-                                 the 127.0.0.1 redirect
+                                 waiting for the 127.0.0.1 redirect (a paste also works
+                                 while it waits)
+  --replace                      with --remote: delete the repository's existing daemon
+                                 machine once doctor finds no FAIL on the new one
 
 When the snapshot named is not among your saved boat snapshots (or you answer `new`),
 setup offers to build one: a temporary noEnv machine gets the latest actions/runner,
@@ -109,6 +114,7 @@ struct Options {
     bin: Option<PathBuf>,
     remote: bool,
     paste: bool,
+    replace: bool,
 }
 
 fn parse_args(args: &[&str]) -> Result<Options, String> {
@@ -132,6 +138,7 @@ fn parse_args(args: &[&str]) -> Result<Options, String> {
             "--dry-run" => o.dry_run = true,
             "--remote" => o.remote = true,
             "--paste" => o.paste = true,
+            "--replace" => o.replace = true,
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
@@ -145,6 +152,9 @@ fn parse_args(args: &[&str]) -> Result<Options, String> {
     }
     if o.paste && !o.remote {
         return Err("--paste goes with --remote".into());
+    }
+    if o.replace && !o.remote {
+        return Err("--replace goes with --remote".into());
     }
     if o.paste && o.offline_link {
         return Err("--offline-link already pastes the code; drop --paste".into());
@@ -305,12 +315,7 @@ fn setup(opts: &Options) -> Result<(), String> {
     let shell_app_id = std::env::var("GITHUB_APP_ID")
         .ok()
         .filter(|v| !v.is_empty());
-    let token_env = std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.is_empty());
-    if token_env && !opts.pat {
-        return Err(
-            "GITHUB_TOKEN is set: pass --pat to use it, or unset it for a GitHub App".into(),
-        );
-    }
+    note_ignored_token(opts.pat);
     if opts.pat && shell_app_id.is_some() {
         return Err("set GITHUB_TOKEN or GITHUB_APP_*, not both".into());
     }
@@ -361,15 +366,20 @@ fn setup(opts: &Options) -> Result<(), String> {
             Existing::Absent
         };
         match plan_app(opts.new_app, shell_app_id.as_deref(), &existing)? {
-            AppPlan::Shell(id) => shell_app(id, sudo)?,
+            AppPlan::Shell(id) => check_installed(&t, shell_app(id, sudo)?, &cfg.repo)?,
             AppPlan::Reuse {
                 id,
                 key_file,
                 installation,
             } => {
                 println!("Using GitHub App {id} from {ENV} (--new-app creates a new one).");
-                app_from_file(id, &key_file, installation, sudo)
-                    .map_err(|e| format!("{e}; pass --new-app to create a new App"))?
+                let auth = app_from_file(id, &key_file, installation, sudo)
+                    .map_err(|e| format!("{e}; pass --new-app to create a new App"))?;
+                check_installed(&t, auth, &cfg.repo)?
+            }
+            AppPlan::KeepPat => {
+                println!("{KEEP_PAT}");
+                Auth::Pat(stored_token(&existing).expect("plan_app found it"))
             }
             AppPlan::Unknown => unreachable!("a real run reads {ENV} or fails"),
             AppPlan::Create => new_app(&t, &cfg.repo, opts.offline_link, sudo)?,
@@ -434,6 +444,10 @@ fn dry_run_app(plan: AppPlan, repo: &str) -> (String, Auth) {
             format!("Would reuse GitHub App {id} from {ENV} (--new-app creates a new one)."),
             app(id, installation, None),
         ),
+        AppPlan::KeepPat => (
+            format!("Would keep the personal token in {ENV}: {KEEP_PAT}"),
+            Auth::Pat(placeholder("GITHUB_TOKEN")),
+        ),
         AppPlan::Unknown => (
             format!(
                 "Would reuse the GitHub App {ENV} names, if it names one (reading it needs \
@@ -457,6 +471,14 @@ fn dry_run_app(plan: AppPlan, repo: &str) -> (String, Auth) {
 /// The line a workflow's job needs to run on the pool.
 fn runs_on(labels: &[String]) -> String {
     format!("runs-on: [{}]", labels.join(", "))
+}
+
+/// Many shells export a GITHUB_TOKEN, and every boat machine has its creator's, so only
+/// `--pat` takes it.
+fn note_ignored_token(pat: bool) {
+    if !pat && std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.trim().is_empty()) {
+        println!("GITHUB_TOKEN is set; setup ignores it (--pat uses it).");
+    }
 }
 
 /// `flag`, else the environment variable `env`.
@@ -710,9 +732,26 @@ enum AppPlan {
         key_file: String,
         installation: Option<u64>,
     },
+    /// The personal token an earlier `setup --pat` stored, with no App: a 0.2.0
+    /// install.sh passed `--pat` on its own, and an upgrade must not swap it for an App.
+    KeepPat,
     /// A dry run that could not read the env file.
     Unknown,
     Create,
+}
+
+const KEEP_PAT: &str = "/etc/sw-boat-runner/env holds a personal token and no App: keeping \
+    the token (--new-app creates an App instead; --pat with GITHUB_TOKEN replaces the token).";
+
+/// The `GITHUB_TOKEN` the env file holds.
+fn stored_token(existing: &Existing) -> Option<Secret> {
+    let Existing::Text(text) = existing else {
+        return None;
+    };
+    parse_env(text)
+        .into_iter()
+        .find(|(k, v)| k == "GITHUB_TOKEN" && !v.is_empty())
+        .map(|(_, v)| Secret(v))
 }
 
 /// The shell's App first, then (unless `--new-app`) the one the env file names, else a
@@ -737,7 +776,11 @@ fn plan_app(new_app: bool, shell_id: Option<&str>, existing: &Existing) -> Resul
             .map(|(_, v)| v.clone())
     };
     let Some(id) = get("GITHUB_APP_ID") else {
-        return Ok(AppPlan::Create);
+        return Ok(if get("GITHUB_TOKEN").is_some() {
+            AppPlan::KeepPat
+        } else {
+            AppPlan::Create
+        });
     };
     let hint = "; fix it or pass --new-app to create a new App";
     check_app_id(&format!("GITHUB_APP_ID in {ENV}"), &id).map_err(|e| format!("{e}{hint}"))?;
@@ -848,6 +891,62 @@ fn app_from_file(
         pem: Secret(pem),
         installation,
         staged: None,
+    })
+}
+
+/// An App setup did not just create must be installed on the policy's repository: the
+/// env file may come from a setup for another one. Before anything is written, so a
+/// refusal leaves the service as it was. The installation becomes the one GitHub names
+/// for the repository.
+fn check_installed(t: &dyn Transport, auth: Auth, repo: &str) -> Result<Auth, String> {
+    let Auth::App {
+        id,
+        pem,
+        installation,
+        staged,
+    } = auth
+    else {
+        return Ok(auth);
+    };
+    let app = App::new(id.clone(), None, pem.expose().as_bytes())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let installation = match app.installation_on(t, repo, now) {
+        Ok(Some(found)) => {
+            if let Some(old) = installation.filter(|&old| old != found) {
+                println!(
+                    "GitHub App {id}'s installation on {repo} is {found}, not {old}; setup uses \
+                     {found}."
+                );
+            }
+            Some(found)
+        }
+        Ok(None) => {
+            let which = installation.map_or(String::new(), |i| format!(" (installation {i})"));
+            return Err(format!(
+                "GitHub App {id}{which} is not installed on {repo}. Add {repo} to the app's \
+                 installation (the account's Settings > Applications > Installed GitHub Apps > \
+                 Configure) and run setup again, or pass --new-app to create an App for it. \
+                 Nothing was changed."
+            ));
+        }
+        // The daemon looks again when it starts, and doctor checks it.
+        Err(Error::Network(e)) => {
+            println!("Could not check GitHub App {id}'s installation on {repo} ({e}).");
+            installation
+        }
+        Err(e) => {
+            return Err(format!(
+                "check GitHub App {id}'s installation on {repo}: {e}. Nothing was changed."
+            ));
+        }
+    };
+    Ok(Auth::App {
+        id,
+        pem,
+        installation,
+        staged,
     })
 }
 
@@ -1311,6 +1410,9 @@ EnvironmentFile={ENV}
 {credential}ExecStart={exec_start}
 Restart=always
 RestartSec=30
+# A tick can take several 90 s requests, and the daemon finishes it on SIGTERM (systemd's
+# default KillSignal).
+TimeoutStopSec=300
 DynamicUser=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -1556,6 +1658,8 @@ mod tests {
         assert!(parse_args(&["--remote", "--bin", "/x"]).is_err());
         assert!(parse_args(&["--paste"]).is_err());
         assert!(parse_args(&["--remote", "--paste", "--offline-link"]).is_err());
+        assert!(parse_args(&["--remote", "--replace"]).unwrap().replace);
+        assert!(parse_args(&["--replace"]).is_err());
     }
 
     #[test]
@@ -1746,6 +1850,57 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_app_must_be_installed_on_the_repository() {
+        let app = |installation| Auth::App {
+            id: "42".into(),
+            pem: Secret(test_pem()),
+            installation,
+            staged: None,
+        };
+        let installation = |auth: Auth| match auth {
+            Auth::App { installation, .. } => installation,
+            Auth::Pat(_) => panic!("an App"),
+        };
+        let on = |status: u16, body: &'static str| {
+            Fake::new(move |s| {
+                assert!(s.url.ends_with("/repos/o/new/installation"), "{}", s.url);
+                respond(status, &[], body)
+            })
+        };
+        // The stored installation covers the repository.
+        let auth = check_installed(&on(200, r#"{"id":77}"#), app(Some(77)), "o/new").unwrap();
+        assert_eq!(installation(auth), Some(77));
+        // Another owner's installation: GitHub's answer wins.
+        let auth = check_installed(&on(200, r#"{"id":88}"#), app(Some(77)), "o/new").unwrap();
+        assert_eq!(installation(auth), Some(88));
+        let auth = check_installed(&on(200, r#"{"id":88}"#), app(None), "o/new").unwrap();
+        assert_eq!(installation(auth), Some(88));
+        // Not installed there: refused before anything is written.
+        let err = check_installed(
+            &on(404, r#"{"message":"Not Found"}"#),
+            app(Some(77)),
+            "o/new",
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.contains("GitHub App 42 (installation 77) is not installed on o/new")
+                && err.contains("--new-app")
+                && err.contains("Nothing was changed"),
+            "{err}"
+        );
+        assert!(check_installed(&on(401, "{}"), app(Some(77)), "o/new").is_err());
+        // A dropped connection keeps what the env file says.
+        let down = Fake::failing(|_| Err(crate::transport::NetworkError("reset".into())));
+        let auth = check_installed(&down, app(Some(77)), "o/new").unwrap();
+        assert_eq!(installation(auth), Some(77));
+        // A token has no installation to check.
+        let fake = on(500, "{}");
+        assert!(check_installed(&fake, Auth::Pat(Secret("t".into())), "o/new").is_ok());
+        assert!(fake.sent().is_empty());
+    }
+
+    #[test]
     fn reads_an_env_file_as_systemd_does() {
         let vars = parse_env("# c\n\nA=1\n B = \"two\" \nC='3'\nnoequals\nD=\n");
         let pairs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (&**k, &**v)).collect();
@@ -1777,8 +1932,16 @@ mod tests {
                 installation: None,
             }
         );
+        // A 0.2.0 --pat install keeps its token on an upgrade; --new-app switches.
         let pat = env("BOAT_API_KEY=bk\nGITHUB_TOKEN=t\n");
-        assert_eq!(plan_app(false, None, &pat).unwrap(), AppPlan::Create);
+        assert_eq!(plan_app(false, None, &pat).unwrap(), AppPlan::KeepPat);
+        assert_eq!(stored_token(&pat).unwrap().expose(), "t");
+        assert_eq!(plan_app(true, None, &pat).unwrap(), AppPlan::Create);
+        assert_eq!(
+            plan_app(false, None, &env("BOAT_API_KEY=bk\nGITHUB_TOKEN=\n")).unwrap(),
+            AppPlan::Create
+        );
+        assert!(stored_token(&Existing::Absent).is_none());
         assert_eq!(
             plan_app(false, None, &Existing::Absent).unwrap(),
             AppPlan::Create
@@ -1824,6 +1987,10 @@ mod tests {
         assert!(matches!(auth, Auth::App { staged: None, .. }));
         let (what, _) = dry_run_app(AppPlan::Shell("7".into()), "o/r");
         assert!(what.starts_with("Would use GitHub App 7"), "{what}");
+        let (what, auth) = dry_run_app(AppPlan::KeepPat, "o/r");
+        assert!(what.contains("--new-app creates an App"), "{what}");
+        assert!(matches!(auth, Auth::Pat(_)));
+        assert!(KEEP_PAT.starts_with(ENV));
         let (what, _) = dry_run_app(AppPlan::Unknown, "o/r");
         assert!(what.contains("needs sudo"), "{what}");
         let (what, auth) = dry_run_app(AppPlan::Create, "o/r");
@@ -1906,6 +2073,7 @@ mod tests {
                 "ProtectHome=yes",
                 "PrivateTmp=yes",
                 "PrivateDevices=yes",
+                "TimeoutStopSec=300",
                 "WantedBy=multi-user.target",
             ] {
                 assert!(unit.lines().any(|l| l == line), "{line}");

@@ -19,6 +19,8 @@ jobs:
       - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
+      # tests/install_sh.rs runs the script itself, under cargo test.
+      - run: shellcheck examples/always-on/install.sh
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- check examples/always-on/policy.toml

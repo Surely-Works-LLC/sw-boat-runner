@@ -9,10 +9,11 @@
 //! command line, an `exec` string or the boat API's command history.
 
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -25,6 +26,8 @@ const MACHINE_TYPE: &str = "small";
 const MACHINE_NAME: &str = "sw-boat-runner";
 /// Label holding this run's id, so a machine whose create got no answer can be found.
 const RUN_LABEL: &str = "sw-boat-runner-daemon-run";
+/// Label marking the daemon machine of one repository, with `repo_key` as its value.
+const HOST_LABEL: &str = "sw-boat-runner-host";
 /// The directory on the machine that holds the secrets until install.sh has run.
 const STAGE: &str = "$HOME/.sbr-setup";
 const REPO: &str = "Surely-Works-LLC/sw-boat-runner";
@@ -54,6 +57,16 @@ pub(super) fn run(opts: &Options) -> Result<(), String> {
     let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
     println!("Policy:\n\n{policy_text}");
     show_check(&policy_text)?;
+    // Before the App: two daemons for one repository would compete for its jobs.
+    let replaced = if opts.dry_run {
+        Vec::new()
+    } else {
+        let key = boat_key.as_ref().expect("asked above").expose().to_string();
+        let t = Ureq::new(Duration::from_secs(30));
+        let found = existing_daemons(&boat::Client::new(&t, key), &cfg.repo)?;
+        refuse_second_daemon(&cfg.repo, &found, opts.replace)?;
+        found
+    };
     if opts.dry_run {
         print!(
             "{}",
@@ -61,7 +74,8 @@ pub(super) fn run(opts: &Options) -> Result<(), String> {
                 &cfg.repo,
                 &github,
                 &git_ref,
-                opts.paste || opts.offline_link
+                opts.paste || opts.offline_link,
+                opts.replace
             )
         );
         return Ok(());
@@ -110,12 +124,15 @@ pub(super) fn run(opts: &Options) -> Result<(), String> {
     };
     println!("+ boat ssh {id} <install.sh at {git_ref}, then `sw-boat-runner setup` there>\n");
     let script = install_script(&git_ref, &auth, &files);
-    let status = boat_ssh(&id, &script, None)?;
-    if !status {
-        return Err(format!(
-            "the install on {id} failed (above). The machine is kept so you can look: \
-             `boat ssh {id}`; `boat delete {id}` removes it.{retry_hint}"
-        ));
+    match boat_ssh(&id, &script, None) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "the install on {id} failed (above). {}{retry_hint}",
+                kept(&id)
+            ));
+        }
+        Err(e) => return Err(format!("{e}. {}{retry_hint}", kept(&id))),
     }
     if let Some(path) = &local_key {
         // The machine has the key now; the copy here is no longer needed.
@@ -125,6 +142,9 @@ pub(super) fn run(opts: &Options) -> Result<(), String> {
                 path.display()
             );
         }
+    }
+    if !replaced.is_empty() {
+        replace_old(&boat, &id, &replaced, &mut io);
     }
     println!(
         "\nThe daemon runs on boat machine {id}.\n\
@@ -157,12 +177,7 @@ fn github_plan(opts: &Options) -> Result<GitHub, String> {
     let shell_app_id = std::env::var("GITHUB_APP_ID")
         .ok()
         .filter(|v| !v.is_empty());
-    let token_env = std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.is_empty());
-    if token_env && !opts.pat {
-        return Err(
-            "GITHUB_TOKEN is set: pass --pat to use it, or unset it for a GitHub App".into(),
-        );
-    }
+    note_ignored_token(opts.pat);
     match (opts.pat, shell_app_id) {
         (true, Some(_)) => Err("set GITHUB_TOKEN or GITHUB_APP_*, not both".into()),
         (true, None) => Ok(GitHub::Pat),
@@ -200,7 +215,7 @@ fn boat_cli_ready() -> Result<(), String> {
 }
 
 /// What `--remote --dry-run` prints after the policy.
-fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool) -> String {
+fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool, replace: bool) -> String {
     let (app_step, file) = match github {
         GitHub::Pat => (
             "ask for GITHUB_TOKEN without echo".to_string(),
@@ -222,16 +237,22 @@ fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool) -> String {
                     "you paste the code GitHub returns"
                 } else {
                     "GitHub sends the browser back to http://127.0.0.1:<random port>/callback, \
-                     where setup listens for 15 minutes"
+                     where setup listens for 15 minutes (or you paste the address it ends on)"
                 }
             ),
             "app.pem",
         ),
     };
+    let existing = if replace {
+        "delete it once doctor finds no FAIL on the new machine (--replace)"
+    } else {
+        "stop, unless --replace"
+    };
     format!(
         "Would, from this computer (it asks for BOAT_API_KEY without echo first):\n\n\
+         0. look for a boat machine that already runs the daemon for {repo} and {existing}\n\
          1. {app_step}\n\
-         2. create an always-on boat {MACHINE_TYPE} machine called {MACHINE_NAME} (no auto-stop, \
+         2. create an always-on boat {MACHINE_TYPE} machine called `{MACHINE_NAME} {repo}` (no auto-stop, \
             not noEnv) and wait until it runs\n\
          3. write {STAGE}/{{policy.toml,boat-key,{file}}} on it (directory mode 700) through \
             the stdin of `boat ssh`, never in a command\n\
@@ -241,7 +262,7 @@ fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool) -> String {
             shows here; then delete {STAGE}\n\
          5. print the machine id and `boat ssh <id> journalctl -u {SERVICE} -f`\n\n\
          SBR_REF picks another release. If step 3 fails the machine is deleted; if step 4 \
-         fails it is kept for a look.\n"
+         fails it is kept for a look, with `boat delete <id> --yes` to remove it.\n"
     )
 }
 
@@ -306,23 +327,29 @@ fn create_app_here(
             "open this link in your browser,"
         }
     );
-    let code = match (listener, port) {
-        (Some(listener), Some(port)) => {
+    let code = match (listener, port, given(&None, "SBR_APP_CODE")) {
+        (_, _, Some(pasted)) => parse_code(&pasted, &state)?,
+        (Some(listener), Some(port), None) => {
             println!(
-                "Waiting up to {} min for GitHub to send the browser back to {}...",
+                "Waiting up to {} min for GitHub to send the browser back to {}.\n\
+                 If the browser is on another computer, the page there does not load: paste \
+                 its address\n(it starts with {}?code=), or just the code, here and press \
+                 Enter.",
                 CALLBACK_WAIT.as_secs() / 60,
+                loopback_redirect(port),
                 loopback_redirect(port)
             );
-            match wait_for_code(&listener, port, &state, CALLBACK_WAIT)? {
+            let pasted = read_pastes();
+            match wait_for_code(&listener, port, &state, CALLBACK_WAIT, &pasted)? {
                 Some(code) => code,
                 None => {
                     println!(
                         "No answer in {} min. If GitHub created the app, the browser shows an \
-                         address starting with http://127.0.0.1:{port}/callback?code=.",
-                        CALLBACK_WAIT.as_secs() / 60
+                         address starting with {}?code=: paste it here (or just the code).",
+                        CALLBACK_WAIT.as_secs() / 60,
+                        loopback_redirect(port)
                     );
-                    let pasted = secret("SBR_APP_CODE", "Paste that address (or just the code)")?;
-                    parse_code(pasted.expose(), &state)?
+                    wait_for_paste(&pasted, &state)?
                 }
             }
         }
@@ -443,19 +470,87 @@ fn parse_callback(head: &str, port: u16, state: &str) -> Callback {
     }
 }
 
-/// Serves the listener until a request brings the code (`Some`) or `limit` passes
-/// (`None`). Other requests get an error page and the wait goes on.
+/// Lines typed on stdin, read on a thread of their own so the wait for the browser can
+/// take a pasted code at the same time. After each line the thread waits for `more`:
+/// `true` reads another line, `false` (or a dropped sender) ends the thread. When the
+/// browser wins, the thread stays blocked in its read until the process ends, so nothing
+/// after the wait may read stdin.
+struct Pasted {
+    lines: Receiver<String>,
+    more: Sender<bool>,
+}
+
+fn read_pastes() -> Pasted {
+    let (line_tx, lines) = mpsc::channel();
+    let (more, more_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            let mut line = String::new();
+            match std::io::stdin().lock().read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line_tx.send(line).is_err() || !more_rx.recv().unwrap_or(false) {
+                return;
+            }
+        }
+    });
+    Pasted { lines, more }
+}
+
+/// The code in one pasted line, if it holds one; a wrong paste says why. Either way it
+/// tells the reader whether to read another line.
+fn take_paste(pasted: &Pasted, line: &str, state: &str) -> Option<Secret> {
+    let line = line.trim();
+    let code = if line.is_empty() {
+        None
+    } else {
+        parse_code(line, state)
+            .map_err(|e| println!("{e}. Paste the whole address, or just the code."))
+            .ok()
+    };
+    let _ = pasted.more.send(code.is_none());
+    code
+}
+
+/// Waits for a pasted code alone, after the listener gave up.
+fn wait_for_paste(pasted: &Pasted, state: &str) -> Result<Secret, String> {
+    loop {
+        let line = pasted
+            .lines
+            .recv()
+            .map_err(|_| "no code: stdin closed before one was pasted".to_string())?;
+        if let Some(code) = take_paste(pasted, &line, state) {
+            return Ok(code);
+        }
+    }
+}
+
+/// Serves the listener until a request or a pasted line brings the code (`Some`) or
+/// `limit` passes (`None`). Other requests get an error page, a wrong paste a message,
+/// and the wait goes on.
 fn wait_for_code(
     listener: &TcpListener,
     port: u16,
     state: &str,
     limit: Duration,
+    pasted: &Pasted,
 ) -> Result<Option<Secret>, String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("listener: {e}"))?;
     let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
+        match pasted.lines.try_recv() {
+            Ok(line) => {
+                if let Some(code) = take_paste(pasted, &line, state) {
+                    return Ok(Some(code));
+                }
+                continue;
+            }
+            // No line yet, or stdin closed: the browser may still come back.
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Some(code) = answer(stream, port, state) {
@@ -518,7 +613,7 @@ fn create_machine(boat: &boat::Client, repo: &str, io: &mut dyn Io) -> Result<St
         machine_type: MACHINE_TYPE.into(),
         ttl_s: None,
         no_env: false,
-        labels: BTreeMap::from([(RUN_LABEL, run_id.clone())]),
+        labels: BTreeMap::from([(RUN_LABEL, run_id.clone()), (HOST_LABEL, repo_key(repo))]),
         name: format!("{MACHINE_NAME} {repo}"),
     };
     let key = format!("sw-boat-runner-daemon-{run_id}");
@@ -541,8 +636,154 @@ fn create_machine(boat: &boat::Client, repo: &str, io: &mut dyn Io) -> Result<St
 fn delete_machine(boat: &boat::Client, id: &str, io: &mut dyn Io) {
     match crate::snapshot::cleanup_retry(io, "delete machine", |_| boat.delete(id)) {
         Ok(()) => println!("Deleted machine {id}."),
-        Err(e) => println!("Could not delete machine {id} ({e}); `boat delete {id}` removes it."),
+        Err(e) => println!(
+            "Could not delete machine {id} ({e}); it may hold the staged keys in {STAGE}. \
+             `boat delete {id} --yes` removes it."
+        ),
     }
+}
+
+/// What every failure after the machine exists ends with.
+fn kept(id: &str) -> String {
+    format!(
+        "The machine {id} is kept, and may still hold the staged keys in {STAGE}: `boat ssh \
+         {id}` to look, `boat delete {id} --yes` to remove it."
+    )
+}
+
+/// The `HOST_LABEL` value for `repo`: hex, which boat takes as a label value, of the
+/// repository's name without case, as GitHub compares it.
+fn repo_key(repo: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, repo.to_lowercase().as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A machine that already runs the daemon for the repository.
+#[derive(Debug, PartialEq, Eq)]
+struct Daemon {
+    id: String,
+    state: String,
+}
+
+/// The daemon machines `setup --remote` made for `repo`: by `HOST_LABEL`, or, for
+/// those made before the label, by the name it gives them. From `boat list --all --json`,
+/// and boat's label search when that list is cut short.
+fn existing_daemons(boat: &boat::Client, repo: &str) -> Result<Vec<Daemon>, String> {
+    let out = Command::new("boat")
+        .args(["list", "--all", "--json"])
+        .env("BOAT_NO_UPDATE", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("boat list: {e}"))?;
+    let listed: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    if !out.status.success() || !listed["sandboxes"].is_array() {
+        return Err(format!(
+            "`boat list --all --json` failed ({}), so setup cannot tell whether a daemon for \
+             {repo} already runs; fix that and try again",
+            out.status
+        ));
+    }
+    let mut found = daemons_in(&listed, repo);
+    if listed["pageInfo"]["hasMore"] == Value::Bool(true) {
+        let labelled = boat
+            .list_labelled(HOST_LABEL, &repo_key(repo))
+            .map_err(|e| format!("look for a daemon machine for {repo}: {e}"))?;
+        for m in labelled {
+            if !gone(&m.state) && !found.iter().any(|d| d.id == m.id) {
+                found.push(Daemon {
+                    id: m.id,
+                    state: m.state,
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// A machine that no longer runs anything.
+fn gone(state: &str) -> bool {
+    matches!(state, "deleted" | "cancelled")
+}
+
+fn daemons_in(listed: &Value, repo: &str) -> Vec<Daemon> {
+    let key = repo_key(repo);
+    let name = format!("{MACHINE_NAME} {repo}");
+    listed["sandboxes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| {
+            m["labels"][HOST_LABEL].as_str() == Some(key.as_str())
+                || m["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+        })
+        .filter_map(|m| {
+            let state = m["state"].as_str().unwrap_or("unknown").to_string();
+            Some(Daemon {
+                id: m["id"].as_str()?.to_string(),
+                state,
+            })
+            .filter(|d| !gone(&d.state))
+        })
+        .collect()
+}
+
+/// Without `--replace`, an existing daemon machine for the repository stops setup.
+fn refuse_second_daemon(repo: &str, found: &[Daemon], replace: bool) -> Result<(), String> {
+    let Some(first) = found.first() else {
+        return Ok(());
+    };
+    let list: Vec<String> = found
+        .iter()
+        .map(|d| format!("{} ({})", d.id, d.state))
+        .collect();
+    if replace {
+        println!(
+            "Will delete {} once doctor finds no FAIL on the new machine (--replace).",
+            list.join(", ")
+        );
+        return Ok(());
+    }
+    let id = &first.id;
+    Err(format!(
+        "boat machine {} already runs the daemon for {repo}, and a second one would compete \
+         for its jobs. Keep it (`boat ssh {id} sudo {BIN} doctor` checks it; to change the \
+         policy, edit {POLICY} there and restart the service), delete it first with `boat \
+         delete {id} --yes`, or pass --replace to delete it once doctor finds no FAIL on \
+         the new machine.",
+        list.join(", ")
+    ))
+}
+
+/// With `--replace`: deletes the old daemon machines once doctor finds no FAIL on the new
+/// one. An active service is not enough: a daemon that keeps failing stays active.
+fn replace_old(boat: &boat::Client, id: &str, old: &[Daemon], io: &mut dyn Io) {
+    println!("+ boat ssh {id} sudo {BIN} doctor   (before deleting the old machine)");
+    let healthy = boat_ssh(id, &doctor_quietly(), None);
+    if !matches!(healthy, Ok(true)) {
+        let ids: Vec<&str> = old.iter().map(|d| d.id.as_str()).collect();
+        println!(
+            "doctor found a problem on {id}, so {} kept running: check \
+             `boat ssh {id} sudo {BIN} doctor`, then delete one of the two with \
+             `boat delete <id> --yes`.",
+            ids.join(", ")
+        );
+        return;
+    }
+    for d in old {
+        delete_machine(boat, &d.id, io);
+    }
+}
+
+/// Doctor on the new machine, its output dropped: it already showed during the install,
+/// and any FAIL exits non-zero.
+fn doctor_quietly() -> String {
+    format!("sudo {BIN} doctor >/dev/null 2>&1")
 }
 
 /// The files `stage` writes under `STAGE`.
@@ -598,8 +839,9 @@ fn write_script(name: &str) -> String {
 /// never from this text, and the directory is deleted whatever happens.
 fn install_script(git_ref: &str, auth: &Auth, files: &Staged) -> String {
     let github = match auth {
+        // install.sh takes the token only when asked to.
         Auth::Pat(_) => format!(
-            "GITHUB_TOKEN=$(cat {}) || exit 1\nexport GITHUB_TOKEN\n",
+            "GITHUB_TOKEN=$(cat {}) || exit 1\nexport GITHUB_TOKEN SBR_PAT=1\n",
             files.secret_file
         ),
         Auth::App {
@@ -643,15 +885,18 @@ fn boat_ssh(id: &str, script: &str, input: Option<&[u8]>) -> Result<bool, String
             Stdio::null()
         })
         .spawn()
-        .map_err(|e| format!("boat ssh: {e}"))?;
+        .map_err(|e| format!("boat ssh {id}: {e}"))?;
     if let Some(bytes) = input {
         let mut stdin = child.stdin.take().expect("piped");
-        stdin
-            .write_all(bytes)
-            .map_err(|e| format!("boat ssh: {e}"))?;
+        if let Err(e) = stdin.write_all(bytes) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("boat ssh {id}: writing its input: {e}"));
+        }
         // Dropped here, so the remote `cat` sees the end of its input.
     }
-    let status = child.wait().map_err(|e| format!("boat ssh: {e}"))?;
+    let status = child.wait().map_err(|e| format!("boat ssh {id}: {e}"))?;
     Ok(status.success())
 }
 
@@ -660,6 +905,13 @@ mod tests {
     use super::*;
 
     const STATE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A `Pasted` fed by the test instead of stdin, and what the waits answered.
+    fn pastes() -> (Pasted, Sender<String>, Receiver<bool>) {
+        let (tx, lines) = mpsc::channel();
+        let (more, more_rx) = mpsc::channel();
+        (Pasted { lines, more }, tx, more_rx)
+    }
 
     fn head(target: &str, host: &str) -> String {
         format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: text/html\r\n\r\n")
@@ -738,7 +990,8 @@ mod tests {
             let c = get(format!("/callback?code=c0de&state={STATE}"));
             (a, b, c)
         });
-        let code = wait_for_code(&listener, port, STATE, Duration::from_secs(20))
+        let (pasted, _tx, _) = pastes();
+        let code = wait_for_code(&listener, port, STATE, Duration::from_secs(20), &pasted)
             .unwrap()
             .unwrap();
         assert_eq!(code.expose(), "c0de");
@@ -757,9 +1010,107 @@ mod tests {
         let idle = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = idle.local_addr().unwrap().port();
         assert!(
-            wait_for_code(&idle, port, STATE, Duration::from_millis(300))
+            wait_for_code(&idle, port, STATE, Duration::from_millis(300), &pasted)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_pasted_code_ends_the_wait_for_the_browser() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (pasted, tx, more) = pastes();
+        for line in [
+            "\n".to_string(),
+            "http://127.0.0.1:1/callback?code=abc&state=other\n".to_string(),
+            format!("http://127.0.0.1:{port}/callback?code=p4ste&state={STATE}\n"),
+        ] {
+            tx.send(line).unwrap();
+        }
+        let code = wait_for_code(&listener, port, STATE, Duration::from_secs(20), &pasted)
+            .unwrap()
+            .unwrap();
+        assert_eq!(code.expose(), "p4ste");
+        // Read on after the blank line and the wrong state; stop after the code.
+        assert_eq!(more.try_iter().collect::<Vec<_>>(), [true, true, false]);
+
+        // After the listener gives up, only a paste ends the wait.
+        tx.send("c0de\n".into()).unwrap();
+        assert_eq!(wait_for_paste(&pasted, STATE).unwrap().expose(), "c0de");
+        drop(tx);
+        assert!(
+            wait_for_paste(&pasted, STATE)
+                .err()
+                .unwrap()
+                .contains("stdin closed")
+        );
+    }
+
+    #[test]
+    fn finds_the_daemon_machine_for_the_repository() {
+        let key = repo_key("acme/app");
+        assert_eq!(key, repo_key("Acme/App"));
+        assert_ne!(key, repo_key("acme/app2"));
+        assert!(key.len() == 32 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+        let listed = serde_json::json!({
+            "pageInfo": {"hasMore": false},
+            "sandboxes": [
+                {"id": "bx_aaaaaaaa", "state": "idle", "name": "renamed",
+                 "labels": {HOST_LABEL: key}},
+                // Made before the label: found by name.
+                {"id": "bx_bbbbbbbb", "state": "stopped", "name": "sw-boat-runner acme/app",
+                 "labels": {}},
+                {"id": "bx_cccccccc", "state": "deleted", "name": "sw-boat-runner acme/app"},
+                {"id": "bx_dddddddd", "state": "idle", "name": "sw-boat-runner acme/app2"},
+                {"id": "bx_eeeeeeee", "state": "idle", "name": "mjth-ci",
+                 "labels": {"sw-boat-runner": "acme"}},
+                // A pool fork with the daemon-identity label of #36: not a host.
+                {"id": "bx_ffffffff", "state": "idle", "name": "acme-ci",
+                 "labels": {"sw-boat-runner-daemon": key}},
+            ]
+        });
+        let found = daemons_in(&listed, "acme/app");
+        assert_eq!(
+            found,
+            [
+                Daemon {
+                    id: "bx_aaaaaaaa".into(),
+                    state: "idle".into()
+                },
+                Daemon {
+                    id: "bx_bbbbbbbb".into(),
+                    state: "stopped".into()
+                },
+            ]
+        );
+        assert!(daemons_in(&listed, "acme/other").is_empty());
+
+        let err = refuse_second_daemon("acme/app", &found, false).unwrap_err();
+        assert!(
+            err.starts_with("boat machine bx_aaaaaaaa (idle), bx_bbbbbbbb (stopped) already runs")
+                && err.contains("`boat delete bx_aaaaaaaa --yes`")
+                && err.contains("--replace"),
+            "{err}"
+        );
+        assert!(refuse_second_daemon("acme/app", &found, true).is_ok());
+        assert!(refuse_second_daemon("acme/app", &[], false).is_ok());
+    }
+
+    #[test]
+    fn replace_waits_for_doctor_not_just_an_active_service() {
+        assert_eq!(
+            doctor_quietly(),
+            "sudo /usr/local/bin/sw-boat-runner doctor >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn a_kept_machine_says_how_to_delete_it() {
+        let k = kept("bx_aaaaaaaa");
+        assert!(
+            k.contains("$HOME/.sbr-setup") && k.contains("`boat delete bx_aaaaaaaa --yes`"),
+            "{k}"
         );
     }
 
@@ -820,6 +1171,8 @@ mod tests {
             },
         );
         assert!(pat.contains("GITHUB_TOKEN=$(cat github-token)") && !pat.contains("ghp_x"));
+        assert!(pat.contains("export GITHUB_TOKEN SBR_PAT=1\n"), "{pat}");
+        assert!(!s.contains("SBR_PAT"), "{s}");
         assert_eq!(
             write_script("boat-key"),
             "umask 077 && mkdir -p \"$HOME/.sbr-setup\" && cat > \"$HOME/.sbr-setup/boat-key\""
@@ -849,7 +1202,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_prints_the_plan() {
-        let p = plan("acme/app", &GitHub::Create, "v0.3.0", false);
+        let p = plan("acme/app", &GitHub::Create, "v0.3.0", false, false);
         assert!(
             p.contains("1. create a private GitHub App for acme/app"),
             "{p}"
@@ -865,14 +1218,21 @@ mod tests {
         );
         assert!(p.contains("install.sh at v0.3.0"), "{p}");
         assert!(p.contains("journalctl -u sw-boat-runner -f"), "{p}");
-        let pasted = plan("acme/app", &GitHub::Create, "v0.3.0", true);
+        assert!(
+            p.contains(
+                "0. look for a boat machine that already runs the daemon for acme/app and stop"
+            ),
+            "{p}"
+        );
+        assert!(plan("acme/app", &GitHub::Create, "v0.3.0", false, true).contains("(--replace)"));
+        let pasted = plan("acme/app", &GitHub::Create, "v0.3.0", true, false);
         assert!(pasted.contains("you paste the code") && !pasted.contains("127.0.0.1"));
-        let pat = plan("acme/app", &GitHub::Pat, "main", false);
+        let pat = plan("acme/app", &GitHub::Pat, "main", false, false);
         assert!(
             pat.contains("GITHUB_TOKEN") && pat.contains("github-token"),
             "{pat}"
         );
-        let shell = plan("acme/app", &GitHub::Shell("7".into()), "main", false);
+        let shell = plan("acme/app", &GitHub::Shell("7".into()), "main", false, false);
         assert!(shell.contains("use GitHub App 7"), "{shell}");
     }
 }
