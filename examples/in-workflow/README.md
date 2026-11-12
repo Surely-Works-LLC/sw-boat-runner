@@ -16,10 +16,10 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.2.0
+    uses: Surely-Works-LLC/sw-boat-runner/.github/workflows/runners.yml@v0.3.0
     with:
       snapshot: snap-1
-      ref: v0.2.0                     # required; the same ref as `uses:`
+      ref: v0.3.0                     # required; the same ref as `uses:`
       app-id: ${{ vars.BOAT_APP_ID }}
     secrets:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
@@ -41,7 +41,7 @@ so only the event check stops it. [Pull requests](#pull-requests) says why.
 
 The `runners` job needs `contents: read` and `actions: read` from the run's token: it
 checks out the daemon and lists the run's jobs to know when they are done. Pin `uses:`
-to a release tag and set `ref` to the same tag (`v0.2.0` above is an example; `app-id`
+to a release tag and set `ref` to the same tag (`v0.3.0` above is an example; `app-id`
 is newer than `v0.1.0`). For more certainty, pin both to the tag's full commit SHA,
 which nobody can move. `ref` is required: GitHub tells a called workflow nothing
 reliable about its own ref, so `uses:` pins the workflow and `ref` pins the daemon it

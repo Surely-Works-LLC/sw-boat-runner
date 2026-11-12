@@ -27,7 +27,7 @@ Intel Mac, build from source (`cargo install`, as in
 
 ```sh
 # macOS arm64. On Linux: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
-curl -fsSLO https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.2.0/sw-boat-runner-aarch64-apple-darwin.tar.gz
+curl -fsSLO https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.3.0/sw-boat-runner-aarch64-apple-darwin.tar.gz
 tar -xzf sw-boat-runner-aarch64-apple-darwin.tar.gz
 ./sw-boat-runner setup --remote    # --dry-run first prints what it would do
 ```
@@ -49,8 +49,8 @@ Or run setup on the machine itself:
 boat new --no-auto-stop --type small    # prints the machine's id
 boat ssh <id>
 # Pin a release you tested, in both places.
-curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.2.0/examples/always-on/install.sh
-SBR_REF=v0.2.0 bash install.sh    # checks the binary, then runs `sw-boat-runner setup`
+curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.0/examples/always-on/install.sh
+SBR_REF=v0.3.0 bash install.sh    # checks the binary, then runs `sw-boat-runner setup`
 ```
 
 Either way, `setup` asks for `repo`, `labels` and `snapshot` and writes them as the policy:

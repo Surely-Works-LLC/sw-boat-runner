@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
+Upgrading from 0.2.0:
+
+- `setup` and `install.sh` use a personal token only with `--pat` (or `SBR_PAT=1`); a
+  `GITHUB_TOKEN` in the shell is ignored. An install that already runs on a token keeps it.
+- Forks now carry the repository. On a boat account that more than one repository uses,
+  upgrade every daemon: a 0.2.0 daemon still takes any machine in a pool of its name.
+- `install.sh` fails when a release lacks a binary for the host instead of building it.
+- `drain` waits until boat has listed no machine for the listing lag (`--settle-s 0` for
+  the old behaviour), and `run` finishes its tick on SIGTERM.
+
 ### Added
 
 - Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
@@ -258,6 +270,7 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/releases/tag/v0.1.0
