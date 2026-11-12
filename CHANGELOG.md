@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `tests/sim_scenarios.rs`: a seven-minute boat outage (every request answers 500) during
+  a warm pool's long job. The daemon keeps running, touches no machine, leaves the busy
+  runner alone and serves the job queued meanwhile within two ticks of boat coming back.
+
 ## [0.3.0] - 2026-11-12
 
 Upgrading from 0.2.0:
