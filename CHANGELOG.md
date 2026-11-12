@@ -6,6 +6,57 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
+  error, once per other daemon, when a machine forked by another daemon for the same
+  repository and pool appears while it runs.
+
+
+- `setup --remote` stops when a boat machine already runs the daemon for the
+  repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
+  `--replace` deletes that machine once `doctor` finds no FAIL on the new one.
+- A rerun of `setup` with a stored or given GitHub App checks that the App is installed
+  on the policy's repository before it writes anything, and uses the installation
+  GitHub names for it.
+- The unit `setup` writes sets `TimeoutStopSec=300`, so systemd waits for the daemon to
+  finish its tick on SIGTERM.
+- `tests/install_sh.rs` runs `install.sh` with fake `curl`, `uname`, `getconf`, `gh` and
+  `cargo`; CI runs shellcheck on it.
+
+
+- `tests/sim`: a stateful fake boat and GitHub over virtual time that the real
+  `run::Loop` runs against. boat's machines boot, stop, expire on their TTL and lose their
+  disk, behind a listing that lags; GitHub's runners come online only once their JIT
+  config is started on an Up machine, and its jobs queue, run, finish or are cancelled.
+  Faults: timeouts, lost answers, 429, 5xx, 401/403, crashes between two requests and
+  restarts. `tests/sim_props.rs` checks the design's invariants over random policies,
+  workloads and fault schedules (`SIM_CASES`, `SIM_SEED`);
+  `tests/sim_known_bugs.rs` and `tests/sim_findings.rs` hold one ignored test per open
+  bug. `run::Loop::drain` is public so the tests can drive it.
+
+### Changed
+
+- `check` and `run` warn about a `fork_ttl_s` that is not above `register_timeout_s` plus
+  300 s; a fork's TTL then may end before its runner comes online.
+- `run` warns once about a job fork whose `Busy` runner comes within 10 minutes of
+  `fork_ttl_s`, after which boat archives the machine.
+
+- `setup` and `setup --remote` ignore `GITHUB_TOKEN` unless `--pat` is given, and say
+  so. They used to refuse to run while it was set. A rerun whose
+  `/etc/sw-boat-runner/env` holds a personal token and no App keeps that token, so an
+  upgrade of a 0.2.0 `--pat` install stays on it; `--new-app` switches to an App.
+- `install.sh` passes `--pat` only with `SBR_PAT=1` or `--pat`, and otherwise unsets
+  `GITHUB_TOKEN` and `GH_TOKEN` for `setup`. Before, the `GITHUB_TOKEN` every boat
+  machine has (its creator's) made setup install that personal token instead of
+  creating an App.
+- `install.sh` stops when a release lacks the binary or `SHA256SUMS` (404) or has no
+  binary for the platform, instead of installing rustup and building the tag. Only a
+  commit, a branch, or glibc older than 2.35 builds with cargo. A `gh` too old for
+  `gh attestation` gets a warning instead of a failure.
+- `setup --remote` takes a pasted code or redirect address while it waits for the
+  browser, for a browser on another computer, instead of only after 15 minutes.
+
 ### Fixed
 
 - Queued and in-progress runs, and each run's jobs, are read past the first page of 100
@@ -79,64 +130,10 @@ All notable changes to this project are documented here. The format follows
   60 s, and while jobs are queued as many forks as there are jobs, that no `Busy` runner
   holds, stay. Its runner is deleted first, so one that just took a job keeps it.
 
-### Added
-
-- Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
-  error, once per other daemon, when a machine forked by another daemon for the same
-  repository and pool appears while it runs.
-
-### Changed
-
-- `check` and `run` warn about a `fork_ttl_s` that is not above `register_timeout_s` plus
-  300 s; a fork's TTL then may end before its runner comes online.
-- `run` warns once about a job fork whose `Busy` runner comes within 10 minutes of
-  `fork_ttl_s`, after which boat archives the machine.
-### Changed
-
-- `setup` and `setup --remote` ignore `GITHUB_TOKEN` unless `--pat` is given, and say
-  so. They used to refuse to run while it was set. A rerun whose
-  `/etc/sw-boat-runner/env` holds a personal token and no App keeps that token, so an
-  upgrade of a 0.2.0 `--pat` install stays on it; `--new-app` switches to an App.
-- `install.sh` passes `--pat` only with `SBR_PAT=1` or `--pat`, and otherwise unsets
-  `GITHUB_TOKEN` and `GH_TOKEN` for `setup`. Before, the `GITHUB_TOKEN` every boat
-  machine has (its creator's) made setup install that personal token instead of
-  creating an App.
-- `install.sh` stops when a release lacks the binary or `SHA256SUMS` (404) or has no
-  binary for the platform, instead of installing rustup and building the tag. Only a
-  commit, a branch, or glibc older than 2.35 builds with cargo. A `gh` too old for
-  `gh attestation` gets a warning instead of a failure.
-- `setup --remote` takes a pasted code or redirect address while it waits for the
-  browser, for a browser on another computer, instead of only after 15 minutes.
-
-### Added
-
-- `setup --remote` stops when a boat machine already runs the daemon for the
-  repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
-  `--replace` deletes that machine once `doctor` finds no FAIL on the new one.
-- A rerun of `setup` with a stored or given GitHub App checks that the App is installed
-  on the policy's repository before it writes anything, and uses the installation
-  GitHub names for it.
-- The unit `setup` writes sets `TimeoutStopSec=300`, so systemd waits for the daemon to
-  finish its tick on SIGTERM.
-- `tests/install_sh.rs` runs `install.sh` with fake `curl`, `uname`, `getconf`, `gh` and
-  `cargo`; CI runs shellcheck on it.
-
-### Fixed
 
 - `setup --remote` waits for `boat ssh` when writing its input fails, and an install
   failure says the machine is kept, may hold the keys in `~/.sbr-setup`, and gives
   `boat delete <id> --yes`.
-### Added
-
-- `tests/sim`: a stateful fake boat and GitHub over virtual time that the real
-  `run::Loop` runs against. boat's machines boot, stop, expire on their TTL and lose their
-  disk, behind a listing that lags; GitHub's runners come online only once their JIT
-  config is started on an Up machine, and its jobs queue, run, finish or are cancelled.
-  Faults: timeouts, lost answers, 429, 5xx, 401/403, crashes between two requests and
-  restarts. `tests/sim_props.rs` checks the design's invariants over random policies,
-  workloads and fault schedules (`SIM_CASES`, `SIM_SEED`);
-  `tests/sim_known_bugs.rs` and `tests/sim_findings.rs` hold one ignored test per open
-  bug. `run::Loop::drain` is public so the tests can drive it.
 
 ## [0.2.0] - 2026-11-11
 
