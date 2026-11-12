@@ -1884,6 +1884,13 @@ impl Sim {
             github::Auth::Token(gh_token(i)),
             self.now,
         ));
+        // Requests run on the world's virtual time, so the loop's answer clock does too.
+        let net = self.net;
+        if let Some(lp) = d.lp.as_mut() {
+            lp.set_clock(Box::new(move || {
+                std::time::Duration::from_secs(net.world.borrow().now)
+            }));
+        }
     }
 
     /// The process dies and comes back with empty memory.
@@ -1956,27 +1963,35 @@ impl Sim {
         }
     }
 
-    /// Runs `drain` for daemon `i` once a tick until it reports 0 or `max_ticks` pass.
-    /// Returns the drain results in order.
+    /// Runs `drain` for daemon `i` the way `sw-boat-runner drain` does: one process that
+    /// drains once a tick until boat has listed no machine for the settle window (the
+    /// HTTP timeout plus a tick, the listing lag), or `max_ticks` pass. Returns the drain
+    /// results in order.
     pub fn drain(&mut self, i: usize, max_ticks: usize) -> Vec<Result<usize, String>> {
+        let settle_s = 90 + self.tick_s;
         let mut out = Vec::new();
+        let d = &self.daemons[i];
+        let mut lp = Loop::new(
+            d.cfg,
+            self.net,
+            boat_key(i),
+            github::Auth::Token(gh_token(i)),
+            self.now,
+        );
+        let mut empty_since = None;
         for _ in 0..max_ticks {
             let now = self.now;
             self.world_mut().advance(now);
-            let d = &self.daemons[i];
-            // `drain` is a fresh process each time, as `sw-boat-runner drain` is.
-            let mut lp = Loop::new(
-                d.cfg,
-                self.net,
-                boat_key(i),
-                github::Auth::Token(gh_token(i)),
-                now,
-            );
             let r = lp.drain(now).map_err(|e| e.to_string());
-            let done = r == Ok(0);
+            let settled = if r == Ok(0) {
+                now - *empty_since.get_or_insert(now) >= settle_s
+            } else {
+                empty_since = None;
+                false
+            };
             out.push(r);
             self.now += self.tick_s;
-            if done {
+            if settled {
                 break;
             }
         }

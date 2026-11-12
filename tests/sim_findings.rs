@@ -23,7 +23,6 @@ const T0: u64 = 20_000 * DAY_S + 3_600;
 /// included start just before the daemon's first fork after midnight; the daemon then
 /// makes two more paid starts it believes fit the cap: 15 cents against a cap of 10.
 #[test]
-#[ignore = "new bug: start price moved between observe and act is booked at the old price (src/run/act.rs)"]
 fn a_start_charged_above_its_quote_counts_against_the_cap() {
     // 23:50 UTC: a fresh daemon books its whole cap as spent until midnight.
     let start = 20_001 * DAY_S - 600;
@@ -71,7 +70,6 @@ fn a_start_charged_above_its_quote_counts_against_the_cap() {
 /// With nothing else queued the fork stays up for the whole TTL (an hour by default):
 /// one machine-hour per cancelled job, which `cancel-in-progress` makes common.
 #[test]
-#[ignore = "new bug: a cancelled job's fork idles until fork_ttl_s (src/decide.rs)"]
 fn a_fork_whose_job_was_cancelled_is_deleted_soon() {
     let mut w = World::new(
         T0,
