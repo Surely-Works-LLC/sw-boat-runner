@@ -605,8 +605,9 @@ impl<'a> Loop<'a> {
         self.act(now, observed, actions)
     }
 
-    /// `drain`'s one tick, then the machines left.
-    fn drain(&mut self, now: UnixSecs) -> Result<usize, Error> {
+    /// `drain`'s one tick, then the machines left. Public so tests/sim can drive it over
+    /// virtual time.
+    pub fn drain(&mut self, now: UnixSecs) -> Result<usize, Error> {
         // `delete_everything` ignores queued jobs, so drain does not spend requests on them.
         self.read_jobs = false;
         self.tick(now, delete_everything)?;

@@ -126,6 +126,17 @@ All notable changes to this project are documented here. The format follows
 - `setup --remote` waits for `boat ssh` when writing its input fails, and an install
   failure says the machine is kept, may hold the keys in `~/.sbr-setup`, and gives
   `boat delete <id> --yes`.
+### Added
+
+- `tests/sim`: a stateful fake boat and GitHub over virtual time that the real
+  `run::Loop` runs against. boat's machines boot, stop, expire on their TTL and lose their
+  disk, behind a listing that lags; GitHub's runners come online only once their JIT
+  config is started on an Up machine, and its jobs queue, run, finish or are cancelled.
+  Faults: timeouts, lost answers, 429, 5xx, 401/403, crashes between two requests and
+  restarts. `tests/sim_props.rs` checks the design's invariants over random policies,
+  workloads and fault schedules (`SIM_CASES`, `SIM_SEED`);
+  `tests/sim_known_bugs.rs` and `tests/sim_findings.rs` hold one ignored test per open
+  bug. `run::Loop::drain` is public so the tests can drive it.
 
 ## [0.2.0] - 2026-11-11
 
