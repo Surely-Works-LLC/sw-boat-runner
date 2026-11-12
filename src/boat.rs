@@ -1,8 +1,10 @@
 //! boat REST client: the sandbox calls the tick loop needs, nothing else.
 //! Reference: https://docs.boat.dev/api/v1.md
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
@@ -16,6 +18,13 @@ pub(crate) const BASE: &str = "https://boat.dev/api/v1";
 const POOL_LABEL: &str = "sw-boat-runner";
 /// Label of a forked machine: `sw-boat-runner-job=<job id>-<attempt>`.
 const JOB_LABEL: &str = "sw-boat-runner-job";
+/// Label of the repository a machine serves: `sw-boat-runner-repo=<owner>/<name>`,
+/// lowercased, as GitHub compares them. boat takes any label value up to 256 bytes, and
+/// GitHub's names (39 + 1 + 100 bytes of `[A-Za-z0-9._-]`) fit. Machines made before 0.3.0
+/// lack it; see `Client::list`.
+const REPO_LABEL: &str = "sw-boat-runner-repo";
+/// Label naming the daemon process that forked a machine, for `Peers`.
+const DAEMON_LABEL: &str = "sw-boat-runner-daemon";
 /// The longest `ttlSeconds` boat accepts. Expiry archives a machine; it does not delete it.
 pub(crate) const MAX_TTL_S: u64 = 2_592_000;
 
@@ -139,15 +148,199 @@ impl Sandbox {
             attempt: attempt.parse().ok()?,
         })
     }
+
+    fn label(&self, key: &str) -> Option<&str> {
+        self.labels.get(key).map(String::as_str)
+    }
 }
 
-/// The labels a fork carries: its pool, and the job it is for unless it is a kept machine.
-fn fork_labels(pool: &str, job: Option<JobKey>) -> BTreeMap<&'static str, String> {
+/// The value of `REPO_LABEL` for `repo`.
+pub(crate) fn repo_label(repo: &str) -> String {
+    repo.to_ascii_lowercase()
+}
+
+/// Whether a machine labelled `sw-boat-runner=<pool>` belongs to `repo`'s daemon: it has
+/// `repo`'s `REPO_LABEL`, or none, as every machine made before 0.3.0. Those are adopted
+/// so an upgrade does not orphan them; boat cannot add a label to a machine, so they keep
+/// lacking it until they are deleted.
+fn belongs(sb: &Sandbox, repo: &str) -> bool {
+    sb.label(REPO_LABEL).is_none_or(|r| r == repo)
+}
+
+/// The labels a fork carries: its pool, its repository and daemon when the client has
+/// them, and the job it is for unless it is a kept machine.
+fn fork_labels(
+    pool: &str,
+    owner: Option<&Owner>,
+    job: Option<JobKey>,
+) -> BTreeMap<&'static str, String> {
     let mut labels = BTreeMap::from([(POOL_LABEL, pool.to_string())]);
+    if let Some(owner) = owner {
+        labels.insert(REPO_LABEL, owner.repo.clone());
+        labels.insert(DAEMON_LABEL, owner.daemon.clone());
+    }
     if let Some(job) = job {
         labels.insert(JOB_LABEL, format!("{}-{}", job.id, job.attempt));
     }
     labels
+}
+
+/// How much a `stray_report` line matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Severity {
+    /// Nothing to do.
+    Info,
+    /// Machines nothing deletes, or that two repositories' daemons may share.
+    Warn,
+}
+
+/// What a listing of every daemon machine on the account says about the policy for `repo`
+/// with `pools`: lines to print, none when all is well. Machines of a pool the policy no
+/// longer has are never listed by `run` again, so nothing deletes them.
+pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<(Severity, String)> {
+    let repo = repo_label(repo);
+    let live = all
+        .iter()
+        .filter(|sb| machine_state(&sb.state) != MachineState::Gone);
+    let mut ours: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut legacy: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut adopted: BTreeMap<&str, usize> = BTreeMap::new();
+    // Pools of the policy that another repository's 0.3.0 daemon uses too.
+    let mut shared: BTreeSet<&str> = BTreeSet::new();
+    for sb in live {
+        let Some(pool) = sb.label(POOL_LABEL) else {
+            continue;
+        };
+        let known = pools.contains(&pool);
+        match (sb.label(REPO_LABEL), known) {
+            (Some(r), false) if r == repo => ours.entry(pool).or_default().push(&sb.id),
+            (Some(r), true) if r != repo => {
+                shared.insert(pool);
+            }
+            (None, false) => legacy.entry(pool).or_default().push(&sb.id),
+            (None, true) => *adopted.entry(pool).or_default() += 1,
+            _ => {}
+        }
+    }
+    let delete = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| format!("`boat delete {id} --yes`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = Vec::new();
+    for (pool, ids) in &ours {
+        out.push((
+            Severity::Warn,
+            format!(
+                "pool {pool} is not in the policy but has {} machine(s) of {repo}: {}; \
+                 nothing deletes them. Put the pool back and run `sw-boat-runner drain \
+                 <policy.toml>`, or once their runners are done: {}",
+                ids.len(),
+                ids.join(", "),
+                delete(ids),
+            ),
+        ));
+    }
+    for (pool, ids) in &legacy {
+        out.push((
+            Severity::Warn,
+            format!(
+                "pool {pool} is not in the policy and has {} machine(s) without a repo label \
+                 (made before 0.3.0, so maybe another repository's): {}. If they are \
+                 {repo}'s, put the pool back and run `sw-boat-runner drain <policy.toml>`, \
+                 or once their runners are done: {}",
+                ids.len(),
+                ids.join(", "),
+                delete(ids),
+            ),
+        ));
+    }
+    // Machines without a repo label are a risk only when another repository may use the
+    // same pool name on this account.
+    let risk = !legacy.is_empty() || !shared.is_empty();
+    for (pool, n) in &adopted {
+        let line = if risk {
+            (
+                Severity::Warn,
+                format!(
+                    "pool {pool}: {n} machine(s) have no repo label (made before 0.3.0) and \
+                     are adopted as {repo}'s, and this boat account has machines of another \
+                     repository or pool that may share the name {pool}. A daemon older than \
+                     0.3.0 filters on the pool label only, so it takes every machine of pool \
+                     {pool}, labelled or not: upgrade every repository's daemon to 0.3.0, \
+                     then drain pool {pool} (`sw-boat-runner drain <policy.toml>`) so all its \
+                     machines carry the repo label"
+                ),
+            )
+        } else {
+            (
+                Severity::Info,
+                format!(
+                    "pool {pool}: {n} machine(s) from before 0.3.0 have no repo label and are \
+                     adopted as {repo}'s. That is harmless while only {repo} uses the pool \
+                     name {pool} on this boat account; draining the pool to relabel them is \
+                     optional"
+                ),
+            )
+        };
+        out.push(line);
+    }
+    out
+}
+
+/// The repository and process a client's machines belong to.
+pub(crate) struct Owner {
+    /// `REPO_LABEL`'s value.
+    repo: String,
+    /// `DAEMON_LABEL`'s value for the forks this process makes.
+    daemon: String,
+    peers: RefCell<Peers>,
+}
+
+/// Spots a second daemon on the same repository and pool: a machine that first shows up
+/// in a listing after this process's first one, labelled by another daemon, was forked by
+/// a daemon that is still running. A predecessor's last forks can show up for a request
+/// timeout and a tick after it was stopped, so those first seen within `grace` of the
+/// start are not counted. A second daemon that only uses kept machines forks nothing and
+/// is not seen.
+struct Peers {
+    started: Instant,
+    grace: Duration,
+    /// Pools listed at least once.
+    listed: HashSet<String>,
+    /// Machines seen in any listing.
+    seen: HashSet<String>,
+    /// Daemons already warned about.
+    warned: BTreeSet<String>,
+}
+
+impl Peers {
+    fn note(&mut self, owner_daemon: &str, pool: &str, listed: &[Sandbox]) {
+        let first = self.listed.insert(pool.to_string());
+        let armed = self.started.elapsed() >= self.grace;
+        for sb in listed {
+            let new = self.seen.insert(sb.id.clone());
+            let Some(daemon) = sb.label(DAEMON_LABEL) else {
+                continue;
+            };
+            if first || !new || !armed || daemon == owner_daemon {
+                continue;
+            }
+            if machine_state(&sb.state) == MachineState::Gone {
+                continue;
+            }
+            if self.warned.insert(daemon.to_string()) {
+                eprintln!(
+                    "error: machine {} of pool {pool} was forked by another sw-boat-runner \
+                     daemon ({daemon}) while this one ({owner_daemon}) runs. Two daemons on \
+                     one repository and pool stop, delete and register runners on each \
+                     other's machines: stop one of them",
+                    sb.id
+                );
+            }
+        }
+    }
 }
 
 /// What `GET /limits` says about the next start.
@@ -198,11 +391,36 @@ pub(crate) fn is_sandbox_id(s: &str) -> bool {
 pub(crate) struct Client<'t> {
     t: &'t dyn Transport,
     key: String,
+    /// Set by `for_repo`: the daemon's machines, which `list` keeps and `fork` labels.
+    owner: Option<Owner>,
 }
 
 impl<'t> Client<'t> {
     pub(crate) fn new(t: &'t dyn Transport, key: String) -> Self {
-        Client { t, key }
+        Client {
+            t,
+            key,
+            owner: None,
+        }
+    }
+
+    /// A client for the daemon `daemon` of `repo`: `list` keeps only `repo`'s machines
+    /// and `fork` labels new ones with both. A machine of another daemon that shows up more
+    /// than `grace` after now is reported once on stderr; see `Peers`.
+    pub(crate) fn for_repo(mut self, repo: &str, daemon: String, grace: Duration) -> Self {
+        let peers = Peers {
+            started: Instant::now(),
+            grace,
+            listed: HashSet::new(),
+            seen: HashSet::new(),
+            warned: BTreeSet::new(),
+        };
+        self.owner = Some(Owner {
+            repo: repo_label(repo),
+            daemon,
+            peers: RefCell::new(peers),
+        });
+        self
     }
 
     /// The one request path: auth, status mapping, and the 2xx body read as `T`. An
@@ -251,13 +469,34 @@ impl<'t> Client<'t> {
             .map(drop)
     }
 
-    /// Every sandbox of `pool`, in any state, following `pageInfo.nextCursor`.
+    /// Every sandbox of `pool`, in any state, following `pageInfo.nextCursor`. With an
+    /// owner, only the machines of its repository, and those with no repository label (see
+    /// `belongs`); boat filters on the pool label, the rest is done here.
     pub(crate) fn list(&self, pool: &str) -> Result<Vec<Sandbox>, Error> {
-        self.list_labelled(POOL_LABEL, pool)
+        let mut listed = self.list_labelled(POOL_LABEL, pool)?;
+        if let Some(owner) = &self.owner {
+            listed.retain(|sb| belongs(sb, &owner.repo));
+            owner.peers.borrow_mut().note(&owner.daemon, pool, &listed);
+        }
+        Ok(listed)
+    }
+
+    /// Every sandbox on the account with a pool label, of any repository and pool, for
+    /// `stray_report`. boat has no filter on a label's key alone, so this reads the whole
+    /// account's list.
+    pub(crate) fn list_daemon_machines(&self) -> Result<Vec<Sandbox>, Error> {
+        let mut all = self.list_query(None)?;
+        all.retain(|sb| sb.labels.contains_key(POOL_LABEL));
+        Ok(all)
     }
 
     /// Every sandbox labelled `key=value`, in any state, following `pageInfo.nextCursor`.
     pub(crate) fn list_labelled(&self, key: &str, value: &str) -> Result<Vec<Sandbox>, Error> {
+        self.list_query(Some((key, value)))
+    }
+
+    /// Every sandbox, or those labelled `key=value`, following `pageInfo.nextCursor`.
+    fn list_query(&self, label: Option<(&str, &str)>) -> Result<Vec<Sandbox>, Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Page {
@@ -270,11 +509,13 @@ impl<'t> Client<'t> {
             next_cursor: Option<String>,
             has_more: bool,
         }
-        let label = encode(&format!("{key}={value}"));
+        let filter = label.map_or(String::new(), |(key, value)| {
+            format!("label={}&", encode(&format!("{key}={value}")))
+        });
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            let mut path = format!("/sandboxes?label={label}&limit={PAGE_LIMIT}");
+            let mut path = format!("/sandboxes?{filter}limit={PAGE_LIMIT}");
             if let Some(c) = &cursor {
                 path.push_str("&cursor=");
                 path.push_str(&encode(c));
@@ -289,7 +530,12 @@ impl<'t> Client<'t> {
         Err(Error::Other {
             status: 0,
             code: "too_many_pages".into(),
-            message: format!("more than {MAX_PAGES} pages of sandboxes labelled {key}={value}"),
+            message: match label {
+                Some((key, value)) => {
+                    format!("more than {MAX_PAGES} pages of sandboxes labelled {key}={value}")
+                }
+                None => format!("more than {MAX_PAGES} pages of sandboxes"),
+            },
         })
     }
 
@@ -346,7 +592,7 @@ impl<'t> Client<'t> {
         let body = json!({
             "from": snapshot,
             "type": machine_type,
-            "labels": fork_labels(pool, job),
+            "labels": fork_labels(pool, self.owner.as_ref(), job),
             "ttlSeconds": ttl_s,
             "noEnv": true,
         });
@@ -864,6 +1110,164 @@ mod tests {
         assert_eq!(sent[0].header("authorization"), Some("Bearer boat_k"));
     }
 
+    /// A listing for pool `ci`: this repository's machine, one from before 0.3.0, another
+    /// repository's, and this repository's in other case.
+    fn shared_account() -> Fake {
+        Fake::new(|_| {
+            respond(
+                200,
+                &[],
+                r#"{"sandboxes":[
+                    {"id":"bx_22222222","state":"idle",
+                     "labels":{"sw-boat-runner":"ci","sw-boat-runner-repo":"o/r"}},
+                    {"id":"bx_33333333","state":"idle","labels":{"sw-boat-runner":"ci"}},
+                    {"id":"bx_44444444","state":"idle",
+                     "labels":{"sw-boat-runner":"ci","sw-boat-runner-repo":"o/other"}},
+                    {"id":"bx_55555555","state":"idle",
+                     "labels":{"sw-boat-runner":"ci","sw-boat-runner-repo":"o/r"}}],
+                    "pageInfo":{"nextCursor":null,"hasMore":false}}"#,
+            )
+        })
+    }
+
+    /// Two repositories' daemons with the same pool name on one boat account each see
+    /// only their own machines, and both adopt the ones made before the repo label.
+    #[test]
+    fn a_daemon_lists_only_its_repositorys_machines() {
+        let fake = shared_account();
+        let ids = |repo: &str| {
+            let boat = Client::new(&fake, "k".into()).for_repo(repo, "d".into(), Duration::ZERO);
+            let listed = boat.list("ci").unwrap();
+            listed.into_iter().map(|sb| sb.id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids("O/R"), ["bx_22222222", "bx_33333333", "bx_55555555"]);
+        assert_eq!(ids("o/other"), ["bx_33333333", "bx_44444444"]);
+        // Without an owner (snapshot, setup), every machine of the pool.
+        assert_eq!(Client::new(&fake, "k".into()).list("ci").unwrap().len(), 4);
+        // The account-wide listing has no label filter.
+        let boat = Client::new(&fake, "k".into());
+        assert_eq!(boat.list_daemon_machines().unwrap().len(), 4);
+        let last = fake.sent().pop().unwrap();
+        assert_eq!(last.url, "https://boat.dev/api/v1/sandboxes?limit=200");
+    }
+
+    #[test]
+    fn a_daemons_forks_carry_its_repository_and_name() {
+        let fake = Fake::new(|_| {
+            respond(
+                202,
+                &[],
+                r#"{"sandbox":{"id":"bx_44444444","state":"init"}}"#,
+            )
+        });
+        let boat =
+            Client::new(&fake, "k".into()).for_repo("Octo/Repo", "h-1-9".into(), Duration::ZERO);
+        boat.fork("runner-base", "large", "ci", None, 3600, "key")
+            .unwrap();
+        let body: Value = serde_json::from_slice(fake.sent()[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["labels"],
+            json!({"sw-boat-runner":"ci","sw-boat-runner-repo":"octo/repo",
+                   "sw-boat-runner-daemon":"h-1-9"})
+        );
+    }
+
+    /// Pre-0.3.0 machines of a policy pool are only an info line, unless the account shows
+    /// that another repository may use the same pool name.
+    #[test]
+    fn adopted_machines_warn_only_when_another_repository_may_share_the_pool() {
+        let sb = |id: &str, pool: &str, repo: Option<&str>| {
+            let mut labels = BTreeMap::from([(POOL_LABEL.to_string(), pool.to_string())]);
+            if let Some(r) = repo {
+                labels.insert(REPO_LABEL.into(), r.into());
+            }
+            Sandbox {
+                id: id.into(),
+                state: "idle".into(),
+                labels,
+                holds_creator_logins: None,
+            }
+        };
+        let severities = |all: &[Sandbox]| {
+            stray_report("O/R", &["ci"], all)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+        };
+        let mine = [
+            sb("bx_22222222", "ci", None),
+            sb("bx_33333333", "ci", Some("o/r")),
+        ];
+        assert_eq!(severities(&mine), [Severity::Info]);
+        let line = &stray_report("o/r", &["ci"], &mine)[0].1;
+        assert!(
+            line.contains("harmless") && line.contains("optional"),
+            "{line}"
+        );
+
+        // Another repository's 0.3.0 daemon has a pool `ci` too.
+        let shared = [mine[0].clone(), sb("bx_44444444", "ci", Some("o/other"))];
+        assert_eq!(severities(&shared), [Severity::Warn]);
+        let line = &stray_report("o/r", &["ci"], &shared)[0].1;
+        assert!(line.contains("upgrade every repository's daemon"), "{line}");
+
+        // Unlabelled machines of a pool this policy does not have: maybe another
+        // repository's daemon, older than 0.3.0.
+        let unknown = [mine[0].clone(), sb("bx_55555555", "boat", None)];
+        assert_eq!(severities(&unknown), [Severity::Warn, Severity::Warn]);
+        assert!(severities(&[]).is_empty());
+    }
+
+    /// A machine another daemon forked after this one's first listing is reported once;
+    /// machines in the first listing, this daemon's own and pre-0.3.0 ones are not.
+    #[test]
+    fn spots_a_second_daemon_on_the_same_pool() {
+        let sandbox = |id: &str, daemon: Option<&str>| {
+            let mut labels = BTreeMap::from([(POOL_LABEL.to_string(), "ci".to_string())]);
+            if let Some(d) = daemon {
+                labels.insert(DAEMON_LABEL.into(), d.into());
+            }
+            Sandbox {
+                id: id.into(),
+                state: "idle".into(),
+                labels,
+                holds_creator_logins: None,
+            }
+        };
+        let mut peers = Peers {
+            started: Instant::now(),
+            grace: Duration::ZERO,
+            listed: HashSet::new(),
+            seen: HashSet::new(),
+            warned: BTreeSet::new(),
+        };
+        let old = sandbox("bx_22222222", Some("a-1-1"));
+        peers.note("me", "ci", std::slice::from_ref(&old));
+        assert!(peers.warned.is_empty());
+        let later = [
+            old,
+            sandbox("bx_33333333", Some("me")),
+            sandbox("bx_44444444", None),
+        ];
+        peers.note("me", "ci", &later);
+        assert!(peers.warned.is_empty());
+        let foreign = [
+            sandbox("bx_55555555", Some("b-2-2")),
+            sandbox("bx_66666666", Some("b-2-2")),
+        ];
+        peers.note("me", "ci", &foreign);
+        assert_eq!(peers.warned.iter().collect::<Vec<_>>(), ["b-2-2"]);
+
+        // Within the grace after a start, a predecessor's last fork is not counted.
+        let mut fresh = Peers {
+            grace: Duration::from_secs(3600),
+            ..peers
+        };
+        fresh.warned.clear();
+        fresh.note("me", "ci", &[sandbox("bx_77777777", Some("c-3-3"))]);
+        assert!(fresh.warned.is_empty());
+    }
+
     #[test]
     fn fork_sends_idempotency_key_and_labels() {
         let fake = Fake::new(|_| {
@@ -1010,7 +1414,7 @@ mod tests {
         let sandbox = |job: Option<JobKey>| Sandbox {
             id: "bx_22222222".into(),
             state: "idle".into(),
-            labels: fork_labels("ci", job)
+            labels: fork_labels("ci", None, job)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),

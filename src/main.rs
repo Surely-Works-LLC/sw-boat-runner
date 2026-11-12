@@ -7,8 +7,8 @@ use sw_boat_runner::{decide, policy, run, snapshot};
 const USAGE: &str = "\
 usage: sw-boat-runner check <policy.toml>
        sw-boat-runner plan <policy.toml> [snapshot.json]
-       sw-boat-runner run <policy.toml>
-       sw-boat-runner drain <policy.toml>
+       sw-boat-runner run <policy.toml> [--drain-on-stop]
+       sw-boat-runner drain <policy.toml> [--settle-s S] [--timeout-s S]
        sw-boat-runner snapshot <sandbox-id> <name> [--machine-type T] [--fix] [--keep-fork] [--yes]
        sw-boat-runner setup [--remote] [--pat] [--dry-run] [--help]
        sw-boat-runner doctor [policy.toml]
@@ -19,8 +19,11 @@ Keeps self-hosted GitHub Actions runners on boat machines.
 
   check   validate a policy and print each pool with its preset applied
   plan    print the actions run would take, from a snapshot file or one live read
-  run     observe, decide and act every tick_s seconds
-  drain   delete the policy's runners and machines; fails while any are left
+  run     observe, decide and act every tick_s seconds. SIGINT or SIGTERM ends it after
+          the current tick; --drain-on-stop then drains the pools as drain does
+  drain   delete the policy's runners and machines, every tick_s, until boat has listed
+          none for --settle-s (default: the 90 s request timeout plus tick_s, how long a
+          fork may go unlisted); fails with machines left after --timeout-s (default 900)
   snapshot  check a sandbox in a noEnv fork and save the fork as a CI snapshot
   setup     install the daemon as a systemd service here, or with --remote on a new boat
             machine from this computer; setup --help says how
@@ -46,16 +49,48 @@ fn main() -> ExitCode {
         ["plan", policy, snapshot] => {
             with_policy(policy, |cfg| cmd_plan(cfg, Some(Path::new(snapshot))))
         }
-        ["run", policy] => with_policy(policy, cmd_run),
-        ["drain", policy] => with_policy(policy, cmd_drain),
+        ["run", policy, flags @ ..] => match flags {
+            [] => with_policy(policy, |cfg| cmd_run(cfg, run::RunOpts::default())),
+            ["--drain-on-stop"] => with_policy(policy, |cfg| {
+                cmd_run(
+                    cfg,
+                    run::RunOpts {
+                        drain_on_stop: true,
+                    },
+                )
+            }),
+            _ => usage(),
+        },
+        ["drain", policy, flags @ ..] => with_policy(policy, |cfg| match drain_opts(cfg, flags) {
+            Some(opts) => cmd_drain(cfg, opts),
+            None => usage(),
+        }),
         ["snapshot", rest @ ..] => cmd_snapshot(rest),
         ["setup", rest @ ..] => sw_boat_runner::setup::cli(rest),
         ["doctor", rest @ ..] => sw_boat_runner::doctor::cli(rest),
-        _ => {
-            eprintln!("{USAGE}");
-            ExitCode::from(2)
-        }
+        _ => usage(),
     }
+}
+
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
+
+/// `drain`'s flags, each a number of seconds; `None` for anything else.
+fn drain_opts(cfg: &model::Config, flags: &[&str]) -> Option<run::DrainOpts> {
+    let mut opts = run::DrainOpts::new(cfg);
+    let mut rest = flags;
+    while let [flag, value, tail @ ..] = rest {
+        let value: u64 = value.parse().ok()?;
+        match *flag {
+            "--settle-s" => opts.settle_s = value,
+            "--timeout-s" => opts.timeout_s = value,
+            _ => return None,
+        }
+        rest = tail;
+    }
+    rest.is_empty().then_some(opts)
 }
 
 fn with_policy(path: &str, cmd: impl FnOnce(&model::Config) -> ExitCode) -> ExitCode {
@@ -139,8 +174,8 @@ fn read_snapshot(path: &Path) -> Result<model::Snapshot, String> {
 }
 
 /// Fails while a machine is left, so a script can repeat it until the pools are empty.
-fn cmd_drain(cfg: &model::Config) -> ExitCode {
-    match run::drain(cfg) {
+fn cmd_drain(cfg: &model::Config, opts: run::DrainOpts) -> ExitCode {
+    match run::drain(cfg, opts) {
         Ok(0) => ExitCode::SUCCESS,
         Ok(left) => {
             eprintln!("drain: {left} machines left");
@@ -153,9 +188,13 @@ fn cmd_drain(cfg: &model::Config) -> ExitCode {
     }
 }
 
-fn cmd_run(cfg: &model::Config) -> ExitCode {
-    match run::run(cfg, decide::decide) {
-        Ok(()) => ExitCode::SUCCESS,
+fn cmd_run(cfg: &model::Config, opts: run::RunOpts) -> ExitCode {
+    match run::run(cfg, decide::decide, opts) {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(left) => {
+            eprintln!("run: drain left {left} machines");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("run: {e}");
             ExitCode::FAILURE

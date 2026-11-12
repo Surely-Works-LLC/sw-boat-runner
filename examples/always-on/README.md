@@ -114,8 +114,8 @@ Then point jobs at the pool:
 runs-on: [self-hosted, boat]
 ```
 
-To stop using it, stop the service and delete the pool's machines and runners. Repeat
-the `drain` line until it succeeds; [Any other host](#any-other-host) says what it
+To stop using it, stop the service and delete the pool's machines and runners. `drain`
+repeats until boat has listed none for about two minutes; if it fails, run it again; [Any other host](#any-other-host) says what it
 does.
 
 ```sh
@@ -169,7 +169,7 @@ Then check the policy, see what the daemon would do, and run it:
 ```sh
 sw-boat-runner check policy.toml   # validate, print each pool with its preset applied
 sw-boat-runner plan policy.toml    # observe once, print the actions as JSON; changes nothing
-sw-boat-runner run policy.toml     # the loop
+sw-boat-runner run policy.toml     # the loop; SIGINT or SIGTERM stops it after the tick
 sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to stop using them
 ```
 
@@ -178,9 +178,16 @@ sw-boat-runner drain policy.toml   # delete the pools' machines and runners, to 
 [tests/scenarios](../../tests/scenarios/) has snapshots to start from.
 
 `drain` deletes the pools' machines and runners, and leaves every other machine and
-runner alone. It fails while a machine is left, for example one whose runner is still
-running a job, so run it again until it succeeds. Then point `runs-on` back at another
+runner alone, including another repository's. It repeats every `tick_s` until boat has
+listed no machine for `--settle-s` seconds (default: the 90 s request timeout plus
+`tick_s`, how long boat may take to list a fork the daemon made just before it stopped).
+It fails if a machine is left after `--timeout-s` (default 900), for example one whose
+runner is still running a job; run it again. `run --drain-on-stop` drains the same way
+in the daemon itself once SIGINT or SIGTERM stops it. Then point `runs-on` back at another
 runner.
+
+`run` and `doctor` warn about machines of this repository in a pool the policy no longer
+has, which nothing deletes, and print the `drain` or `boat delete` command for them.
 
 ## Verifying a release
 

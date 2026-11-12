@@ -123,6 +123,7 @@ jobs:
           APP_KEY_FILE: ${{ runner.temp }}/github-app.pem
         run: (umask 077 && printf '%s\n' "$APP_KEY" > "$APP_KEY_FILE")
       - name: Run the daemon until the run's other jobs are done
+        id: daemon
         env:
           BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
@@ -130,8 +131,10 @@ jobs:
           GITHUB_APP_PRIVATE_KEY_FILE: ${{ inputs.app-id != '' && format('{0}/github-app.pem', runner.temp) || '' }}
           # Listing this run's jobs needs only the run's own token.
           GH_TOKEN: ${{ github.token }}
+        # SIGTERM lets the daemon finish its tick, then --drain-on-stop deletes the pool's
+        # machines in the same process, which still knows the forks boat has not listed.
         run: |
-          target/release/sw-boat-runner run policy.toml &
+          target/release/sw-boat-runner run policy.toml --drain-on-stop &
           daemon=$!
           jobs="repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100"
           # Every job but the daemons themselves. A job behind `needs` is listed only once
@@ -144,20 +147,20 @@ jobs:
             if [ "$(gh api "$jobs" --jq "$open")" -eq 0 ]; then idle=$((idle + 1)); else idle=0; fi
           done
           kill "$daemon"
+          wait "$daemon"
       - name: Delete the pool's machines and runners
-        if: always()
+        if: always() && steps.daemon.outcome != 'success'
         env:
           BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.RUNNER_ADMIN_TOKEN }}
           GITHUB_APP_ID: ${{ inputs.app-id }}
           GITHUB_APP_PRIVATE_KEY_FILE: ${{ inputs.app-id != '' && format('{0}/github-app.pem', runner.temp) || '' }}
+        # When the daemon did not drain (it failed, or the run was cancelled). A fresh
+        # process does not know the forks boat has not listed yet, so drain repeats until
+        # boat has listed none for the listing lag.
         run: |
           [ -f policy.toml ] || exit 0
-          for _ in $(seq 20); do
-            if target/release/sw-boat-runner drain policy.toml; then exit 0; fi
-            sleep 15
-          done
-          exit 1
+          target/release/sw-boat-runner drain policy.toml --timeout-s 600
       - name: Delete the app's key
         if: always()
         env:

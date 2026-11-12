@@ -17,6 +17,8 @@ mod testkit;
 
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::boat;
@@ -83,7 +85,22 @@ impl From<github::Error> for Error {
     }
 }
 
-pub fn run(cfg: &Config, decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>) -> Result<(), Error> {
+/// How `run` ends after SIGINT or SIGTERM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunOpts {
+    /// Drain the pools in this process before exiting, as `drain` does. This process
+    /// still remembers the forks boat has not listed yet, so none is missed.
+    pub drain_on_stop: bool,
+}
+
+/// Ticks until SIGINT or SIGTERM, which let the current tick finish; a second signal exits
+/// at once with status 130. Returns the machines left by `--drain-on-stop`, else 0.
+pub fn run(
+    cfg: &Config,
+    decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>,
+    opts: RunOpts,
+) -> Result<usize, Error> {
+    let stop = stop_on_signal();
     let transport = Ureq::new(HTTP_TIMEOUT);
     let mut tick_loop = Loop::connect(cfg, &transport, unix_now())?;
     // Once, and only advice: a failed read changes nothing.
@@ -95,12 +112,73 @@ pub fn run(cfg: &Config, decide: impl Fn(&Snapshot, &Pool) -> Vec<Action>) -> Re
         }
         Err(e) => eprintln!("saved snapshots: {e}"),
     }
-    let period = Duration::from_secs(cfg.tick_s.max(1));
-    loop {
-        let started = Instant::now();
-        tick_loop.tick(unix_now(), &decide)?;
-        std::thread::sleep(period.saturating_sub(started.elapsed()));
+    let pools: Vec<&str> = cfg.pools.iter().map(|p| p.name.as_str()).collect();
+    match tick_loop.boat.list_daemon_machines() {
+        Ok(all) => {
+            for (severity, line) in boat::stray_report(&cfg.repo, &pools, &all) {
+                match severity {
+                    boat::Severity::Info => eprintln!("info: {line}"),
+                    boat::Severity::Warn => eprintln!("warning: {line}"),
+                }
+            }
+        }
+        Err(e) => eprintln!("listing every pool's machines: {e}"),
     }
+    let stopped = || stop.load(Ordering::SeqCst);
+    // Sleeps until the next tick is due, or a signal.
+    let mut wait = |d: Duration| {
+        let end = Instant::now() + d;
+        while !stopped() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(200)));
+        }
+    };
+    tick_loop.serve(
+        &decide,
+        opts,
+        &stopped,
+        &mut unix_now,
+        &mut wait,
+        &mut std::thread::sleep,
+    )
+}
+
+/// A flag SIGINT and SIGTERM set. The shutdown hook goes first, so it sees the flag unset
+/// on the first signal and exits on the second.
+pub(crate) fn stop_on_signal() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
+        let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
+    }
+    stop
+}
+
+/// How long a fork boat accepted may go unlisted (`FixListLag`): the request timeout and a
+/// tick.
+pub fn list_lag_s(cfg: &Config) -> u64 {
+    HTTP_TIMEOUT.as_secs().saturating_add(cfg.tick_s)
+}
+
+/// This process's `sw-boat-runner-daemon` label: host, process id and start time, so a
+/// restart is a new daemon too and the line that names it says where it runs.
+fn daemon_id(now: UnixSecs) -> String {
+    let host = ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_default();
+    let host: String = host
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .take(64)
+        .collect();
+    let host = if host.is_empty() { "host" } else { &host };
+    format!("{host}-{}-{now}", std::process::id())
 }
 
 /// One observe with `run`'s credentials and no writes, for `plan` without a snapshot file.
@@ -115,13 +193,35 @@ pub fn observe_once(cfg: &Config) -> Result<Snapshot, Error> {
         .snapshot)
 }
 
+/// How long `drain` keeps going.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainOpts {
+    /// Done once no machine has been listed for this long. A fork a stopped daemon sent
+    /// may not be listed for `list_lag_s`, so less can miss it.
+    pub settle_s: u64,
+    /// Give up after this long, with the machines still left.
+    pub timeout_s: u64,
+}
+
+impl DrainOpts {
+    pub const DEFAULT_TIMEOUT_S: u64 = 900;
+
+    pub fn new(cfg: &Config) -> Self {
+        DrainOpts {
+            settle_s: list_lag_s(cfg),
+            timeout_s: Self::DEFAULT_TIMEOUT_S,
+        }
+    }
+}
+
 /// Deletes every machine and runner of the policy's pools, for taking a pool out of use.
-/// A machine whose runner is running a job is left alone. Returns the machines still
-/// there, so a caller can repeat it until it returns 0.
-pub fn drain(cfg: &Config) -> Result<usize, Error> {
+/// A machine whose runner is running a job is left alone. Repeats every `tick_s` until no
+/// machine has been listed for `settle_s`, or `timeout_s` has passed. Returns the
+/// machines still there, 0 once it settled.
+pub fn drain(cfg: &Config, opts: DrainOpts) -> Result<usize, Error> {
     let transport = Ureq::new(HTTP_TIMEOUT);
     let now = unix_now();
-    Loop::connect(cfg, &transport, now)?.drain(now)
+    Loop::connect(cfg, &transport, now)?.drain_settled(opts, &mut unix_now, &mut std::thread::sleep)
 }
 
 /// `drain`'s stand-in for `decide`.
@@ -259,9 +359,11 @@ impl<'a> Loop<'a> {
         github: github::Auth,
         now: UnixSecs,
     ) -> Self {
+        // A predecessor's forks may show up for `list_lag_s` after this start.
+        let grace = Duration::from_secs(list_lag_s(cfg));
         Loop {
             cfg,
-            boat: boat::Client::new(t, boat_key),
+            boat: boat::Client::new(t, boat_key).for_repo(&cfg.repo, daemon_id(now), grace),
             gh: github::Client::new(t, github, cfg.repo.clone()),
             memory: observe::Memory::default(),
             ledger: act::Ledger::new(cfg, now),
@@ -324,6 +426,88 @@ impl<'a> Loop<'a> {
             .iter()
             .filter(|m| m.state != MachineState::Gone);
         Ok(left.count())
+    }
+
+    /// `drain` rounds every `tick_s` until no machine has been listed for `settle_s`. Past
+    /// `timeout_s` it stops at the first round that lists a machine, returning how many,
+    /// or that fails, returning its error; an empty listing still runs on to `settle_s`.
+    fn drain_settled(
+        &mut self,
+        opts: DrainOpts,
+        clock: &mut dyn FnMut() -> UnixSecs,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<usize, Error> {
+        let start = clock();
+        let mut empty_since = None;
+        let mut last = None;
+        loop {
+            let now = clock();
+            let timed_out = now.saturating_sub(start) >= opts.timeout_s;
+            match self.drain(now) {
+                Ok(0) => {
+                    let since = *empty_since.get_or_insert(now);
+                    if now.saturating_sub(since) >= opts.settle_s {
+                        return Ok(0);
+                    }
+                    if last != Some(0) {
+                        eprintln!(
+                            "drain: no machines left; checking for {}s that boat lists no more",
+                            opts.settle_s
+                        );
+                    }
+                    last = Some(0);
+                }
+                Ok(left) => {
+                    empty_since = None;
+                    if timed_out {
+                        return Ok(left);
+                    }
+                    if last != Some(left) {
+                        eprintln!("drain: {left} machines left");
+                    }
+                    last = Some(left);
+                }
+                Err(e) if e.is_fatal() || timed_out => return Err(e),
+                Err(e) => {
+                    empty_since = None;
+                    last = None;
+                    eprintln!("drain: {e}");
+                }
+            }
+            sleep(Duration::from_secs(self.cfg.tick_s.max(1)));
+        }
+    }
+
+    /// Ticks every `tick_s` until `stop` says so, checked after each tick, so the tick in
+    /// progress always finishes. `wait` sleeps until the next tick is due and may return
+    /// early once `stop` is set. Then drains with `opts.drain_on_stop`, still knowing the
+    /// forks boat has not listed, pausing with `sleep`, which a set `stop` must not cut
+    /// short. Returns the machines that drain left, else 0.
+    fn serve(
+        &mut self,
+        decide: &dyn Fn(&Snapshot, &Pool) -> Vec<Action>,
+        opts: RunOpts,
+        stop: &dyn Fn() -> bool,
+        clock: &mut dyn FnMut() -> UnixSecs,
+        wait: &mut dyn FnMut(Duration),
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<usize, Error> {
+        let period = self.cfg.tick_s.max(1);
+        while !stop() {
+            let started = clock();
+            self.tick(started, decide)?;
+            if stop() {
+                break;
+            }
+            let spent = clock().saturating_sub(started);
+            wait(Duration::from_secs(period.saturating_sub(spent)));
+        }
+        if !opts.drain_on_stop {
+            eprintln!("run: stopped by a signal");
+            return Ok(0);
+        }
+        eprintln!("run: stopped by a signal; draining");
+        self.drain_settled(DrainOpts::new(self.cfg), clock, sleep)
     }
 
     fn pool(&self, name: &str) -> Result<&'a Pool, Error> {
@@ -440,6 +624,8 @@ mod tests {
         let sent = fake.sent();
         let fork = &sent[16];
         assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
+        assert!(fork.body_text().contains(r#""sw-boat-runner-repo":"o/r""#));
+        assert!(fork.body_text().contains(r#""sw-boat-runner-daemon":""#));
         assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
         let jit = &sent[11];
         assert!(
@@ -538,6 +724,144 @@ mod tests {
                 format!("DELETE {BOAT}/sandboxes/bx_44444444"),
             ]
         );
+    }
+
+    /// `drain_settled` on a clock that only its sleeps move, from `NOW`. Returns the result
+    /// and the time it returned.
+    fn drain_at(fake: &Fake, opts: DrainOpts) -> (usize, UnixSecs) {
+        let cfg = config();
+        let t = std::cell::Cell::new(NOW);
+        let mut tick_loop = started(&cfg, fake);
+        let left = tick_loop
+            .drain_settled(opts, &mut || t.get(), &mut |d| t.set(t.get() + d.as_secs()))
+            .unwrap();
+        (left, t.get())
+    }
+
+    /// The daemon was stopped right after boat accepted a fork, which boat lists only from
+    /// the second round's first listing. A drain that stopped at the first empty listing
+    /// would leave it; waiting `settle_s` with nothing listed deletes it.
+    #[test]
+    fn drain_waits_out_the_listing_lag() {
+        let late = |t| if (3..=4).contains(&t) { LISTED_55 } else { "" };
+        let settle = DrainOpts {
+            settle_s: 30,
+            timeout_s: 900,
+        };
+        let fake = lagging(late, |_| JOB_70);
+        assert_eq!(drain_at(&fake, settle), (0, NOW + 60));
+        let delete = format!("DELETE {BOAT}/sandboxes/bx_55555555");
+        assert!(requests(&fake).contains(&delete), "{:?}", requests(&fake));
+
+        // `--settle-s 0` is the old drain, which misses it.
+        let fake = lagging(late, |_| JOB_70);
+        let at_once = DrainOpts {
+            settle_s: 0,
+            ..settle
+        };
+        assert_eq!(drain_at(&fake, at_once), (0, NOW));
+        assert!(!requests(&fake).contains(&delete));
+    }
+
+    /// Another repository's daemon has a pool `ci` on the same boat account: draining
+    /// this one leaves its machine alone.
+    #[test]
+    fn drain_leaves_another_repositorys_machines() {
+        let other = |_| {
+            r#"{"id":"bx_66666666","state":"idle",
+                "labels":{"sw-boat-runner":"ci","sw-boat-runner-repo":"o/other"}}"#
+        };
+        let fake = lagging(other, |_| JOB_70);
+        let opts = DrainOpts {
+            settle_s: 0,
+            timeout_s: 0,
+        };
+        assert_eq!(drain_at(&fake, opts), (0, NOW));
+        assert!(!requests(&fake).iter().any(|r| r.starts_with("DELETE")));
+    }
+
+    #[test]
+    fn drain_gives_up_with_machines_left_after_its_timeout() {
+        let fake = lagging(|_| LISTED_55, |_| JOB_70);
+        let opts = DrainOpts {
+            settle_s: 105,
+            timeout_s: 30,
+        };
+        assert_eq!(drain_at(&fake, opts), (1, NOW + 30));
+    }
+
+    #[test]
+    fn the_default_drain_settles_for_the_listing_lag() {
+        let cfg = config();
+        assert_eq!(DrainOpts::new(&cfg).settle_s, 105);
+        assert_eq!(list_lag_s(&cfg), HTTP_TIMEOUT.as_secs() + cfg.tick_s);
+    }
+
+    /// `serve` on a clock that only its waits and sleeps move, from `NOW`. `decide` forks
+    /// job 70 on the first tick and then the stop flag is set, as by a signal during that
+    /// tick. Returns the result, the ticks run and the time it returned.
+    fn serve_at(fake: &Fake, opts: RunOpts, stop_after: usize) -> (usize, usize, UnixSecs) {
+        let cfg = config();
+        let t = std::cell::Cell::new(NOW);
+        let ticks = std::cell::Cell::new(0);
+        let stop = AtomicBool::new(false);
+        let decide = |s: &Snapshot, _: &Pool| {
+            ticks.set(ticks.get() + 1);
+            if ticks.get() == stop_after {
+                stop.store(true, Ordering::SeqCst);
+            }
+            if s.machines.is_empty() && ticks.get() == 1 {
+                vec![fork(Some(70))]
+            } else {
+                Vec::new()
+            }
+        };
+        let advance = |d: Duration| t.set(t.get() + d.as_secs());
+        let left = started(&cfg, fake)
+            .serve(
+                &decide,
+                opts,
+                &|| stop.load(Ordering::SeqCst),
+                &mut || t.get(),
+                &mut |d| advance(d),
+                &mut |d| advance(d),
+            )
+            .unwrap();
+        (left, ticks.get(), t.get())
+    }
+
+    /// A signal during the third tick: that tick finishes, no fourth starts, and nothing
+    /// is deleted without `--drain-on-stop`.
+    #[test]
+    fn a_signal_ends_the_loop_after_the_current_tick() {
+        let fake = lagging(|_| "", |_| JOB_70);
+        assert_eq!(serve_at(&fake, RunOpts::default(), 3), (0, 3, NOW + 30));
+        assert_eq!(forks(&fake).len(), 1);
+        assert!(!requests(&fake).iter().any(|r| r.starts_with("DELETE")));
+    }
+
+    /// The daemon forks for job 70 and is stopped; boat never lists the fork while the
+    /// daemon runs. `--drain-on-stop` still deletes it, because this process remembers the
+    /// fork, and then waits out the listing lag with nothing listed.
+    #[test]
+    fn drain_on_stop_deletes_a_fork_boat_has_not_listed() {
+        let fake = lagging(|_| "", |_| JOB_70);
+        let opts = RunOpts {
+            drain_on_stop: true,
+        };
+        let (left, ticks, _) = serve_at(&fake, opts, 1);
+        assert_eq!((left, ticks), (0, 1));
+        let delete = format!("DELETE {BOAT}/sandboxes/bx_55555555");
+        assert!(requests(&fake).contains(&delete), "{:?}", requests(&fake));
+    }
+
+    /// The handlers set the flag on the first signal and leave the process running.
+    #[test]
+    fn a_signal_sets_the_stop_flag() {
+        let stop = stop_on_signal();
+        assert!(!stop.load(Ordering::SeqCst));
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        assert!(stop.load(Ordering::SeqCst));
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {

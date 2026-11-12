@@ -100,7 +100,9 @@ fn single_pool(text: &str) -> Result<Option<toml::Table>, Error> {
 }
 
 /// A pool name from its labels: those other than `self-hosted`, lowercased, with every
-/// character a name may not hold replaced by `_`, or `default` when none is left.
+/// character a name may not hold replaced by `_`, or `default` when none is left. Two
+/// repositories with the same labels get the same name; their machines are told apart by
+/// boat's repo label (`boat::repo_label`), not by the name.
 fn name_from(labels: &[String]) -> String {
     let parts: Vec<String> = labels
         .iter()
