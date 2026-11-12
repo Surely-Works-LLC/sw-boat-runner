@@ -4,6 +4,7 @@
 //! The key, the JWT and the installation token are credentials: none of them has `Debug`
 //! or `Display`, and no error message quotes them or a response body that holds them.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
@@ -21,8 +22,8 @@ use crate::github::{API, Error};
 use crate::model::UnixSecs;
 use crate::transport::{Transport, redact};
 
-/// The JWT says it was issued this long ago, so a clock a little ahead of GitHub's still
-/// passes.
+/// The JWT says it was issued this long before GitHub's time, as GitHub advises, so a
+/// clock a little ahead of the last `Date` seen still passes.
 const JWT_BACKDATE_S: u64 = 60;
 /// The JWT expires this long from now; GitHub refuses one that lives over 10 minutes.
 const JWT_LIFE_S: u64 = 540;
@@ -38,6 +39,10 @@ pub struct App {
     key: RsaKeyPair,
     rng: SystemRandom,
     token: Option<Installation>,
+    /// GitHub's clock minus this one, in seconds, from the last `Date` GitHub sent. The
+    /// JWT's `iat` and `exp` and the token's expiry go by GitHub's time, so a clock that
+    /// runs ahead or behind is not refused. A `Cell`, so `doctor`'s `&App` calls learn it.
+    skew: Cell<i64>,
 }
 
 struct Installation {
@@ -73,6 +78,7 @@ impl App {
             key,
             rng: SystemRandom::new(),
             token: None,
+            skew: Cell::new(0),
         })
     }
 
@@ -82,8 +88,28 @@ impl App {
         App::new(id, installation, &pem).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// An RS256 JWT for the app, valid from a minute before `now` for nine minutes after.
+    /// `now` on GitHub's clock, as far as the last `Date` it sent tells.
+    fn github_now(&self, now: UnixSecs) -> UnixSecs {
+        now.saturating_add_signed(self.skew.get())
+    }
+
+    /// Learns GitHub's clock from the `Date` of an answer received at `now`, which must be
+    /// the time the answer arrived, not when its tick began: a slow request would read as
+    /// skew.
+    pub(crate) fn note_date(&self, now: UnixSecs, date: Option<&str>) {
+        let Some(server) = date.and_then(parse_http_date) else {
+            return;
+        };
+        let (Ok(server), Ok(local)) = (i64::try_from(server), i64::try_from(now)) else {
+            return;
+        };
+        self.skew.set(server - local);
+    }
+
+    /// An RS256 JWT for the app, valid from a minute before `now` for nine minutes after,
+    /// on GitHub's clock.
     fn jwt(&self, now: UnixSecs) -> Result<String, Error> {
+        let now = self.github_now(now);
         let iss = match self.id.parse::<u64>() {
             Ok(n) => json!(n),
             Err(_) => json!(self.id),
@@ -106,32 +132,58 @@ impl App {
     }
 
     /// The installation token, minted again when none is held or it expires within
-    /// `REFRESH_EARLY_S` of `now`.
+    /// `REFRESH_EARLY_S` of `now` (on GitHub's clock). A JWT GitHub refuses for its time
+    /// is signed again once on the clock of GitHub's answer.
+    #[cfg(test)]
     pub(crate) fn token(
         &mut self,
         t: &dyn Transport,
         repo: &str,
         now: UnixSecs,
     ) -> Result<String, Error> {
+        self.token_at(t, repo, &|| now)
+    }
+
+    /// `token` with `now` read at each step, so a JWT is signed, and each answer's `Date`
+    /// compared, at the time it happens.
+    pub(crate) fn token_at(
+        &mut self,
+        t: &dyn Transport,
+        repo: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<String, Error> {
         if let Some(held) = &self.token {
-            if now.saturating_add(REFRESH_EARLY_S) < held.expires {
+            if self.github_now(now()).saturating_add(REFRESH_EARLY_S) < held.expires {
                 return Ok(held.token.clone());
             }
         }
         self.token = None;
-        let jwt = self.jwt(now)?;
+        let skew = self.skew.get();
+        let held = match self.mint(t, repo, now) {
+            Err(Error::Clock(_)) if self.skew.get() != skew => self.mint(t, repo, now),
+            r => r,
+        }?;
+        let token = held.token.clone();
+        self.token = Some(held);
+        Ok(token)
+    }
+
+    fn mint(
+        &mut self,
+        t: &dyn Transport,
+        repo: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<Installation, Error> {
+        let jwt = self.jwt(now())?;
         let installation = match self.installation {
             Some(id) => id,
             None => {
-                let id = installation_id(t, &jwt, repo)?;
+                let id = self.installation_id(t, &jwt, repo, now)?;
                 self.installation = Some(id);
                 id
             }
         };
-        let held = exchange(t, &jwt, installation, repo)?;
-        let token = held.token.clone();
-        self.token = Some(held);
-        Ok(token)
+        self.exchange(t, &jwt, installation, repo, now)
     }
 
     /// One look for the app's installation on `repo`, for `setup`'s wait: `Ok(None)` while
@@ -148,7 +200,7 @@ impl App {
         }
         let jwt = self.jwt(now)?;
         let url = format!("{API}/repos/{repo}/installation");
-        let (status, body) = send(t, "GET", &url, &jwt, None)?;
+        let (status, body) = self.send(t, "GET", &url, &jwt, None, &|| now)?;
         match status {
             200..=299 => serde_json::from_slice::<Out>(&body)
                 .map(|out| Some(out.id))
@@ -182,7 +234,7 @@ impl App {
         let jwt = self.jwt(now)?;
         let url = format!("{API}/app/installations/{installation}");
         let what = format!("read installation {installation}");
-        let body = call(t, "GET", &url, &jwt, None, &what)?;
+        let body = self.call(t, "GET", &url, &jwt, None, &what, &|| now)?;
         serde_json::from_slice::<Out>(&body)
             .map(|out| out.permissions)
             .map_err(|_| Error::Parse("installation response".into()))
@@ -197,102 +249,126 @@ impl App {
     pub(crate) fn forget_token(&mut self) {
         self.token = None;
     }
-}
 
-/// `GET /repos/{owner}/{repo}/installation`: the app's installation on the repository.
-fn installation_id(t: &dyn Transport, jwt: &str, repo: &str) -> Result<u64, Error> {
-    #[derive(Deserialize)]
-    struct Out {
-        id: u64,
-    }
-    let url = format!("{API}/repos/{repo}/installation");
-    let what = format!("find the app's installation on {repo} (is the app installed there?)");
-    let body = call(t, "GET", &url, jwt, None, &what)?;
-    let out: Out =
-        serde_json::from_slice(&body).map_err(|_| Error::Parse("installation response".into()))?;
-    Ok(out.id)
-}
-
-/// `POST /app/installations/{id}/access_tokens`, for the policy's repository only and
-/// only the permissions the daemon uses, whatever else the app was granted.
-fn exchange(
-    t: &dyn Transport,
-    jwt: &str,
-    installation: u64,
-    repo: &str,
-) -> Result<Installation, Error> {
-    #[derive(Deserialize)]
-    struct Out {
-        token: String,
-        expires_at: String,
-    }
-    let url = format!("{API}/app/installations/{installation}/access_tokens");
-    let name = repo.split_once('/').map_or(repo, |(_, name)| name);
-    let body = json!({
-        "repositories": [name],
-        "permissions": { "administration": "write", "actions": "read" },
-    });
-    let what = format!("get a token for installation {installation}");
-    let bytes = call(t, "POST", &url, jwt, Some(&body), &what)?;
-    // serde errors can quote the input; this input holds the token.
-    let out: Out = serde_json::from_slice(&bytes)
-        .map_err(|_| Error::Parse("installation token response".into()))?;
-    let expires = parse_utc(&out.expires_at)
-        .ok_or_else(|| Error::Parse(format!("expires_at {:?}", out.expires_at)))?;
-    Ok(Installation {
-        token: out.token,
-        expires,
-    })
-}
-
-/// One app-authenticated call. These count against the app's own limit, not the
-/// installation token's, so they stay out of the client's request budget.
-fn call(
-    t: &dyn Transport,
-    method: &str,
-    url: &str,
-    jwt: &str,
-    body: Option<&Value>,
-    what: &str,
-) -> Result<Vec<u8>, Error> {
-    let (status, body) = send(t, method, url, jwt, body)?;
-    if (200..300).contains(&status) {
-        return Ok(body);
-    }
-    let message = message(&body, jwt);
-    let rate_limited =
-        status == 429 || (status == 403 && message.to_ascii_lowercase().contains("rate limit"));
-    match status {
-        401 | 403 | 404 | 422 if !rate_limited => {
-            Err(Error::App(format!("could not {what}: {status} {message}")))
+    /// `GET /repos/{owner}/{repo}/installation`: the app's installation on the repository.
+    fn installation_id(
+        &self,
+        t: &dyn Transport,
+        jwt: &str,
+        repo: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<u64, Error> {
+        #[derive(Deserialize)]
+        struct Out {
+            id: u64,
         }
-        status => Err(Error::Status { status, message }),
+        let url = format!("{API}/repos/{repo}/installation");
+        let what = format!("find the app's installation on {repo} (is the app installed there?)");
+        let body = self.call(t, "GET", &url, jwt, None, &what, now)?;
+        let out: Out = serde_json::from_slice(&body)
+            .map_err(|_| Error::Parse("installation response".into()))?;
+        Ok(out.id)
     }
-}
 
-/// Sends one request signed with the app's JWT: the status and the body.
-fn send(
-    t: &dyn Transport,
-    method: &str,
-    url: &str,
-    jwt: &str,
-    body: Option<&Value>,
-) -> Result<(u16, Vec<u8>), Error> {
-    let auth = format!("Bearer {jwt}");
-    let mut headers = vec![
-        ("Authorization", auth.as_str()),
-        ("Accept", "application/vnd.github+json"),
-        ("X-GitHub-Api-Version", "2022-11-28"),
-        ("User-Agent", "sw-boat-runner"),
-    ];
-    if body.is_some() {
-        headers.push(("Content-Type", "application/json"));
+    /// `POST /app/installations/{id}/access_tokens`, for the policy's repository only and
+    /// only the permissions the daemon uses, whatever else the app was granted.
+    fn exchange(
+        &self,
+        t: &dyn Transport,
+        jwt: &str,
+        installation: u64,
+        repo: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<Installation, Error> {
+        #[derive(Deserialize)]
+        struct Out {
+            token: String,
+            expires_at: String,
+        }
+        let url = format!("{API}/app/installations/{installation}/access_tokens");
+        let name = repo.split_once('/').map_or(repo, |(_, name)| name);
+        let body = json!({
+            "repositories": [name],
+            "permissions": { "administration": "write", "actions": "read" },
+        });
+        let what = format!("get a token for installation {installation}");
+        let bytes = self.call(t, "POST", &url, jwt, Some(&body), &what, now)?;
+        // serde errors can quote the input; this input holds the token.
+        let out: Out = serde_json::from_slice(&bytes)
+            .map_err(|_| Error::Parse("installation token response".into()))?;
+        let expires = parse_utc(&out.expires_at)
+            .ok_or_else(|| Error::Parse(format!("expires_at {:?}", out.expires_at)))?;
+        Ok(Installation {
+            token: out.token,
+            expires,
+        })
     }
-    let bytes = body.map(|b| b.to_string().into_bytes());
-    let resp = t
-        .send(method, url, &headers, bytes.as_deref())
-        .map_err(|e| Error::Network(e.0))?;
-    Ok((resp.status, resp.body))
+
+    /// One app-authenticated call. These count against the app's own limit, not the
+    /// installation token's, so they stay out of the client's request budget.
+    ///
+    /// A 401 for the JWT's time claims is `Error::Clock`, which a later try on GitHub's
+    /// clock fixes; any other 401, 403, 404 or 422 is `Error::App`, which it does not.
+    #[allow(clippy::too_many_arguments)]
+    fn call(
+        &self,
+        t: &dyn Transport,
+        method: &str,
+        url: &str,
+        jwt: &str,
+        body: Option<&Value>,
+        what: &str,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<Vec<u8>, Error> {
+        let (status, body) = self.send(t, method, url, jwt, body, now)?;
+        if (200..300).contains(&status) {
+            return Ok(body);
+        }
+        let message = message(&body, jwt);
+        let rate_limited =
+            status == 429 || (status == 403 && message.to_ascii_lowercase().contains("rate limit"));
+        match status {
+            401 if refuses_time(&message) => Err(Error::Clock(format!(
+                "GitHub refused the app's JWT for its time ({message}); this clock is {} s \
+                 off GitHub's, so the next JWT goes by GitHub's; turn on time sync \
+                 (`sudo timedatectl set-ntp true`)",
+                self.skew.get()
+            ))),
+            401 | 403 | 404 | 422 if !rate_limited => {
+                Err(Error::App(format!("could not {what}: {status} {message}")))
+            }
+            status => Err(Error::Status { status, message }),
+        }
+    }
+
+    /// Sends one request signed with the app's JWT: the status and the body. Learns
+    /// GitHub's clock from the answer's `Date`.
+    fn send(
+        &self,
+        t: &dyn Transport,
+        method: &str,
+        url: &str,
+        jwt: &str,
+        body: Option<&Value>,
+        now: &dyn Fn() -> UnixSecs,
+    ) -> Result<(u16, Vec<u8>), Error> {
+        let auth = format!("Bearer {jwt}");
+        let mut headers = vec![
+            ("Authorization", auth.as_str()),
+            ("Accept", "application/vnd.github+json"),
+            ("X-GitHub-Api-Version", "2022-11-28"),
+            ("User-Agent", "sw-boat-runner"),
+        ];
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json"));
+        }
+        let bytes = body.map(|b| b.to_string().into_bytes());
+        let resp = t
+            .send(method, url, &headers, bytes.as_deref())
+            .map_err(|e| Error::Network(e.0))?;
+        self.note_date(now(), resp.header("date"));
+        Ok((resp.status, resp.body))
+    }
 }
 
 /// The `message` of an error response, with the JWT redacted.
@@ -303,6 +379,31 @@ fn message(body: &[u8], jwt: &str) -> String {
         .unwrap_or_default();
     redact(&mut message, jwt);
     message
+}
+
+/// Whether a 401's `message` refuses the JWT's `iat` or `exp`, as GitHub does for a clock
+/// that is off its own: "'Issued at' claim ('iat') must be an Integer representing the
+/// time that the assertion was issued", "'Expiration time' claim ('exp') is too far in the
+/// future", and the like.
+fn refuses_time(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    ["'iat'", "'exp'", "issued at", "expiration time", "expired"]
+        .iter()
+        .any(|claim| m.contains(claim))
+}
+
+/// `Wed, 11 Nov 2026 10:00:00 GMT`, the form HTTP's `Date` takes, to Unix seconds.
+pub(crate) fn parse_http_date(s: &str) -> Option<UnixSecs> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let [_, day, month, year, time, "GMT"] = parts.as_slice() else {
+        return None;
+    };
+    let month = MONTHS.iter().position(|m| m == month)? + 1;
+    let day: u32 = day.parse().ok()?;
+    parse_utc(&format!("{year}-{month:02}-{day:02}T{time}Z"))
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, the form GitHub sends, to Unix seconds.
@@ -496,6 +597,34 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .is_fatal()
         );
+    }
+
+    /// The JWT goes by GitHub's clock once a `Date` showed it, so a clock running ahead
+    /// (or behind) is not refused; a 401 for the time claims is transient, others are not.
+    #[test]
+    fn the_jwt_follows_githubs_clock() {
+        let app = test_app(None);
+        // GitHub reads 1_000_000 while this clock reads 1_000_300.
+        app.note_date(1_000_300, Some("Mon, 12 Jan 1970 13:46:40 GMT"));
+        let jwt = app.jwt(1_000_300).unwrap();
+        assert_eq!(
+            b64(jwt.split('.').nth(1).unwrap()),
+            json!({"iat": 999_940, "exp": 1_000_540, "iss": 12345})
+        );
+        app.note_date(1_000_300, Some("not a date"));
+        assert_eq!(app.skew.get(), -300);
+
+        assert!(refuses_time("'Issued at' claim ('iat') must be an Integer"));
+        assert!(refuses_time(
+            "'Expiration time' claim ('exp') is too far in the future"
+        ));
+        assert!(!refuses_time("A JSON web token could not be decoded"));
+        assert!(!refuses_time("Integration not found"));
+        assert_eq!(
+            parse_http_date("Wed, 11 Nov 2026 10:00:00 GMT"),
+            parse_utc("2026-11-11T10:00:00Z")
+        );
+        assert_eq!(parse_http_date("Wed, 11 Nov 2026 10:00:00 PST"), None);
     }
 
     #[test]

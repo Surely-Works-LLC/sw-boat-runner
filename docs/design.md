@@ -258,8 +258,15 @@ starts with 5,000 left: 30 in-progress runs cost 32 requests a tick before this 
 and a job one of the runs queues is found within 10 ticks (150 s). An installation token
 sends about 2,300 an hour, never skips an observe, and finds the job within 4 ticks
 (60 s), as fast as `RUN_MAX_AGE_S` allows; under the old fixed quarter it took 150 s, as
-for a personal token. With 100 runs, the most one page lists, an installation token
+for a personal token. With 100 runs, one full page of the list, an installation token
 finds the job within 7 ticks (105 s) and a personal token within 32 (480 s).
+
+The run lists and each run's jobs are read page by page, 100 to a page, up to 10 pages,
+so a matrix of more than 100 jobs has its later jobs seen. Paging stops at a short page
+or once the pages cover the list's `total_count`, so a list of 100 or fewer costs one
+request, and each page keeps its own ETag. The ETag cache drops a URL only after a tick
+that sent requests without it; a tick the budget skips sends nothing and keeps every
+ETag, so the next observe is mostly free 304s.
 
 ## State machine
 

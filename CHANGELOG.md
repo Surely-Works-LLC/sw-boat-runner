@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Queued and in-progress runs, and each run's jobs, are read past the first page of 100
+  (up to 10 pages, stopping once `total_count` is covered). A matrix of more than 100
+  jobs no longer hangs with its later jobs never seen.
+- A tick skipped for the GitHub request budget no longer ages the ETag cache, so the
+  next observe sends `If-None-Match` and gets free 304s instead of paying for every read.
+- GitHub errors are split into permanent and transient. Only a bad or revoked
+  credential, a missing permission, an App that is not installed or is refused, and a
+  repository that may not have self-hosted runners stop the daemon. Rate limits, 5xx,
+  network errors and a JWT refused for clock skew are retried on the next tick instead
+  of ending in a systemd restart loop.
+- A GitHub App's JWT goes by GitHub's clock, learned from the `Date` of its answers, so
+  a clock running ahead or behind no longer has the JWT refused; a refusal for `iat` or
+  `exp` resyncs and tries once more.
+- A 403 on registering a runner that blames runner policy now says so, and how to allow
+  self-hosted runners for the repository.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

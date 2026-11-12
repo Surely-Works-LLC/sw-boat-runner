@@ -43,22 +43,39 @@ pub(crate) const PACE_MAX_S: u64 = 300;
 const PER_PAGE: usize = 100;
 const MAX_PAGES: u32 = 10;
 
+/// What can go wrong talking to GitHub. `is_fatal` splits it in two: an error no later
+/// tick can fix, which ends the daemon, and one the loop logs and outlives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Under `RATE_FLOOR` requests left, or GitHub's own limit hit; wait for `reset`.
+    /// Under `RATE_FLOOR` requests left, or GitHub's own limit hit, primary or secondary;
+    /// wait for `reset`. Transient.
     RateLimited {
         remaining: u64,
         reset: UnixSecs,
     },
-    /// 401, or 403 that is not a rate limit: bad token or missing permission.
+    /// 401 (after one fresh installation token for an App), or 403 that is not a rate
+    /// limit: a bad or revoked credential, or a missing permission. Permanent.
     Unauthorized {
         status: u16,
+        message: String,
+    },
+    /// 403 on `generate-jitconfig` that names runners: an organization or enterprise
+    /// policy keeps self-hosted runners off the repository, or the default runner group
+    /// does not include it. Permanent.
+    RunnersForbidden {
+        message: String,
     },
     NotFound,
     /// The GitHub App's JWT or installation was refused: wrong app id or key, the app
-    /// not installed on the repository, or a missing permission.
+    /// not installed on the repository (or uninstalled), suspended, or a missing
+    /// permission. Permanent.
     App(String),
+    /// GitHub refused the App's JWT for its `iat` or `exp`: this clock is off GitHub's.
+    /// The App resyncs to GitHub's `Date` and tries again, so this is transient.
+    Clock(String),
+    /// No answer. Transient.
     Network(String),
+    /// Any other status, 5xx included. Transient.
     Status {
         status: u16,
         message: String,
@@ -67,8 +84,16 @@ pub enum Error {
 }
 
 impl Error {
+    /// True for an error no later tick can fix: the credential is wrong or lacks a
+    /// permission, the App is not installed, or the repository may not have self-hosted
+    /// runners. Restarting does not help, so the daemon stops. Everything else (rate
+    /// limits, 5xx, network errors, a JWT refused for clock skew, 404 on one object) is
+    /// worth another tick.
     pub(crate) fn is_fatal(&self) -> bool {
-        matches!(self, Error::Unauthorized { .. } | Error::App(_))
+        matches!(
+            self,
+            Error::Unauthorized { .. } | Error::App(_) | Error::RunnersForbidden { .. }
+        )
     }
 
     /// This error with every copy of `secret` in its text replaced.
@@ -76,9 +101,12 @@ impl Error {
         match &mut self {
             Error::Network(text)
             | Error::Status { message: text, .. }
+            | Error::Unauthorized { message: text, .. }
+            | Error::RunnersForbidden { message: text }
             | Error::Parse(text)
-            | Error::App(text) => redact(text, secret),
-            Error::RateLimited { .. } | Error::Unauthorized { .. } | Error::NotFound => {}
+            | Error::App(text)
+            | Error::Clock(text) => redact(text, secret),
+            Error::RateLimited { .. } | Error::NotFound => {}
         }
         self
     }
@@ -90,14 +118,43 @@ impl fmt::Display for Error {
             Error::RateLimited { remaining, reset } => {
                 write!(f, "GitHub rate limit: {remaining} left until {reset}")
             }
-            Error::Unauthorized { status } => write!(f, "GitHub unauthorized ({status})"),
+            Error::Unauthorized { status, message } => {
+                write!(f, "GitHub unauthorized ({status}")?;
+                if !message.is_empty() {
+                    write!(f, " {message}")?;
+                }
+                write!(f, ")")?;
+                match status {
+                    401 => write!(f, ": the credential is wrong or revoked"),
+                    _ => write!(
+                        f,
+                        ": the credential lacks a permission (it needs Administration read \
+                         and write and Actions read on the repository)"
+                    ),
+                }
+            }
+            Error::RunnersForbidden { message } => write!(
+                f,
+                "GitHub refused to register a self-hosted runner (403 {message}): an \
+                 organization or enterprise policy can forbid self-hosted runners on the \
+                 repository, and the Default runner group must include it; an owner can \
+                 allow both in the organization's Settings > Actions"
+            ),
             Error::NotFound => write!(f, "GitHub: not found"),
             Error::App(e) => write!(f, "GitHub App: {e}"),
+            Error::Clock(e) => write!(f, "GitHub App: {e}"),
             Error::Network(e) => write!(f, "GitHub network error: {e}"),
             Error::Status { status, message } => write!(f, "GitHub error {status}: {message}"),
             Error::Parse(e) => write!(f, "GitHub response not understood: {e}"),
         }
     }
+}
+
+/// A 403 `message` that blames runner policy rather than the credential.
+fn forbids_runners(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    !m.contains("resource not accessible")
+        && (m.contains("self-hosted") || m.contains("runner") || m.contains("policy"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -218,8 +275,20 @@ impl Budget {
     }
 }
 
+const JITCONFIG: &str = "/actions/runners/generate-jitconfig";
+
+/// A run's jobs, first page. GitHub's default `filter` is `latest`, so a re-run lists only
+/// its latest attempt's jobs.
 fn jobs_path(run: u64) -> String {
     format!("/actions/runs/{run}/jobs?per_page={PER_PAGE}")
+}
+
+/// Page `page` of the list whose first page is `first`.
+fn page_path(first: &str, page: u32) -> String {
+    match page {
+        1 => first.to_string(),
+        n => format!("{first}&page={n}"),
+    }
 }
 
 /// What the last read of an in-progress run's jobs found.
@@ -269,6 +338,13 @@ pub(crate) struct Client<'t> {
     budget: Budget,
     /// In-progress runs by id.
     runs: HashMap<u64, RunJobs>,
+    /// The cache was aged since `begin_tick`. Aging waits for the tick's first request, so
+    /// a tick that sends nothing, such as one the budget skips, keeps every ETag.
+    aged: bool,
+    /// Seconds on a monotonic clock, and its reading at `begin_tick`, so the time an
+    /// answer arrives is `now` plus what the tick has taken so far.
+    elapsed: Box<dyn Fn() -> u64>,
+    tick_mark: u64,
 }
 
 impl<'t> Client<'t> {
@@ -293,18 +369,41 @@ impl<'t> Client<'t> {
                 observed: None,
             },
             runs: HashMap::new(),
+            aged: true,
+            elapsed: {
+                let origin = std::time::Instant::now();
+                Box::new(move || origin.elapsed().as_secs())
+            },
+            tick_mark: 0,
         }
     }
 
-    /// Sets the clock and drops cached bodies the previous tick did not use, so the
-    /// cache holds at most one tick's URLs.
+    /// A client whose monotonic clock is `elapsed`, for tests of slow requests.
+    #[cfg(test)]
+    fn with_clock(mut self, elapsed: impl Fn() -> u64 + 'static) -> Self {
+        self.elapsed = Box::new(elapsed);
+        self
+    }
+
+    /// Sets the clock and refills the budget. The tick's first request then drops cached
+    /// bodies the last tick that sent requests did not use, so the cache holds at most
+    /// one observe's URLs, and a tick that sends nothing ages nothing.
     pub(crate) fn begin_tick(&mut self, now: UnixSecs) {
         self.now = now;
+        self.tick_mark = (self.elapsed)();
+        self.aged = false;
+        self.budget.refill(now);
+    }
+
+    fn age_cache(&mut self) {
+        if self.aged {
+            return;
+        }
+        self.aged = true;
         self.cache.retain(|_, c| c.used);
         for c in self.cache.values_mut() {
             c.used = false;
         }
-        self.budget.refill(now);
     }
 
     /// Whether this tick should observe: with a token in the budget, or when the last
@@ -347,6 +446,7 @@ impl<'t> Client<'t> {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Vec<u8>, Error> {
+        self.age_cache();
         let result = self.send(method, path, body);
         result.map_err(|e| match self.auth.secret() {
             Some(secret) => e.redact(secret),
@@ -374,6 +474,10 @@ impl<'t> Client<'t> {
             }
         }
 
+        if let Auth::App(app) = &self.auth {
+            let arrived = self.now + (self.elapsed)().saturating_sub(self.tick_mark);
+            app.note_date(arrived, resp.header("date"));
+        }
         let remaining = resp.number("x-ratelimit-remaining");
         let retry_after = resp.number("retry-after");
         let a_minute = self.now.saturating_add(60);
@@ -438,8 +542,12 @@ impl<'t> Client<'t> {
                 }
                 Ok(resp.body)
             }
+            403 if path == JITCONFIG && forbids_runners(&message()) => {
+                Err(Error::RunnersForbidden { message: message() })
+            }
             401 | 403 => Err(Error::Unauthorized {
                 status: resp.status,
+                message: message(),
             }),
             404 => Err(Error::NotFound),
             status => Err(Error::Status {
@@ -458,7 +566,11 @@ impl<'t> Client<'t> {
     ) -> Result<Response, Error> {
         let token = match &mut self.auth {
             Auth::Token(token) => token.clone(),
-            Auth::App(app) => app.token(self.t, &self.repo, self.now)?,
+            Auth::App(app) => {
+                let (now, mark, elapsed) = (self.now, self.tick_mark, &self.elapsed);
+                let at = || now + elapsed().saturating_sub(mark);
+                app.token_at(self.t, &self.repo, &at)?
+            }
         };
         let auth = format!("Bearer {token}");
         let mut headers = vec![
@@ -487,6 +599,37 @@ impl<'t> Client<'t> {
     fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> Result<T, Error> {
         let body = self.request("GET", path, None)?;
         serde_json::from_slice(&body).map_err(|e| Error::Parse(e.to_string()))
+    }
+
+    /// Every item under `key` of the list whose first page is `first`, up to `MAX_PAGES`
+    /// pages. Page 1 goes to `first` as is, so its ETag stays put; later pages add
+    /// `&page=N`, each with its own ETag. Paging stops at a short page, or once the pages
+    /// read cover the list's `total_count`, so a list of exactly 100 costs one request.
+    /// Past `MAX_PAGES` the rest is left out rather than fail the observe; the next pages
+    /// come into view as the first ones empty.
+    fn list<T: for<'de> Deserialize<'de>>(
+        &mut self,
+        first: &str,
+        key: &str,
+    ) -> Result<Vec<T>, Error> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let mut v: Value = self.get(&page_path(first, page))?;
+            let total = v.get("total_count").and_then(Value::as_u64);
+            let items = v
+                .get_mut(key)
+                .map(Value::take)
+                .ok_or_else(|| Error::Parse(format!("no `{key}` in the list")))?;
+            let items: Vec<T> =
+                serde_json::from_value(items).map_err(|e| Error::Parse(e.to_string()))?;
+            let short = items.len() < PER_PAGE;
+            out.extend(items);
+            let covered = total.is_some_and(|t| u64::from(page) * PER_PAGE as u64 >= t);
+            if short || covered {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The repository's runners whose names start with `sbr-`.
@@ -520,7 +663,7 @@ impl<'t> Client<'t> {
             encoded_jit_config: String,
         }
         let body = json!({ "name": name, "runner_group_id": 1, "labels": labels });
-        let bytes = self.request("POST", "/actions/runners/generate-jitconfig", Some(&body))?;
+        let bytes = self.request("POST", JITCONFIG, Some(&body))?;
         // serde errors can quote the input; this input holds a credential.
         let out: Out = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Parse("generate-jitconfig response".into()))?;
@@ -532,12 +675,9 @@ impl<'t> Client<'t> {
             .map(drop)
     }
 
-    /// The queued jobs of one run's first 100 jobs.
+    /// The queued jobs of one run, every page of them, so a matrix of more than 100 jobs
+    /// has its later jobs seen.
     fn run_jobs(&mut self, run: u64) -> Result<Vec<(JobKey, Vec<String>)>, Error> {
-        #[derive(Deserialize)]
-        struct Jobs {
-            jobs: Vec<Job>,
-        }
         #[derive(Deserialize)]
         struct Job {
             id: u64,
@@ -545,9 +685,8 @@ impl<'t> Client<'t> {
             status: String,
             labels: Vec<String>,
         }
-        let jobs: Jobs = self.get(&jobs_path(run))?;
+        let jobs: Vec<Job> = self.list(&jobs_path(run), "jobs")?;
         Ok(jobs
-            .jobs
             .into_iter()
             .filter(|j| j.status == "queued")
             .map(|j| {
@@ -560,9 +699,9 @@ impl<'t> Client<'t> {
             .collect())
     }
 
-    /// Queued jobs of the first 100 queued and the first 100 in-progress runs; an
-    /// in-progress run still queues its later jobs. `wanted` tells whether a pool serves a
-    /// job's labels.
+    /// Queued jobs of the queued and the in-progress runs, up to `MAX_PAGES` pages of
+    /// each list; an in-progress run still queues its later jobs. `wanted` tells whether a
+    /// pool serves a job's labels.
     ///
     /// A queued run's jobs are read every call; they rarely change, so most reads are
     /// free 304s. A run in both lists, because it started between them, is read once. An in-progress run's jobs change with every step, so they are read when
@@ -580,10 +719,6 @@ impl<'t> Client<'t> {
         wanted: &dyn Fn(&[String]) -> bool,
     ) -> Result<Vec<QueuedJob>, Error> {
         #[derive(Deserialize)]
-        struct Runs {
-            workflow_runs: Vec<Run>,
-        }
-        #[derive(Deserialize)]
         struct Run {
             id: u64,
             #[serde(default)]
@@ -592,33 +727,37 @@ impl<'t> Client<'t> {
             updated_at: String,
         }
         let mut out = BTreeMap::new();
-        let queued: Runs = self.get(&format!("/actions/runs?status=queued&per_page={PER_PAGE}"))?;
+        let first = format!("/actions/runs?status=queued&per_page={PER_PAGE}");
+        let queued: Vec<Run> = self.list(&first, "workflow_runs")?;
         let mut read = HashSet::new();
-        for run in queued.workflow_runs {
-            out.extend(self.run_jobs(run.id)?);
-            read.insert(run.id);
+        for run in queued {
+            // A run that moved up a page while the list was read shows up twice.
+            if read.insert(run.id) {
+                out.extend(self.run_jobs(run.id)?);
+            }
         }
 
-        let mut runs: Runs = self.get(&format!(
-            "/actions/runs?status=in_progress&per_page={PER_PAGE}"
-        ))?;
+        let first = format!("/actions/runs?status=in_progress&per_page={PER_PAGE}");
+        let mut runs: Vec<Run> = self.list(&first, "workflow_runs")?;
         // A run that started between the two lists was just read as queued.
-        runs.workflow_runs.retain(|r| !read.contains(&r.id));
-        let listed: HashSet<u64> = runs.workflow_runs.iter().map(|r| r.id).collect();
+        runs.retain(|r| read.insert(r.id));
+        let listed: HashSet<u64> = runs.iter().map(|r| r.id).collect();
         self.runs.retain(|id, _| listed.contains(id));
         // (0 required, 1 changed, 2 old; last read; run)
         let mut todo: Vec<(u8, UnixSecs, &Run)> = Vec::new();
-        for run in &runs.workflow_runs {
+        for run in &runs {
             let rank = match self.runs.get(&run.id) {
                 None => (0, 0),
                 Some(c) if c.attempt != run.run_attempt || c.wanted => (0, c.fetched),
                 Some(c) if c.updated_at != run.updated_at => (1, c.fetched),
                 Some(c) if self.now >= c.fetched.saturating_add(RUN_MAX_AGE_S) => (2, c.fetched),
                 Some(_) => {
-                    // Keep its ETag, so its next read may be a free 304.
-                    let url = format!("{API}/repos/{}{}", self.repo, jobs_path(run.id));
-                    if let Some(c) = self.cache.get_mut(&url) {
-                        c.used = true;
+                    // Keep the ETags of its pages, so its next read may be free 304s.
+                    let first = format!("{API}/repos/{}{}", self.repo, jobs_path(run.id));
+                    for (url, c) in &mut self.cache {
+                        if url.starts_with(&first) {
+                            c.used = true;
+                        }
                     }
                     continue;
                 }
@@ -741,11 +880,18 @@ mod tests {
         assert_eq!(sent[0].header("if-none-match"), None);
         assert_eq!(sent[1].header("if-none-match"), Some("\"v1\""));
 
-        // A tick that does not use the URL drops it from the cache.
+        // Ticks that send nothing, such as ones the budget skips, keep the cache...
         gh.begin_tick(3);
         gh.begin_tick(4);
         gh.runners().unwrap();
-        assert_eq!(fake.sent()[2].header("if-none-match"), None);
+        assert_eq!(fake.sent()[2].header("if-none-match"), Some("\"v1\""));
+
+        // ...and a tick that sends requests but not this one drops it.
+        gh.begin_tick(5);
+        gh.delete_runner(1).unwrap();
+        gh.begin_tick(6);
+        gh.runners().unwrap();
+        assert_eq!(fake.sent()[4].header("if-none-match"), None);
     }
 
     #[test]
@@ -967,7 +1113,7 @@ mod tests {
         let mut gh = app(&refused);
         gh.begin_tick(T0);
         let err = gh.runners().unwrap_err();
-        assert_eq!(err, Error::Unauthorized { status: 401 });
+        assert!(matches!(err, Error::Unauthorized { status: 401, .. }));
         assert!(err.is_fatal());
         assert_eq!(refused.sent().len(), 4);
     }
@@ -987,6 +1133,8 @@ mod tests {
         queued_in: Option<u64>,
         touched: Option<u64>,
         left: u64,
+        /// Answer with an ETag, and with a 304 that GitHub does not count when it matches.
+        etags: bool,
     }
 
     const T0: UnixSecs = 1_000_000;
@@ -1034,15 +1182,31 @@ mod tests {
                     }
                     json!({ "jobs": jobs })
                 };
-                st.left = st.left.saturating_sub(1);
+                let body = body.to_string();
+                let etag = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    body.hash(&mut h);
+                    format!("\"{:x}\"", h.finish())
+                };
+                let fresh = st.etags && s.header("if-none-match") == Some(etag.as_str());
+                if !fresh {
+                    st.left = st.left.saturating_sub(1);
+                }
                 let left = st.left.to_string();
                 let reset = (T0 + 3_600).to_string();
-                let headers = [
+                let mut headers = vec![
                     ("X-RateLimit-Limit", "5000"),
                     ("X-RateLimit-Remaining", left.as_str()),
                     ("X-RateLimit-Reset", reset.as_str()),
                 ];
-                respond(200, &headers, &body.to_string())
+                if st.etags {
+                    headers.push(("ETag", etag.as_str()));
+                }
+                match fresh {
+                    true => respond(304, &headers, ""),
+                    false => respond(200, &headers, &body),
+                }
             });
             Busy { fake, state, auth }
         }
@@ -1221,6 +1385,40 @@ mod tests {
         assert_eq!(observed, [0, pace, 2 * pace, 3 * pace]);
     }
 
+    /// Ticks the budget skips send nothing and age no ETag, so each paced observe after
+    /// the first is answered with free 304s, and GitHub's count stops dropping.
+    #[test]
+    fn skipped_ticks_keep_the_etags() {
+        let busy = Busy::new(30, 450, app);
+        busy.state.borrow_mut().etags = true;
+        let mut gh = busy.client();
+        let mut observes = Vec::new();
+        for t in 0..80 {
+            let before = busy.fake.sent().len();
+            if busy.tick(&mut gh, t).1.is_some() {
+                observes.push(before..busy.fake.sent().len());
+            }
+        }
+        let pace = PACE_MAX_S / TICK_S;
+        assert_eq!(observes.len(), 4, "observed every {pace} ticks");
+        let sent = busy.fake.sent();
+        let repo_reads = |range: &std::ops::Range<usize>| {
+            sent[range.clone()]
+                .iter()
+                .filter(|s| s.url.contains("/repos/"))
+                .map(|s| s.header("if-none-match").is_some())
+                .collect::<Vec<_>>()
+        };
+        assert!(repo_reads(&observes[0]).iter().all(|&etag| !etag));
+        for range in &observes[1..] {
+            let reads = repo_reads(range);
+            assert!(!reads.is_empty());
+            assert!(reads.iter().all(|&etag| etag), "{reads:?}");
+        }
+        // The first observe's 32 reads count; the 304s after it do not.
+        assert_eq!(busy.state.borrow().left, 450 - 32);
+    }
+
     /// A run left unread keeps its ETag, so its next read is a free 304 when nothing changed.
     #[test]
     fn an_unread_run_keeps_its_etag() {
@@ -1249,5 +1447,326 @@ mod tests {
             .map(|s| s.header("if-none-match").map(str::to_string))
             .collect();
         assert_eq!(reads, [None, Some("\"j\"".to_string())]);
+    }
+
+    fn job_json(id: u64, status: &str) -> Value {
+        json!({"id": id, "run_attempt": 1, "status": status, "labels": ["self-hosted"]})
+    }
+
+    /// One queued run whose jobs number `jobs`, the last of them queued, with GitHub's
+    /// `total_count`. Each page has an ETag.
+    fn matrix(jobs: u64) -> Fake {
+        Fake::new(move |s| {
+            let page: u64 = s
+                .url
+                .split("&page=")
+                .nth(1)
+                .map_or(1, |p| p.parse().unwrap());
+            let etag = format!("\"p{page}\"");
+            if s.header("if-none-match") == Some(etag.as_str()) {
+                return respond(304, &[], "");
+            }
+            let body = if s.url.contains("status=queued") {
+                json!({"total_count": 1, "workflow_runs": [{"id": 5, "run_attempt": 1}]})
+            } else if s.url.contains("status=in_progress") {
+                json!({"total_count": 0, "workflow_runs": []})
+            } else {
+                let from = (page - 1) * PER_PAGE as u64;
+                let to = (from + PER_PAGE as u64).min(jobs);
+                let list: Vec<Value> = (from..to)
+                    .map(|i| job_json(i, if i + 1 == jobs { "queued" } else { "completed" }))
+                    .collect();
+                json!({"total_count": jobs, "jobs": list})
+            };
+            respond(200, &[("ETag", etag.as_str())], &body.to_string())
+        })
+    }
+
+    fn job_reads(fake: &Fake) -> Vec<String> {
+        fake.sent()
+            .into_iter()
+            .filter(|s| s.url.contains("/jobs"))
+            .map(|s| s.url.trim_start_matches(API).to_string())
+            .collect()
+    }
+
+    /// A run with more than 100 jobs has every page read, so a job past the first 100 is
+    /// seen; a run of exactly 100 costs one request.
+    #[test]
+    fn a_big_matrix_is_read_to_its_last_page() {
+        let fake = matrix(250);
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        gh.begin_tick(T0);
+        let jobs = gh.queued_jobs(&|_| true).unwrap();
+        assert_eq!(jobs.iter().map(|j| j.key.id).collect::<Vec<_>>(), [249]);
+        let first = "/repos/o/r/actions/runs/5/jobs?per_page=100";
+        assert_eq!(
+            job_reads(&fake),
+            [
+                first.to_string(),
+                format!("{first}&page=2"),
+                format!("{first}&page=3")
+            ]
+        );
+
+        // Each page keeps its own ETag.
+        gh.begin_tick(T0 + TICK_S);
+        gh.queued_jobs(&|_| true).unwrap();
+        let sent = fake.sent();
+        let again: Vec<_> = sent
+            .iter()
+            .filter(|s| s.url.contains("/jobs"))
+            .skip(3)
+            .collect();
+        assert_eq!(again.len(), 3);
+        assert!(again.iter().all(|s| s.header("if-none-match").is_some()));
+
+        let fake = matrix(100);
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        gh.begin_tick(T0);
+        assert_eq!(gh.queued_jobs(&|_| true).unwrap()[0].key.id, 99);
+        assert_eq!(job_reads(&fake), [first]);
+    }
+
+    /// The run lists are paged too, and a run that moved between pages is read once.
+    #[test]
+    fn run_lists_are_paged() {
+        let fake = Fake::new(|s| {
+            let page = s.url.split("&page=").nth(1).unwrap_or("1");
+            let body = if s.url.contains("status=queued") {
+                let ids: Vec<u64> = match page {
+                    "1" => (1..=100).collect(),
+                    // Run 100 moved down a page while the list was read.
+                    _ => (100..=120).collect(),
+                };
+                let runs: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+                json!({"total_count": 120, "workflow_runs": runs})
+            } else if s.url.contains("status=in_progress") {
+                let ids: Vec<u64> = match page {
+                    "1" => (200..300).collect(),
+                    _ => vec![300],
+                };
+                let runs: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+                json!({"workflow_runs": runs})
+            } else {
+                let id: u64 = s.url.split('/').nth(8).unwrap().parse().unwrap();
+                json!({"total_count": 1, "jobs": [job_json(id * 10, "queued")]})
+            };
+            respond(200, &[], &body.to_string())
+        });
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        gh.begin_tick(T0);
+        let jobs = gh.queued_jobs(&|_| true).unwrap();
+        assert_eq!(jobs.len(), 120 + 101);
+        let sent = fake.sent();
+        let lists: Vec<_> = sent
+            .iter()
+            .filter(|s| s.url.contains("status="))
+            .map(|s| s.url.trim_start_matches(API))
+            .collect();
+        assert_eq!(
+            lists,
+            [
+                "/repos/o/r/actions/runs?status=queued&per_page=100",
+                "/repos/o/r/actions/runs?status=queued&per_page=100&page=2",
+                "/repos/o/r/actions/runs?status=in_progress&per_page=100",
+                "/repos/o/r/actions/runs?status=in_progress&per_page=100&page=2",
+            ]
+        );
+        let run_100 = sent
+            .iter()
+            .filter(|s| s.url.contains("/runs/100/jobs"))
+            .count();
+        assert_eq!(run_100, 1);
+    }
+
+    /// A list that never ends stops at `MAX_PAGES` and keeps what it read.
+    #[test]
+    fn paging_stops_at_the_cap() {
+        let fake = Fake::new(|s| {
+            let body = if s.url.contains("status=queued") {
+                json!({"workflow_runs": [{"id": 5}]})
+            } else if s.url.contains("status=in_progress") {
+                json!({"workflow_runs": []})
+            } else {
+                let jobs: Vec<Value> = (0..PER_PAGE as u64)
+                    .map(|i| job_json(i, "queued"))
+                    .collect();
+                json!({"jobs": jobs})
+            };
+            respond(200, &[], &body.to_string())
+        });
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        gh.begin_tick(T0);
+        gh.queued_jobs(&|_| true).unwrap();
+        assert_eq!(job_reads(&fake).len(), MAX_PAGES as usize);
+    }
+
+    /// Permanent refusals are fatal, with a hint; rate limits and 5xx are not.
+    #[test]
+    fn classifies_refusals() {
+        let answer = |status: u16,
+                      headers: &'static [(&'static str, &'static str)],
+                      message: &'static str| {
+            let fake = Fake::new(move |_| {
+                respond(status, headers, &json!({"message": message}).to_string())
+            });
+            let mut gh = Client::new(&fake, Auth::Token("ghp_test".into()), "o/r".into());
+            gh.begin_tick(T0);
+            (
+                gh.runners().unwrap_err(),
+                gh.generate_jitconfig("n", &[]).err().unwrap(),
+            )
+        };
+
+        let (list, jit) = answer(401, &[], "Bad credentials");
+        assert!(list.is_fatal() && jit.is_fatal());
+        assert!(list.to_string().contains("wrong or revoked"), "{list}");
+
+        let (list, jit) = answer(403, &[], "Resource not accessible by integration");
+        assert!(matches!(list, Error::Unauthorized { status: 403, .. }));
+        assert!(matches!(jit, Error::Unauthorized { status: 403, .. }));
+        assert!(list.is_fatal());
+        assert!(
+            list.to_string().contains("Administration read and write"),
+            "{list}"
+        );
+
+        let policy = "Repository level self-hosted runners are disabled on this repository";
+        let (list, jit) = answer(403, &[], policy);
+        assert!(matches!(list, Error::Unauthorized { .. }));
+        assert_eq!(
+            jit,
+            Error::RunnersForbidden {
+                message: policy.into()
+            }
+        );
+        assert!(jit.is_fatal());
+        assert!(jit.to_string().contains("Settings > Actions"), "{jit}");
+
+        let (list, _) = answer(403, &[("Retry-After", "30")], "slow down");
+        assert_eq!(
+            list,
+            Error::RateLimited {
+                remaining: 0,
+                reset: T0 + 30
+            }
+        );
+        assert!(!list.is_fatal());
+
+        let (list, jit) = answer(502, &[], "Server Error");
+        assert!(!list.is_fatal() && !jit.is_fatal());
+    }
+
+    /// An App whose clock runs ahead has its JWT refused for `iat` once, then resyncs to
+    /// GitHub's `Date` and gets its token in the same request.
+    #[test]
+    fn an_app_resyncs_its_clock_after_a_refused_jwt() {
+        // GitHub's clock reads T0 while this one reads T0 + 600.
+        let date = "Mon, 12 Jan 1970 13:46:40 GMT";
+        assert_eq!(crate::github_app::parse_http_date(date), Some(T0));
+        let fake = Fake::new(move |s| {
+            if s.url.ends_with("/access_tokens") {
+                let jwt = s
+                    .header("authorization")
+                    .unwrap()
+                    .trim_start_matches("Bearer ");
+                let claims = jwt.split('.').nth(1).unwrap();
+                let claims: Value = serde_json::from_slice(
+                    &base64::Engine::decode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        claims,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if claims["iat"].as_u64().unwrap() > T0 {
+                    let message = "'Issued at' claim ('iat') must be an Integer representing \
+                                   the time that the assertion was issued";
+                    let body = json!({"message": message}).to_string();
+                    return respond(401, &[("Date", date)], &body);
+                }
+                let body = r#"{"token":"ghs_1","expires_at":"1970-01-12T14:46:40Z"}"#;
+                return respond(201, &[("Date", date)], body);
+            }
+            respond(200, &[("Date", date)], r#"{"runners":[]}"#)
+        });
+        let mut gh = Client::new(&fake, app(), "o/r".into());
+        gh.begin_tick(T0 + 600);
+        gh.runners().unwrap();
+        let urls: Vec<_> = fake.sent().into_iter().map(|s| s.url).collect();
+        assert_eq!(urls.len(), 3);
+        assert!(urls[0].ends_with("/access_tokens") && urls[1].ends_with("/access_tokens"));
+
+        // Without a `Date` to resync to, the refusal is transient: the next tick tries again.
+        let fake = Fake::new(|_| {
+            respond(
+                401,
+                &[],
+                r#"{"message":"'Expiration time' claim ('exp') is too far in the future"}"#,
+            )
+        });
+        let mut gh = Client::new(&fake, app(), "o/r".into());
+        gh.begin_tick(T0);
+        let err = gh.runners().unwrap_err();
+        assert!(matches!(err, Error::Clock(_)), "{err:?}");
+        assert!(!err.is_fatal());
+        assert_eq!(fake.sent().len(), 1);
+    }
+
+    /// Skew is measured when an answer arrives, not when its tick began: after a tick of
+    /// slow requests, the next tick's JWT is not signed in GitHub's future.
+    #[test]
+    fn slow_requests_do_not_read_as_clock_skew() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        // Seconds since T0 on this machine's clock, which agrees with GitHub's. Every
+        // request takes 80 s.
+        let wall = Rc::new(Cell::new(0u64));
+        let http_date = |t: UnixSecs| {
+            let s = t % 86_400;
+            let (h, m, s) = (s / 3_600, s / 60 % 60, s % 60);
+            format!("Mon, 12 Jan 1970 {h:02}:{m:02}:{s:02} GMT")
+        };
+        let w = wall.clone();
+        let fake = Fake::new(move |s| {
+            let sent_at = T0 + w.get();
+            w.set(w.get() + 80);
+            let date = http_date(T0 + w.get());
+            if s.url.ends_with("/access_tokens") {
+                let jwt = s
+                    .header("authorization")
+                    .unwrap()
+                    .trim_start_matches("Bearer ");
+                let claims = jwt.split('.').nth(1).unwrap();
+                let claims: Value = serde_json::from_slice(
+                    &base64::Engine::decode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        claims,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if claims["iat"].as_u64().unwrap() > sent_at {
+                    let body = r#"{"message":"'Issued at' claim ('iat') must be an Integer"}"#;
+                    return respond(401, &[("Date", date.as_str())], body);
+                }
+                // Lives 400 s, so the next tick mints again.
+                let body = r#"{"token":"ghs_1","expires_at":"1970-01-12T13:53:20Z"}"#;
+                return respond(201, &[("Date", date.as_str())], body);
+            }
+            respond(200, &[("Date", date.as_str())], r#"{"runners":[]}"#)
+        });
+        let w = wall.clone();
+        let mut gh = Client::new(&fake, app(), "o/r".into()).with_clock(move || w.get());
+        gh.begin_tick(T0);
+        gh.runners().unwrap();
+        assert_eq!(wall.get(), 160);
+        gh.begin_tick(T0 + wall.get());
+        gh.runners().unwrap();
+        let sent = fake.sent();
+        let mints = sent.iter().filter(|s| s.url.ends_with("/access_tokens"));
+        // One mint a tick, none refused and retried.
+        assert_eq!(mints.count(), 2);
     }
 }
