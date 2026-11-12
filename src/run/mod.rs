@@ -15,7 +15,9 @@ mod script;
 #[cfg(test)]
 mod testkit;
 
+use std::collections::HashMap;
 use std::fmt;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::boat;
 use crate::github;
 use crate::github_app;
-use crate::model::{Action, Cents, Config, MachineState, Pool, RunnerState, Snapshot, UnixSecs};
+use crate::model::{
+    Action, Cents, Config, MachineState, Placement, Pool, RunnerState, Snapshot, UnixSecs,
+};
 use crate::transport::{Transport, Ureq};
 
 pub(crate) use script::HOME_WAIT_S;
@@ -35,6 +39,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 /// The "pacing" line is logged at most once in this many seconds: pacing is normal,
 /// so a minute-by-minute line would only be noise.
 const PACED_LOG_S: UnixSecs = 600;
+/// The summary line of each pool's machines and today's spend is logged at most once in
+/// this many seconds, so a quiet daemon still shows it is alive.
+const SUMMARY_LOG_S: UnixSecs = 3_600;
 /// After an error no tick can fix, `run` tries again after this wait, doubling to
 /// `FATAL_RETRY_MAX_S`, and exits once `FATAL_GIVE_UP_S` have passed since the first one.
 /// A restart would set today's spend to the largest cap (`FixCrashSpend`), close starts
@@ -123,6 +130,7 @@ pub fn run(
     let stop = stop_on_signal();
     let transport = Ureq::new(HTTP_TIMEOUT);
     let mut tick_loop = Loop::connect(cfg, &transport, unix_now())?;
+    tick_loop.log(start_line(cfg));
     // Once, and only advice: a failed read changes nothing.
     match tick_loop.boat.saved_snapshots(None) {
         Ok(saved) => {
@@ -211,6 +219,68 @@ pub(crate) fn stop_on_signal() -> Arc<AtomicBool> {
         let _ = signal_hook::flag::register(sig, Arc::clone(&stop));
     }
     stop
+}
+
+/// The line `run` logs once at start: version, repository and pools.
+pub fn start_line(cfg: &Config) -> String {
+    let pools: Vec<String> = cfg
+        .pools
+        .iter()
+        .map(|p| {
+            let placement: Vec<&str> = p
+                .placement
+                .iter()
+                .map(|s| match s {
+                    Placement::Slot => "slot",
+                    Placement::Resume => "resume",
+                    Placement::Fork => "fork",
+                })
+                .collect();
+            format!("{} ({}, max {})", p.name, placement.join("+"), p.max_boxes)
+        })
+        .collect();
+    format!(
+        "start: sw-boat-runner {}, repo {}, pools {}",
+        env!("CARGO_PKG_VERSION"),
+        cfg.repo,
+        pools.join(", ")
+    )
+}
+
+/// Where the loop's action lines go by default: stderr, through `eprint!` so a test's
+/// output capture sees them too.
+struct Stderr;
+
+impl Write for Stderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        eprint!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Why `decide` deletes each machine it deletes, by machine id, with each pool seeing the
+/// queued jobs routed to it as in `plan`. Only for the log.
+fn delete_reasons(cfg: &Config, snap: &Snapshot) -> HashMap<String, &'static str> {
+    let owners = route(cfg, snap);
+    let mut routed = snap.clone();
+    let mut out = HashMap::new();
+    for (i, pool) in cfg.pools.iter().enumerate() {
+        routed.queued = snap
+            .queued
+            .iter()
+            .zip(&owners)
+            .filter(|(_, owner)| **owner == Some(i))
+            .map(|(job, _)| job.clone())
+            .collect();
+        for (id, why) in crate::decide::delete_reasons(&routed, pool) {
+            out.insert(id.to_string(), why);
+        }
+    }
+    out
 }
 
 /// How long a fork boat accepted may go unlisted (`FixListLag`): the request timeout and a
@@ -415,6 +485,10 @@ pub struct Loop<'a> {
     winding_down: bool,
     /// When the last observe succeeded, and the runners it found.
     last_observe: Option<LastObserve>,
+    /// Where the one line per action that succeeds goes (`log`); stderr by default.
+    log: Box<dyn Write>,
+    /// When the summary line was last logged; see `SUMMARY_LOG_S`.
+    summary_logged: Option<UnixSecs>,
 }
 
 #[derive(Clone)]
@@ -457,7 +531,60 @@ impl<'a> Loop<'a> {
             began: Duration::ZERO,
             winding_down: false,
             last_observe: None,
+            log: Box::new(Stderr),
+            summary_logged: None,
         }
+    }
+
+    /// Sends the loop's action lines (one per fork, resume, stop, delete, register and
+    /// unregister that succeeds, and the hourly summary) to `w` instead of stderr.
+    pub fn set_log(&mut self, w: Box<dyn Write>) {
+        self.log = w;
+    }
+
+    /// Logs one line. Never a secret: callers pass ids, names, pools and reasons only.
+    pub(crate) fn log(&mut self, line: impl fmt::Display) {
+        let _ = self.log.write_all(format!("{line}\n").as_bytes());
+    }
+
+    /// Once every `SUMMARY_LOG_S`, the first tick included: each pool's machines up and
+    /// runners busy, and today's spend on starts (account-wide).
+    fn log_summary(&mut self, now: UnixSecs, snap: &Snapshot) {
+        if self
+            .summary_logged
+            .is_some_and(|t| now < t.saturating_add(SUMMARY_LOG_S))
+        {
+            return;
+        }
+        self.summary_logged = Some(now);
+        let pools: Vec<String> = self
+            .cfg
+            .pools
+            .iter()
+            .map(|p| {
+                let up = snap
+                    .machines
+                    .iter()
+                    .filter(|m| m.pool == p.name && m.state == MachineState::Up)
+                    .count();
+                let busy = snap
+                    .runners
+                    .iter()
+                    .filter(|r| r.pool == p.name && r.state == RunnerState::Busy)
+                    .count();
+                format!("pool {}: {up} up, {busy} busy", p.name)
+            })
+            .collect();
+        let spent = self.ledger.spent_cents();
+        self.log(format_args!(
+            "summary: {}; spent {spent}c today",
+            pools.join("; ")
+        ));
+    }
+
+    /// `drain` is running: every delete and unregister is for the drain.
+    fn draining(&self) -> bool {
+        !self.read_jobs
     }
 
     /// Before the process exits on an error no tick fixed: one more observe, then the
@@ -499,7 +626,6 @@ impl<'a> Loop<'a> {
                 _ => false,
             });
             if !m.is_ephemeral() && m.state == MachineState::Up && !held(&m.id) && !decided {
-                eprintln!("exit: stopping {} in pool {}", m.id, m.pool);
                 actions.push(Action::Stop {
                     machine: m.id.clone(),
                 });
@@ -535,9 +661,9 @@ impl<'a> Loop<'a> {
                 {
                     continue;
                 }
-                eprintln!("exit: stopping {} in pool {}", sb.id, pool.name);
-                if let Err(e) = self.boat.stop(&sb.id) {
-                    eprintln!("exit: stop {}: {e}", sb.id);
+                match self.boat.stop(&sb.id) {
+                    Ok(()) => self.log(format_args!("stop {} (pool {}): exit", sb.id, pool.name)),
+                    Err(e) => eprintln!("exit: stop {}: {e}", sb.id),
                 }
             }
         }
@@ -597,6 +723,7 @@ impl<'a> Loop<'a> {
                 return Ok(());
             }
         };
+        self.log_summary(now, &observed.snapshot);
         let actions = plan(self.cfg, &observed.snapshot, decide)
             .into_iter()
             .map(|(_, a)| a)
@@ -1429,5 +1556,22 @@ mod tests {
             ),
             github::Auth::Token(_) => panic!("a token"),
         }
+    }
+
+    #[test]
+    fn start_line_names_version_repo_and_pools() {
+        let mut cfg = config();
+        let mut warm = cfg.pools[0].clone();
+        warm.name = "boat".into();
+        warm.placement = vec![Placement::Slot, Placement::Resume];
+        cfg.pools.push(warm);
+        assert_eq!(
+            start_line(&cfg),
+            format!(
+                "start: sw-boat-runner {}, repo o/r, pools ci (fork, max 4), boat \
+                 (slot+resume, max 4)",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 }

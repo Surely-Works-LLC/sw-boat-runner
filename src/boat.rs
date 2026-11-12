@@ -252,17 +252,20 @@ pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<(
             ),
         ));
     }
+    // Unlabelled machines of a pool this policy does not have are almost always another
+    // daemon's on the same account, so they get no delete or drain advice.
     for (pool, ids) in &legacy {
+        let n = ids.len();
+        let (machines, are, them) = if n == 1 {
+            ("machine", "is", "it")
+        } else {
+            ("machines", "are", "them")
+        };
         out.push((
-            Severity::Warn,
+            Severity::Info,
             format!(
-                "pool {pool} is not in the policy and has {} machine(s) without a repo label \
-                 (made before 0.3.0, so maybe another repository's): {}. If they are \
-                 {repo}'s, put the pool back and run `sw-boat-runner drain <policy.toml>`, \
-                 or once their runners are done: {}",
-                ids.len(),
-                ids.join(", "),
-                delete(ids),
+                "pool {pool}: {n} {machines} from before 0.3.0 {are} not in this policy; \
+                 another daemon on this boat account probably owns {them}; left alone"
             ),
         ));
     }
@@ -1228,10 +1231,35 @@ mod tests {
         let line = &stray_report("o/r", &["ci"], &shared)[0].1;
         assert!(line.contains("upgrade every repository's daemon"), "{line}");
 
-        // Unlabelled machines of a pool this policy does not have: maybe another
-        // repository's daemon, older than 0.3.0.
-        let unknown = [mine[0].clone(), sb("bx_55555555", "boat", None)];
-        assert_eq!(severities(&unknown), [Severity::Warn, Severity::Warn]);
+        // Unlabelled machines of a pool this policy does not have: almost always another
+        // daemon's, so only an info line with no delete command, but they may be a
+        // daemon older than 0.3.0, so adopted machines warn.
+        let unknown = [
+            mine[0].clone(),
+            sb("bx_55555555", "mjth", None),
+            sb("bx_66666666", "mjth", None),
+        ];
+        assert_eq!(severities(&unknown), [Severity::Info, Severity::Warn]);
+        let line = &stray_report("o/r", &["ci"], &unknown)[0].1;
+        assert_eq!(
+            line,
+            "pool mjth: 2 machines from before 0.3.0 are not in this policy; another daemon \
+             on this boat account probably owns them; left alone"
+        );
+        assert!(!line.contains("bx_") && !line.contains("delete") && !line.contains("drain"));
+
+        // Labelled with this repository in a pool the policy no longer has: surely ours,
+        // so the delete and drain advice stays.
+        let renamed = [sb("bx_77777777", "old", Some("o/r"))];
+        let report = stray_report("o/r", &["ci"], &renamed);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].0, Severity::Warn);
+        assert!(
+            report[0].1.contains("`boat delete bx_77777777 --yes`")
+                && report[0].1.contains("sw-boat-runner drain"),
+            "{}",
+            report[0].1
+        );
         assert!(severities(&[]).is_empty());
     }
 

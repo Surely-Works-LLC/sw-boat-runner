@@ -10,7 +10,9 @@ use super::observe::Observed;
 use super::{Error, HTTP_TIMEOUT, Loop, script};
 use crate::boat;
 use crate::github;
-use crate::model::{Action, Cents, Config, JobKey, Placement, Snapshot, UnixSecs};
+use crate::model::{
+    Action, Cents, Config, JobKey, MachineState, Placement, RunnerState, Snapshot, UnixSecs,
+};
 
 pub(super) const DAY_S: u64 = 86_400;
 /// boat's 409 code for a resume of a machine whose disk it has deleted, which it may do
@@ -258,6 +260,11 @@ struct Tick<'s> {
     /// Machines this tick leaves alone: a runner whose start failed is still registered
     /// on them.
     skip: HashSet<String>,
+    /// Why `decide` deletes each machine it deletes, for the log.
+    delete_reasons: HashMap<String, &'static str>,
+    /// Kept machines each pool started this tick (resumes and kept forks), for the log's
+    /// reason of a kept fork.
+    kept_started: HashMap<String, usize>,
 }
 
 impl Tick<'_> {
@@ -267,6 +274,39 @@ impl Tick<'_> {
     fn at(&self, elapsed: Duration) -> UnixSecs {
         self.now
             .saturating_add(elapsed.saturating_sub(self.began).as_secs())
+    }
+}
+
+/// `<machine> (pool <pool>)`, or the machine alone when the snapshot does not have it.
+fn machine_in(snap: &Snapshot, machine: &str) -> String {
+    match snap.machines.iter().find(|m| m.id == machine) {
+        Some(m) => format!("{machine} (pool {})", m.pool),
+        None => machine.to_string(),
+    }
+}
+
+/// Why `decide` unregisters `runner`, for the log: its rules in `View::unregister`.
+fn unregister_reason(cfg: &Config, snap: &Snapshot, runner: &str) -> Option<&'static str> {
+    let r = snap.runners.iter().find(|r| r.name == runner)?;
+    let up = snap
+        .machines
+        .iter()
+        .any(|m| m.id == r.machine && m.state == MachineState::Up);
+    let timeout = cfg
+        .pools
+        .iter()
+        .find(|p| p.name == r.pool)
+        .map(|p| p.register_timeout_s);
+    if r.state == RunnerState::Offline {
+        Some("offline")
+    } else if !up {
+        Some("machine_down")
+    } else if r.state == RunnerState::Registered
+        && timeout.is_some_and(|t| snap.now.saturating_sub(r.registered_at) > t)
+    {
+        Some("register_timeout")
+    } else {
+        None
     }
 }
 
@@ -318,6 +358,31 @@ fn backoff_key(snap: &Snapshot, a: &Action) -> Option<(String, StartKind)> {
     }
 }
 
+/// Why `decide` forks a kept machine in pool `p`, for the log, and counts it: `min_up`
+/// while the pool's kept machines (up, starting, stopping in a pool with `resume`, and
+/// those started this tick) are short of it, else queued jobs no stopped machine covers.
+fn kept_fork_reason(t: &mut Tick, p: &crate::model::Pool) -> String {
+    let held = t
+        .snapshot
+        .machines
+        .iter()
+        .filter(|m| m.pool == p.name && !m.is_ephemeral())
+        .filter(|m| match m.state {
+            MachineState::Up | MachineState::Starting => true,
+            MachineState::Stopping => p.has(Placement::Resume),
+            MachineState::Stopped | MachineState::Gone => false,
+        })
+        .count();
+    let started = t.kept_started.entry(p.name.clone()).or_default();
+    let why = if held + *started < p.min_up as usize {
+        format!("up to min_up {}", p.min_up)
+    } else {
+        "for queued jobs".to_string()
+    };
+    *started += 1;
+    why
+}
+
 impl Loop<'_> {
     /// The time now, for what is timed from a request's answer; see `Tick::at`.
     fn at(&self, t: &Tick) -> UnixSecs {
@@ -358,13 +423,25 @@ impl Loop<'_> {
                 Starts::Closed
             },
             skip: HashSet::new(),
+            // Only for the log, so worked out only when there is a delete to explain.
+            delete_reasons: if !self.draining()
+                && actions.iter().any(|a| matches!(a, Action::Delete { .. }))
+            {
+                super::delete_reasons(self.cfg, snapshot)
+            } else {
+                HashMap::new()
+            },
+            kept_started: HashMap::new(),
         };
         let mut fatal: Option<Error> = None;
         // Runners whose start failed last tick hold a slot and count as supply until they
         // are gone, so they go first.
         for a in &observed.abandoned {
             match self.delete_runner(a.id) {
-                Ok(()) => self.memory.forget_abandoned(&a.name),
+                Ok(()) => {
+                    self.memory.forget_abandoned(&a.name);
+                    self.log(format_args!("unregister {}: start_failed", a.name));
+                }
                 Err(e) => {
                     eprintln!("unregister {} (its start failed): {e}", a.name);
                     tick.skip.insert(a.machine.clone());
@@ -430,10 +507,35 @@ impl Loop<'_> {
     fn execute(&mut self, t: &mut Tick, action: &Action) -> Result<(), Error> {
         match action {
             Action::Unregister { runner } => match t.runner_ids.remove(runner) {
-                Some(id) => self.delete_runner(id),
+                Some(id) => {
+                    self.delete_runner(id)?;
+                    let why = if self.draining() {
+                        Some("drain")
+                    } else {
+                        unregister_reason(self.cfg, t.snapshot, runner)
+                    };
+                    match why {
+                        Some(why) => self.log(format_args!("unregister {runner}: {why}")),
+                        None => self.log(format_args!("unregister {runner}")),
+                    }
+                    Ok(())
+                }
                 None => Ok(()),
             },
-            Action::Delete { machine } => self.delete_machine(t, machine),
+            Action::Delete { machine } => {
+                self.delete_machine(t, machine)?;
+                let what = machine_in(t.snapshot, machine);
+                let why = if self.draining() {
+                    Some("drain")
+                } else {
+                    t.delete_reasons.get(machine).copied()
+                };
+                match why {
+                    Some(why) => self.log(format_args!("delete {what}: {why}")),
+                    None => self.log(format_args!("delete {what}")),
+                }
+                Ok(())
+            }
             Action::Stop { machine } => {
                 match self.remove_runners(t, machine) {
                     // On the way out nothing else could stop it; see `Loop::wind_down`.
@@ -442,7 +544,15 @@ impl Loop<'_> {
                     }
                     r => r?,
                 }
-                Ok(self.boat.stop(machine)?)
+                self.boat.stop(machine)?;
+                let why = if self.winding_down {
+                    "exit"
+                } else {
+                    "idle_stop"
+                };
+                let what = machine_in(t.snapshot, machine);
+                self.log(format_args!("stop {what}: {why}"));
+                Ok(())
             }
             Action::Register {
                 pool,
@@ -532,13 +642,16 @@ impl Loop<'_> {
         let msg = format!("error: {error}. No runner registered; {what}");
         let backoff_s = self.ledger.fork_held_logins(t.now, pool, error);
         eprintln!("{msg}; the pool's next fork in {backoff_s}s");
+        let what = format!("{machine} (pool {pool})");
         if stop {
             self.remove_runners(t, machine)?;
             self.boat.stop(machine)?;
             // Until boat lists it stopping, `decide` may still ask for a runner on it.
             self.memory.note_holds_logins(machine);
+            self.log(format_args!("stop {what}: logins"));
         } else {
             self.delete_machine(t, machine)?;
+            self.log(format_args!("delete {what}: logins"));
         }
         Ok(false)
     }
@@ -566,6 +679,10 @@ impl Loop<'_> {
             self.memory.abandon(name, machine, at);
             return Err(e.into());
         }
+        // The name and machine only: the jit config is a secret.
+        self.log(format_args!(
+            "register {name} on {machine} (pool {pool}, slot {slot})"
+        ));
         Ok(())
     }
 
@@ -574,6 +691,11 @@ impl Loop<'_> {
             Ok(()) => {
                 let at = self.at(t);
                 self.memory.resumed(machine, at);
+                let what = machine_in(t.snapshot, machine);
+                if let Some(m) = t.snapshot.machines.iter().find(|m| m.id == machine) {
+                    *t.kept_started.entry(m.pool.clone()).or_default() += 1;
+                }
+                self.log(format_args!("resume {what}"));
                 Ok(())
             }
             // boat may have resumed it, and charged for it, without an answer. Held as a
@@ -587,7 +709,10 @@ impl Loop<'_> {
             // resume, so delete it; the pool then forks a new one if it needs to.
             Err(Error::Boat(boat::Error::Conflict { code, .. })) if code == DISK_EXPIRED => {
                 eprintln!("warn: {machine} lost its disk; deleting it");
-                self.delete_machine(t, machine)
+                self.delete_machine(t, machine)?;
+                let what = machine_in(t.snapshot, machine);
+                self.log(format_args!("delete {what}: disk_expired"));
+                Ok(())
             }
             Err(e) => Err(e),
         }
@@ -608,6 +733,11 @@ impl Loop<'_> {
         match self.start(t, forked) {
             Ok(id) => {
                 let at = self.at(t);
+                let what = match job {
+                    Some(j) => format!("job {} attempt {}", j.id, j.attempt),
+                    None => format!("kept machine, {}", kept_fork_reason(t, p)),
+                };
+                self.log(format_args!("fork {id} (pool {}): {what}", p.name));
                 self.memory.forked(id, &p.name, job, at);
                 Ok(())
             }
@@ -1070,6 +1200,8 @@ mod tests {
                 snapshot: &observed.snapshot,
                 runner_ids: observed.runner_ids.clone(),
                 starts: Starts::Closed,
+                delete_reasons: HashMap::new(),
+                kept_started: HashMap::new(),
             };
             for action in &actions {
                 let (price, recheck) = (0, false);
@@ -1458,5 +1590,57 @@ mod tests {
         assert_eq!(logins.count(&get), 2);
         assert_eq!(registers(&logins.fake), 1);
         assert!(tick_loop.ledger.failing.is_empty());
+    }
+
+    /// One line per action that succeeds, with the job or the reason, and nothing on a
+    /// tick with nothing to do. The register line names the runner and machine, never
+    /// the jit config.
+    #[test]
+    fn logs_a_line_per_fork_register_and_delete() {
+        let cfg = config();
+        const RUNNING_55: &str = r#"{"id":"bx_55555555","state":"running",
+            "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}"#;
+        let fake = lagging(
+            |t| if t == 2 || t == 3 { RUNNING_55 } else { "" },
+            |t| if t < 3 { JOB_70 } else { "" },
+        );
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.set_clock(Box::new(|| Duration::ZERO));
+        let log = capture_log(&mut tick_loop);
+
+        tick_loop.tick(NOW, decide).unwrap();
+        assert_eq!(
+            log.take(),
+            [
+                "summary: pool ci: 0 up, 0 busy; spent 100c today",
+                "fork bx_55555555 (pool ci): job 70 attempt 1",
+            ]
+        );
+        tick_loop.tick(NOW + 15, decide).unwrap();
+        assert_eq!(
+            log.take(),
+            ["register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0)"]
+        );
+        // The runner ran its job and is gone, so the fork is finished.
+        tick_loop.tick(NOW + 30, decide).unwrap();
+        assert_eq!(log.take(), ["delete bx_55555555 (pool ci): finished"]);
+        // Nothing left to do: no line.
+        tick_loop.tick(NOW + 45, decide).unwrap();
+        assert_eq!(log.take(), Vec::<String>::new());
+        assert_eq!(registers(&fake), 1);
+    }
+
+    /// `drain` gives every delete and unregister the reason `drain`.
+    #[test]
+    fn drain_logs_its_deletes() {
+        let cfg = config();
+        let fake = Fake::new(reply);
+        let mut tick_loop = started(&cfg, &fake);
+        let log = capture_log(&mut tick_loop);
+        tick_loop.drain(NOW).unwrap();
+        let lines = log.take();
+        assert!(lines.contains(&"unregister sbr-ci-bx_22222222-0-900: drain".to_string()));
+        assert!(lines.contains(&"delete bx_22222222 (pool ci): drain".to_string()));
+        assert!(lines.iter().all(|l| !l.contains("JITSECRET")), "{lines:?}");
     }
 }

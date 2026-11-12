@@ -183,7 +183,9 @@ shows that risk: another repository's machines with one of the policy's pool nam
 unlabelled machines in a pool the policy does not have. Once at start, `run` lists every
 `sw-boat-runner` machine on the account (boat has no filter on a label's key alone), and
 both commands warn about this repository's machines in a pool the policy no longer has,
-which no tick lists or deletes.
+which no tick lists or deletes, and print the drain or delete commands for them.
+Unlabelled machines in a pool the policy does not have are almost always another
+daemon's on the same account, so they get one info line each pool and no commands.
 
 Each fork also carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A machine that
 first shows up after the daemon's first listing of its pool, labelled by another daemon,
