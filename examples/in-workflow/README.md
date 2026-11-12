@@ -68,8 +68,10 @@ Administration write and Actions read, whatever else the app may do. Optional in
 | `app-id` | none | The GitHub App's ID or client ID; its key goes in the `app-private-key` secret. Empty means `RUNNER_ADMIN_TOKEN`. |
 
 The label names the run and the attempt, so each run gets its own pool and two runs never
-share a daemon. The `runners` job ends once every other job of the run is done, and then
-deletes the pool's machines and runners with `sw-boat-runner drain`.
+share a daemon. The `runners` job ends once every other job of the run is done: it sends the daemon
+SIGTERM, and the daemon finishes its tick and deletes the pool's machines and runners
+(`run --drain-on-stop`). If the daemon failed or the run was cancelled, `sw-boat-runner
+drain` does it instead.
 
 What this costs compared with a daemon that stays up:
 

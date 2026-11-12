@@ -83,9 +83,9 @@ checks and saves it as `sw-boat-runner snapshot` does
 
 On a create, boat adds none of the account's secrets, but logins saved in the snapshot
 stay. On a resume, boat also scrubs owner secrets from the restored disk before the
-machine is reachable. The daemon labels its machines `sw-boat-runner=<pool>`, names its
-runners `sbr-<pool>-...`, and ignores every other machine and runner. To update the
-runner, rebuild the snapshot.
+machine is reachable. The daemon labels its machines `sw-boat-runner=<pool>` and
+`sw-boat-runner-repo=<owner>/<name>` (lowercased), names its runners `sbr-<pool>-...`, and
+ignores every other machine and runner. To update the runner, rebuild the snapshot.
 
 Keep the snapshot small: every start that is not a resume of a kept machine copies it to
 a new disk, and a snapshot larger than `machine_type`'s disk makes boat refuse each fork
@@ -150,13 +150,31 @@ that gap.
 
 The daemon keeps no database. Each tick it reads:
 
-- boat: `GET /sandboxes?label=sw-boat-runner=<pool>` and `GET /limits`;
+- boat: `GET /sandboxes?label=sw-boat-runner=<pool>`, keeping the machines whose
+  `sw-boat-runner-repo` label is the policy's `repo` or missing, and `GET /limits`;
 - GitHub: the repository's runners whose names start with `sbr-<pool>-`, and the queued
   jobs. Before `decide` runs, each queued job goes only to the first pool in the file
   whose labels match it.
 
 [GitHub requests](#github-requests) describes how the daemon keeps these reads inside the
 API's rate limit.
+
+Pool names come from labels, so two repositories on one boat account can both have a pool
+`boat`. The repo label keeps their daemons apart. boat filters on one label and cannot
+change a machine's labels, so the daemon filters on the repo label itself, and a machine
+made before 0.3.0, which has only the pool label, is adopted by every daemon with that
+pool name. An upgrade orphans nothing; a pool that two repositories shared before 0.3.0
+stays shared until those machines are gone, and `run` and `doctor` warn about them. Once at
+start, `run` lists every `sw-boat-runner` machine on the account (boat has no filter on a
+label's key alone), and both commands warn about this repository's machines in a pool
+the policy no longer has, which no tick lists or deletes.
+
+Each fork also carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A machine that
+first shows up after the daemon's first listing of its pool, labelled by another daemon,
+was forked by a daemon that is still running against the same repository and pool, so
+the daemon logs an error naming it, once. Machines first seen within the listing lag of
+the start may be a stopped predecessor's last forks and are not counted. A second daemon
+that only uses kept machines forks nothing and goes unseen.
 
 Runner names carry what the daemon needs to know about them:
 `sbr-<pool>-<machine id>-<slot>-<registered unix time>`. A machine forked for a job
@@ -238,6 +256,11 @@ token bucket in `src/github.rs`:
   tick never acts on half a snapshot. Under 200 requests left (`RATE_FLOOR`) nothing is
   sent until the reset, leaving the rest to whoever else uses the token.
 - `drain` does not read queued jobs, so it needs only the runner list and its deletes.
+  A new `drain` process knows none of the forks a stopped daemon sent, which boat may not
+  list for the request timeout plus a tick (`FixListLag`), so it repeats every tick until
+  boat has listed none for that long (`--settle-s`). SIGINT and SIGTERM let `run` finish
+  its tick and exit; with `--drain-on-stop` it drains first, with its in-flight forks
+  still in memory.
 
 The runner list and the queued runs' jobs rarely change, so most of those reads are 304s.
 An in-progress run's jobs change with every step, and such a run can still queue a later
@@ -357,5 +380,6 @@ create whose answer is lost, a lost kept disk, and a crash between any two actio
 
 ## Out of scope
 
-Kubernetes, webhooks, several daemon instances against one pool, providers other than
-boat, and updating runner binaries in place (rebuild the pool's snapshot instead).
+Kubernetes, webhooks, several daemon instances against one pool (detected when the
+other one forks, see [Observed state](#observed-state), but not prevented), providers
+other than boat, and updating runner binaries in place (rebuild the pool's snapshot instead).

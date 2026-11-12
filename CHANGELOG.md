@@ -23,6 +23,30 @@ All notable changes to this project are documented here. The format follows
   `exp` resyncs and tries once more.
 - A 403 on registering a runner that blames runner policy now says so, and how to allow
   self-hosted runners for the repository.
+- Daemons of two repositories with the same pool name on one boat account no longer stop,
+  delete and register runners on each other's machines. Forks now carry
+  `sw-boat-runner-repo=<owner>/<name>` next to `sw-boat-runner=<pool>`, and a daemon keeps
+  only its repository's machines. Machines made before 0.3.0 have no repo label and are
+  adopted, so an upgrade orphans none; boat cannot relabel a machine, so a pool two
+  repositories already shared stays shared until those machines are drained. `run` and
+  `doctor` warn about them.
+- A pool removed from or renamed in the policy no longer leaks its machines silently:
+  `doctor` lists this repository's machines in pools the policy does not have and prints
+  the `drain` or `boat delete` command, and `run` warns about them once at start.
+- `drain` no longer reports success while boat has yet to list a fork the stopped daemon
+  made just before it stopped. It repeats every `tick_s` until boat has listed no machine
+  for the request timeout plus a tick (`--settle-s` to change), and fails with machines left
+  after `--timeout-s` (default 900).
+- `run` handles SIGINT and SIGTERM: it finishes the current tick and exits 0; a second
+  signal exits at once. `run --drain-on-stop` drains the pools in the same process first.
+  The `runners` workflow uses it and waits for the daemon, and runs `drain` only when the
+  daemon did not finish.
+
+### Added
+
+- Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
+  error, once per other daemon, when a machine forked by another daemon for the same
+  repository and pool appears while it runs.
 
 ## [0.2.0] - 2026-11-11
 

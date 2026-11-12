@@ -49,6 +49,9 @@ any FAIL. The policy defaults to /etc/sw-boat-runner/policy.toml.
   boat       the key works
   snapshot   each pool's snapshot is saved, fits its machine type's disk, and came
              from a sandbox without its creator's logins
+  machines   no machine of this repository is in a pool the policy no longer has, and
+             no pool shares machines from before 0.3.0, which carry no repo label;
+             each warn prints the drain or delete command
   github     the App's installation has Administration write and Actions read and
              mints a token, or the token lists the repository's runners; rate limit left
   service    systemctl is-active sw-boat-runner
@@ -432,6 +435,35 @@ fn boat_checks(
     }
     for pool in &cfg.pools {
         pool_snapshot(r, &boat, pool);
+    }
+    stray_machines(r, cfg, &boat);
+}
+
+/// Machines `run` never lists again: those of a pool the policy no longer has.
+fn stray_machines(r: &mut Report, cfg: &Config, boat: &boat::Client) {
+    let all = match boat.list_daemon_machines() {
+        Ok(all) => all,
+        Err(e) => {
+            r.warn(
+                "machines",
+                format!("could not list the account's machines: {e}"),
+            );
+            return;
+        }
+    };
+    let pools: Vec<&str> = cfg.pools.iter().map(|p| p.name.as_str()).collect();
+    let report = boat::stray_report(&cfg.repo, &pools, &all);
+    if report.is_empty() {
+        r.ok(
+            "machines",
+            format!(
+                "every machine of {} is in one of the policy's pools",
+                cfg.repo
+            ),
+        );
+    }
+    for line in report {
+        r.warn("machines", line);
     }
 }
 
@@ -990,6 +1022,13 @@ mod tests {
                     r#"{"snapshots":[{"name":"snap-1","status":"ready",
                         "sourceSandboxId":"bx_55555555","sizeBytes":20000000000}]}"#,
                 ),
+                ("GET", "https://boat.dev/api/v1/sandboxes?limit=200") => respond(
+                    200,
+                    &[],
+                    r#"{"sandboxes":[{"id":"bx_44444444","state":"running",
+                        "labels":{"sw-boat-runner":"ci","sw-boat-runner-repo":"o/r"}}],
+                        "pageInfo":{"nextCursor":null,"hasMore":false}}"#,
+                ),
                 ("GET", "https://boat.dev/api/v1/sandboxes/bx_55555555") => respond(
                     200,
                     &[],
@@ -1034,6 +1073,7 @@ mod tests {
                 (Level::Ok, "boat"),
                 (Level::Ok, "snapshot"),
                 (Level::Ok, "snapshot"),
+                (Level::Ok, "machines"),
                 (Level::Ok, "github"),
                 (Level::Ok, "github"),
                 (Level::Ok, "service"),
@@ -1077,6 +1117,23 @@ mod tests {
             url if url.contains("/actions/runners") => {
                 Some(respond(401, &[], r#"{"message":"Bad credentials"}"#))
             }
+            // A renamed pool's machine, a pre-0.3.0 machine of a pool not in the policy
+            // and one of `ci`, another repository's, and a deleted one.
+            "https://boat.dev/api/v1/sandboxes?limit=200" => Some(respond(
+                200,
+                &[],
+                r#"{"sandboxes":[
+                    {"id":"bx_22222222","state":"idle",
+                     "labels":{"sw-boat-runner":"old","sw-boat-runner-repo":"o/r"}},
+                    {"id":"bx_33333333","state":"archived","labels":{"sw-boat-runner":"boat"}},
+                    {"id":"bx_44444444","state":"idle","labels":{"sw-boat-runner":"ci"}},
+                    {"id":"bx_66666666","state":"idle",
+                     "labels":{"sw-boat-runner":"old","sw-boat-runner-repo":"o/other"}},
+                    {"id":"bx_77777777","state":"deleted",
+                     "labels":{"sw-boat-runner":"old","sw-boat-runner-repo":"o/r"}},
+                    {"id":"bx_88888888","state":"idle","labels":{"other":"x"}}],
+                    "pageInfo":{"nextCursor":null,"hasMore":false}}"#,
+            )),
             _ => None,
         });
         let mut r = Report::default();
@@ -1091,6 +1148,9 @@ mod tests {
                 (Level::Ok, "boat"),
                 (Level::Fail, "snapshot"),
                 (Level::Fail, "snapshot"),
+                (Level::Warn, "machines"),
+                (Level::Warn, "machines"),
+                (Level::Warn, "machines"),
                 (Level::Fail, "github"),
                 (Level::Fail, "service"),
                 (Level::Warn, "runners"),
@@ -1098,6 +1158,23 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("larger machine_type"), "{out}");
+        assert!(
+            out.contains("pool old is not in the policy but has 1 machine(s) of o/r: bx_22222222")
+                && out.contains("`boat delete bx_22222222 --yes`"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pool boat is not in the policy and has 1 machine(s) without a repo"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pool ci: 1 machine(s) have no repo label"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("bx_66666666") && !out.contains("bx_77777777"),
+            "{out}"
+        );
         assert!(out.contains("--no-env"), "{out}");
         assert!(out.contains("Administration read and write"), "{out}");
         assert!(!out.contains("ghp_secret"), "{out}");
