@@ -244,7 +244,7 @@ fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool, replace: bool) 
         ),
     };
     let existing = if replace {
-        "delete it once the new machine's service is active (--replace)"
+        "delete it once doctor finds no FAIL on the new machine (--replace)"
     } else {
         "stop, unless --replace"
     };
@@ -744,7 +744,7 @@ fn refuse_second_daemon(repo: &str, found: &[Daemon], replace: bool) -> Result<(
         .collect();
     if replace {
         println!(
-            "Will delete {} once the new machine's service is active (--replace).",
+            "Will delete {} once doctor finds no FAIL on the new machine (--replace).",
             list.join(", ")
         );
         return Ok(());
@@ -754,19 +754,21 @@ fn refuse_second_daemon(repo: &str, found: &[Daemon], replace: bool) -> Result<(
         "boat machine {} already runs the daemon for {repo}, and a second one would compete \
          for its jobs. Keep it (`boat ssh {id} sudo {BIN} doctor` checks it; to change the \
          policy, edit {POLICY} there and restart the service), delete it first with `boat \
-         delete {id} --yes`, or pass --replace to delete it once the new machine's service \
-         is active.",
+         delete {id} --yes`, or pass --replace to delete it once doctor finds no FAIL on \
+         the new machine.",
         list.join(", ")
     ))
 }
 
-/// With `--replace`: deletes the old daemon machines once the new one's service runs.
+/// With `--replace`: deletes the old daemon machines once doctor finds no FAIL on the new
+/// one. An active service is not enough: a daemon that keeps failing stays active.
 fn replace_old(boat: &boat::Client, id: &str, old: &[Daemon], io: &mut dyn Io) {
-    let active = boat_ssh(id, &format!("systemctl is-active --quiet {SERVICE}"), None);
-    if !matches!(active, Ok(true)) {
+    println!("+ boat ssh {id} sudo {BIN} doctor   (before deleting the old machine)");
+    let healthy = boat_ssh(id, &doctor_quietly(), None);
+    if !matches!(healthy, Ok(true)) {
         let ids: Vec<&str> = old.iter().map(|d| d.id.as_str()).collect();
         println!(
-            "The {SERVICE} service on {id} is not active, so {} kept running: check \
+            "doctor found a problem on {id}, so {} kept running: check \
              `boat ssh {id} sudo {BIN} doctor`, then delete one of the two with \
              `boat delete <id> --yes`.",
             ids.join(", ")
@@ -776,6 +778,12 @@ fn replace_old(boat: &boat::Client, id: &str, old: &[Daemon], io: &mut dyn Io) {
     for d in old {
         delete_machine(boat, &d.id, io);
     }
+}
+
+/// Doctor on the new machine, its output dropped: it already showed during the install,
+/// and any FAIL exits non-zero.
+fn doctor_quietly() -> String {
+    format!("sudo {BIN} doctor >/dev/null 2>&1")
 }
 
 /// The files `stage` writes under `STAGE`.
@@ -1087,6 +1095,14 @@ mod tests {
         );
         assert!(refuse_second_daemon("acme/app", &found, true).is_ok());
         assert!(refuse_second_daemon("acme/app", &[], false).is_ok());
+    }
+
+    #[test]
+    fn replace_waits_for_doctor_not_just_an_active_service() {
+        assert_eq!(
+            doctor_quietly(),
+            "sudo /usr/local/bin/sw-boat-runner doctor >/dev/null 2>&1"
+        );
     }
 
     #[test]

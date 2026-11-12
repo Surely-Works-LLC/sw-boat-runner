@@ -94,7 +94,9 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 
 - `setup` and `setup --remote` ignore `GITHUB_TOKEN` unless `--pat` is given, and say
-  so. They used to refuse to run while it was set.
+  so. They used to refuse to run while it was set. A rerun whose
+  `/etc/sw-boat-runner/env` holds a personal token and no App keeps that token, so an
+  upgrade of a 0.2.0 `--pat` install stays on it; `--new-app` switches to an App.
 - `install.sh` passes `--pat` only with `SBR_PAT=1` or `--pat`, and otherwise unsets
   `GITHUB_TOKEN` and `GH_TOKEN` for `setup`. Before, the `GITHUB_TOKEN` every boat
   machine has (its creator's) made setup install that personal token instead of
@@ -110,10 +112,12 @@ All notable changes to this project are documented here. The format follows
 
 - `setup --remote` stops when a boat machine already runs the daemon for the
   repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
-  `--replace` deletes that machine once the new one's service is active.
+  `--replace` deletes that machine once `doctor` finds no FAIL on the new one.
 - A rerun of `setup` with a stored or given GitHub App checks that the App is installed
   on the policy's repository before it writes anything, and uses the installation
   GitHub names for it.
+- The unit `setup` writes sets `TimeoutStopSec=300`, so systemd waits for the daemon to
+  finish its tick on SIGTERM.
 - `tests/install_sh.rs` runs `install.sh` with fake `curl`, `uname`, `getconf`, `gh` and
   `cargo`; CI runs shellcheck on it.
 

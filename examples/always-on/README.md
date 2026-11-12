@@ -11,8 +11,8 @@ with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs
 (`boat api-key create` makes a key). First it lists your boat machines and stops if one
 already runs the daemon for the repository: one labelled `sw-boat-runner-host` for it,
 or called `sw-boat-runner <owner>/<name>`. Keep that one, delete it with
-`boat delete <id> --yes`, or pass `--replace`, which deletes it once the new machine's
-service is active. Then:
+`boat delete <id> --yes`, or pass `--replace`, which deletes it once `doctor` finds no
+FAIL on the new machine. Then:
 
 1. It asks for `BOAT_API_KEY` without echo, then the repository, labels and snapshot,
    and offers to build the snapshot if it is missing.

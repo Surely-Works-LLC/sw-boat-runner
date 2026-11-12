@@ -81,7 +81,7 @@ Installs sw-boat-runner as a systemd service on this machine (Ubuntu, sudo):
                                  waiting for the 127.0.0.1 redirect (a paste also works
                                  while it waits)
   --replace                      with --remote: delete the repository's existing daemon
-                                 machine once the new machine's service is active
+                                 machine once doctor finds no FAIL on the new one
 
 When the snapshot named is not among your saved boat snapshots (or you answer `new`),
 setup offers to build one: a temporary noEnv machine gets the latest actions/runner,
@@ -377,6 +377,10 @@ fn setup(opts: &Options) -> Result<(), String> {
                     .map_err(|e| format!("{e}; pass --new-app to create a new App"))?;
                 check_installed(&t, auth, &cfg.repo)?
             }
+            AppPlan::KeepPat => {
+                println!("{KEEP_PAT}");
+                Auth::Pat(stored_token(&existing).expect("plan_app found it"))
+            }
             AppPlan::Unknown => unreachable!("a real run reads {ENV} or fails"),
             AppPlan::Create => new_app(&t, &cfg.repo, opts.offline_link, sudo)?,
         }
@@ -440,6 +444,10 @@ fn dry_run_app(plan: AppPlan, repo: &str) -> (String, Auth) {
             format!("Would reuse GitHub App {id} from {ENV} (--new-app creates a new one)."),
             app(id, installation, None),
         ),
+        AppPlan::KeepPat => (
+            format!("Would keep the personal token in {ENV}: {KEEP_PAT}"),
+            Auth::Pat(placeholder("GITHUB_TOKEN")),
+        ),
         AppPlan::Unknown => (
             format!(
                 "Would reuse the GitHub App {ENV} names, if it names one (reading it needs \
@@ -469,7 +477,7 @@ fn runs_on(labels: &[String]) -> String {
 /// `--pat` takes it.
 fn note_ignored_token(pat: bool) {
     if !pat && std::env::var("GITHUB_TOKEN").is_ok_and(|v| !v.trim().is_empty()) {
-        println!("GITHUB_TOKEN is set; setup ignores it and uses a GitHub App (--pat uses it).");
+        println!("GITHUB_TOKEN is set; setup ignores it (--pat uses it).");
     }
 }
 
@@ -724,9 +732,26 @@ enum AppPlan {
         key_file: String,
         installation: Option<u64>,
     },
+    /// The personal token an earlier `setup --pat` stored, with no App: a 0.2.0
+    /// install.sh passed `--pat` on its own, and an upgrade must not swap it for an App.
+    KeepPat,
     /// A dry run that could not read the env file.
     Unknown,
     Create,
+}
+
+const KEEP_PAT: &str = "/etc/sw-boat-runner/env holds a personal token and no App: keeping \
+    the token (--new-app creates an App instead; --pat with GITHUB_TOKEN replaces the token).";
+
+/// The `GITHUB_TOKEN` the env file holds.
+fn stored_token(existing: &Existing) -> Option<Secret> {
+    let Existing::Text(text) = existing else {
+        return None;
+    };
+    parse_env(text)
+        .into_iter()
+        .find(|(k, v)| k == "GITHUB_TOKEN" && !v.is_empty())
+        .map(|(_, v)| Secret(v))
 }
 
 /// The shell's App first, then (unless `--new-app`) the one the env file names, else a
@@ -751,7 +776,11 @@ fn plan_app(new_app: bool, shell_id: Option<&str>, existing: &Existing) -> Resul
             .map(|(_, v)| v.clone())
     };
     let Some(id) = get("GITHUB_APP_ID") else {
-        return Ok(AppPlan::Create);
+        return Ok(if get("GITHUB_TOKEN").is_some() {
+            AppPlan::KeepPat
+        } else {
+            AppPlan::Create
+        });
     };
     let hint = "; fix it or pass --new-app to create a new App";
     check_app_id(&format!("GITHUB_APP_ID in {ENV}"), &id).map_err(|e| format!("{e}{hint}"))?;
@@ -1381,6 +1410,9 @@ EnvironmentFile={ENV}
 {credential}ExecStart={exec_start}
 Restart=always
 RestartSec=30
+# A tick can take several 90 s requests, and the daemon finishes it on SIGTERM (systemd's
+# default KillSignal).
+TimeoutStopSec=300
 DynamicUser=yes
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -1900,8 +1932,16 @@ mod tests {
                 installation: None,
             }
         );
+        // A 0.2.0 --pat install keeps its token on an upgrade; --new-app switches.
         let pat = env("BOAT_API_KEY=bk\nGITHUB_TOKEN=t\n");
-        assert_eq!(plan_app(false, None, &pat).unwrap(), AppPlan::Create);
+        assert_eq!(plan_app(false, None, &pat).unwrap(), AppPlan::KeepPat);
+        assert_eq!(stored_token(&pat).unwrap().expose(), "t");
+        assert_eq!(plan_app(true, None, &pat).unwrap(), AppPlan::Create);
+        assert_eq!(
+            plan_app(false, None, &env("BOAT_API_KEY=bk\nGITHUB_TOKEN=\n")).unwrap(),
+            AppPlan::Create
+        );
+        assert!(stored_token(&Existing::Absent).is_none());
         assert_eq!(
             plan_app(false, None, &Existing::Absent).unwrap(),
             AppPlan::Create
@@ -1947,6 +1987,10 @@ mod tests {
         assert!(matches!(auth, Auth::App { staged: None, .. }));
         let (what, _) = dry_run_app(AppPlan::Shell("7".into()), "o/r");
         assert!(what.starts_with("Would use GitHub App 7"), "{what}");
+        let (what, auth) = dry_run_app(AppPlan::KeepPat, "o/r");
+        assert!(what.contains("--new-app creates an App"), "{what}");
+        assert!(matches!(auth, Auth::Pat(_)));
+        assert!(KEEP_PAT.starts_with(ENV));
         let (what, _) = dry_run_app(AppPlan::Unknown, "o/r");
         assert!(what.contains("needs sudo"), "{what}");
         let (what, auth) = dry_run_app(AppPlan::Create, "o/r");
@@ -2029,6 +2073,7 @@ mod tests {
                 "ProtectHome=yes",
                 "PrivateTmp=yes",
                 "PrivateDevices=yes",
+                "TimeoutStopSec=300",
                 "WantedBy=multi-user.target",
             ] {
                 assert!(unit.lines().any(|l| l == line), "{line}");
