@@ -1,6 +1,8 @@
 //! A one-pool policy and a fake boat and GitHub that the loop's tests share.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::io::Write;
+use std::rc::Rc;
 
 use super::{HTTP_TIMEOUT, Loop};
 use crate::github;
@@ -41,6 +43,40 @@ pub(super) fn config() -> Config {
 /// A loop whose restart wait is over by `NOW`.
 pub(super) fn started<'a>(cfg: &'a Config, fake: &'a Fake) -> Loop<'a> {
     Loop::new(cfg, fake, BOAT_KEY.into(), gh_auth(), STARTED)
+}
+
+/// What a loop logged, for `capture_log`.
+#[derive(Clone, Default)]
+pub(super) struct Logged(Rc<RefCell<Vec<u8>>>);
+
+impl Logged {
+    /// The lines logged so far, and forgets them.
+    pub(super) fn take(&self) -> Vec<String> {
+        let bytes = std::mem::take(&mut *self.0.borrow_mut());
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl Write for Logged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sends `tick_loop`'s action lines to the returned buffer instead of stderr.
+pub(super) fn capture_log(tick_loop: &mut Loop) -> Logged {
+    let logged = Logged::default();
+    tick_loop.set_log(Box::new(logged.clone()));
+    logged
 }
 
 /// `GH_TOKEN` as a personal access token.

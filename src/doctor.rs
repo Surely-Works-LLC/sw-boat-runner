@@ -51,7 +51,8 @@ any FAIL. The policy defaults to /etc/sw-boat-runner/policy.toml.
              from a sandbox without its creator's logins
   machines   no machine of this repository is in a pool the policy no longer has, and
              no pool shares machines from before 0.3.0, which carry no repo label;
-             each warn prints the drain or delete command
+             each warn about this repository's machines prints the drain or delete
+             command; unlabelled machines of other pools are another daemon's, left alone
   github     the App's installation has Administration write and Actions read and
              mints a token, or the token lists the repository's runners; rate limit left
   service    systemctl is-active sw-boat-runner
@@ -1155,7 +1156,7 @@ mod tests {
                 (Level::Fail, "snapshot"),
                 (Level::Fail, "snapshot"),
                 (Level::Warn, "machines"),
-                (Level::Warn, "machines"),
+                (Level::Ok, "machines"),
                 (Level::Warn, "machines"),
                 (Level::Fail, "github"),
                 (Level::Fail, "service"),
@@ -1170,7 +1171,10 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("pool boat is not in the policy and has 1 machine(s) without a repo"),
+            out.contains(
+                "pool boat: 1 machine from before 0.3.0 is not in this policy; another daemon \
+                 on this boat account probably owns it; left alone"
+            ) && !out.contains("bx_33333333"),
             "{out}"
         );
         assert!(

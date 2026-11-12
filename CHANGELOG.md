@@ -56,8 +56,25 @@ All notable changes to this project are documented here. The format follows
   `gh attestation` gets a warning instead of a failure.
 - `setup --remote` takes a pasted code or redirect address while it waits for the
   browser, for a browser on another computer, instead of only after 15 minutes.
+- `run` logs what it does, one stderr line per action that succeeds: `fork <id> (pool
+  <pool>): job <id> attempt <n>` or `kept machine, <why>`, `resume`, `stop ...:
+  idle_stop`, `delete ...: finished` (or `orphaned`, `ttl`, `logins`, `drain`, ...),
+  `register <runner> on <machine>` and `unregister <runner>: <why>`. It logs a `start:`
+  line with the version, repository and pools, and a `summary:` line of each pool's
+  machines up and runners busy and today's spend (or, until 00:00 UTC after a restart,
+  that it is unknown and counted as the cap) at the first tick and then hourly. A
+  tick with nothing to do logs nothing; no line carries a secret or jit config. Before,
+  `journalctl -u sw-boat-runner -f` showed only errors. `run::Loop::set_log` sends the
+  lines elsewhere.
 
 ### Fixed
+
+- `doctor` and `run` no longer advise deleting unlabelled machines (made before 0.3.0)
+  in a pool the policy does not have. Those are almost always another daemon's on the
+  same boat account, so they get one info line per pool ("another daemon on this boat
+  account probably owns them; left alone") with no `boat delete` or `drain` command.
+  Delete and drain advice stays for machines labelled with this repository in a pool
+  the policy no longer has.
 
 - Queued and in-progress runs, and each run's jobs, are read past the first page of 100
   (up to 10 pages, stopping once `total_count` is covered). A matrix of more than 100

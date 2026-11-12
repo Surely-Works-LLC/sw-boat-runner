@@ -115,6 +115,33 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     actions
 }
 
+/// Why `decide` deletes each machine of `pool` it deletes, for the log: `finished`,
+/// `ttl` or `orphaned` for a job's fork; `no_resume` for a stopped kept machine of a pool
+/// without `resume`, and `no_slot` for a kept machine up or starting in a pool without
+/// `slot`. Reads the same guard as `decide`, so the two cannot disagree.
+pub fn delete_reasons<'a>(snap: &'a Snapshot, pool: &'a Pool) -> Vec<(&'a str, &'static str)> {
+    let v = View::new(snap, pool);
+    let deleted = v.machines.iter().filter(|m| v.delete(m));
+    deleted
+        .map(|m| {
+            let why = if !m.is_ephemeral() {
+                if m.state == Stopped {
+                    "no_resume"
+                } else {
+                    "no_slot"
+                }
+            } else if v.finished(m) {
+                "finished"
+            } else if v.age(m) > pool.fork_ttl_s {
+                "ttl"
+            } else {
+                "orphaned"
+            };
+            (m.id.as_str(), why)
+        })
+        .collect()
+}
+
 /// One snapshot as one pool sees it, sorted once so that each guard is a lookup.
 struct View<'a> {
     snap: &'a Snapshot,
