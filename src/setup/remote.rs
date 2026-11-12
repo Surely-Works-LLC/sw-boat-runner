@@ -605,8 +605,11 @@ fn install_script(git_ref: &str, auth: &Auth, files: &Staged) -> String {
         Auth::App {
             id, installation, ..
         } => {
+            // A boat machine comes with its creator's GITHUB_TOKEN, which install.sh would
+            // take for a personal token.
             let mut s = format!(
-                "export GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE=\"$d/{}\"\n",
+                "unset GITHUB_TOKEN GH_TOKEN\n\
+                 export GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE=\"$d/{}\"\n",
                 files.secret_file
             );
             if let Some(i) = installation {
@@ -802,7 +805,8 @@ mod tests {
         assert!(s.contains("export BOAT_API_KEY SBR_REF=v0.3.0\n"));
         assert!(s.contains("BOAT_API_KEY=$(cat boat-key)"));
         assert!(s.contains(
-            "export GITHUB_APP_ID=42 GITHUB_APP_PRIVATE_KEY_FILE=\"$d/app.pem\"\n\
+            "unset GITHUB_TOKEN GH_TOKEN\n\
+             export GITHUB_APP_ID=42 GITHUB_APP_PRIVATE_KEY_FILE=\"$d/app.pem\"\n\
              export GITHUB_APP_INSTALLATION_ID=77\n"
         ));
         assert!(s.contains("trap 'rm -rf \"$d\"' EXIT"));
