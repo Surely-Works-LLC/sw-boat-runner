@@ -4,7 +4,7 @@
 # echo, and installs the systemd service. `sw-boat-runner setup --help` lists its flags.
 # usage: bash install.sh [policy.toml] [setup flags...]
 # With a policy file, setup uses it instead of asking. A GITHUB_TOKEN in the environment
-# means a personal token instead of an App (setup --pat); GITHUB_APP_ID and
+# without GITHUB_APP_ID means a personal token (setup --pat); GITHUB_APP_ID and
 # GITHUB_APP_PRIVATE_KEY_FILE mean an App you already have.
 # SBR_REF picks the version: unset for the latest release, a tag starting with v and a
 # digit, a commit hash or a branch. For a release (Linux x86_64 or arm64) it downloads the
@@ -23,7 +23,7 @@ if [ $# -gt 0 ] && [[ $1 != -* ]]; then
     args+=(--policy "$1")
     shift
 fi
-if [ -n "${GITHUB_TOKEN:-}" ]; then
+if [ -n "${GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_APP_ID:-}" ]; then
     args+=(--pat)
 fi
 
