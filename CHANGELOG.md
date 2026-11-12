@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format follows
   this process registered logs `online <runner> <n>s after its register` when GitHub
   first lists it online. Together they tell queueing for capacity from the daemon's own
   delay.
+### Added
+
+- `tests/sim_scenarios.rs`: a seven-minute boat outage (every request answers 500) during
+  a warm pool's long job. The daemon keeps running, touches no machine, leaves the busy
+  runner alone and serves the job queued meanwhile within two ticks of boat coming back.
 
 ## [0.3.0] - 2026-11-12
 
