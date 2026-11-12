@@ -44,6 +44,51 @@ fn warm_pool_stops_idle_machines_and_resumes_them() {
     assert!(w.jobs.iter().all(|j| j.status == JobStatus::Done));
 }
 
+/// boat answers every request with 500 for seven minutes while a warm pool runs a long
+/// job, and a short job queues during the outage. The daemon keeps running, touches no
+/// machine, leaves the busy runner alone, and serves the short job within two ticks of
+/// boat coming back.
+#[test]
+fn a_boat_outage_keeps_busy_runners_and_serves_the_queue_once_boat_is_back() {
+    let mut w = world(Knobs::default());
+    w.seed_machine(0, "ci", None, BoxState::Up);
+    w.seed_machine(0, "ci", None, BoxState::Up);
+    let long = w.add_run("o/r", T0, &[(large(), 1_200)])[0];
+    let short = w.add_run("o/r", T0 + 400, &[(large(), 60)])[0];
+    let cfg = one_pool("warm", "max_boxes = 2\nmin_up = 2");
+    let mut s = Sim::warmed(w, vec![cfg]);
+    s.run_for(300);
+    assert!(
+        s.world().jobs[long].started_at.is_some(),
+        "the long job started"
+    );
+    let before = s.world().stats.clone();
+
+    s.world_mut().faults.boat_5xx = 1.0;
+    s.run_for(420);
+    let back = s.now;
+    s.world_mut().faults = Faults::none();
+    s.run_for(1_200);
+
+    s.assert_clean(&[]);
+    let w = s.world();
+    assert_eq!(w.jobs[long].status, JobStatus::Done, "{:?}", w.jobs[long]);
+    let started = w.jobs[short].started_at.expect("the short job ran");
+    assert!(started >= back, "the short job started during the outage");
+    assert!(
+        started <= back + 2 * s.tick_s,
+        "the short job started {}s after boat came back",
+        started.saturating_sub(back)
+    );
+    let after = &w.stats;
+    assert_eq!(
+        (after.creates, after.resumes, after.stops, after.deletes),
+        (before.creates, before.resumes, before.stops, before.deletes),
+        "{after:?}"
+    );
+    assert_eq!(after.exits, 0, "{after:?}");
+}
+
 /// Two daemons on one boat account, for one repository with pools of different names, and
 /// for two repositories with pools of different names: neither touches the other's
 /// machines, even while one is down.
