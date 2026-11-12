@@ -38,6 +38,9 @@ pub(super) struct Ledger {
     /// The price booked for the last start boat accepted or may have accepted, until a
     /// later quote is read; see `quote_seen`.
     unconfirmed: Option<Cents>,
+    /// `spent_cents` was set to the largest cap at start, as the real spend before the
+    /// restart is not known, and the UTC day has not turned since.
+    spend_unknown: bool,
 }
 
 /// The kinds of action that cost a start, which back off apart in each pool.
@@ -88,6 +91,7 @@ impl Ledger {
             blocked_until: now.saturating_add(HTTP_TIMEOUT.as_secs()),
             failing: HashMap::new(),
             unconfirmed: None,
+            spend_unknown: true,
         }
     }
 
@@ -116,11 +120,22 @@ impl Ledger {
             self.day = now / DAY_S;
             self.spent_cents = 0;
             self.unconfirmed = None;
+            self.spend_unknown = false;
         }
     }
 
     pub(super) fn spent_cents(&self) -> Cents {
         self.spent_cents
+    }
+
+    /// Today's spend for the log: the real figure, or that it is not known since the
+    /// restart and counted as the cap.
+    pub(super) fn spend_note(&self) -> String {
+        if self.spend_unknown {
+            "spend today unknown since restart (counted as the cap)".to_string()
+        } else {
+            format!("spent {}c today", self.spent_cents)
+        }
     }
 
     pub(super) fn starts_open(&self, now: UnixSecs) -> bool {
@@ -1612,7 +1627,8 @@ mod tests {
         assert_eq!(
             log.take(),
             [
-                "summary: pool ci: 0 up, 0 busy; spent 100c today",
+                "summary: pool ci: 0 up, 0 busy; spend today unknown since restart \
+                 (counted as the cap)",
                 "fork bx_55555555 (pool ci): job 70 attempt 1",
             ]
         );
@@ -1642,5 +1658,31 @@ mod tests {
         assert!(lines.contains(&"unregister sbr-ci-bx_22222222-0-900: drain".to_string()));
         assert!(lines.contains(&"delete bx_22222222 (pool ci): drain".to_string()));
         assert!(lines.iter().all(|l| !l.contains("JITSECRET")), "{lines:?}");
+    }
+
+    /// After a restart the summary says the spend is not known; from the next UTC day on
+    /// it gives the real figure.
+    #[test]
+    fn summary_gives_the_real_spend_once_the_day_turns() {
+        let cfg = config();
+        let fake = lagging(|_| "", |_| "");
+        let mut tick_loop = started(&cfg, &fake);
+        let log = capture_log(&mut tick_loop);
+        tick_loop.tick(NOW, decide).unwrap();
+        assert_eq!(
+            log.take(),
+            [
+                "summary: pool ci: 0 up, 0 busy; spend today unknown since restart (counted as \
+              the cap)"
+            ]
+        );
+        // Within the hour: no summary.
+        tick_loop.tick(NOW + 15, decide).unwrap();
+        assert_eq!(log.take(), Vec::<String>::new());
+        tick_loop.tick(DAY_S + NOW, decide).unwrap();
+        assert_eq!(
+            log.take(),
+            ["summary: pool ci: 0 up, 0 busy; spent 0c today"]
+        );
     }
 }

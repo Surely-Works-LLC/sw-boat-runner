@@ -61,7 +61,8 @@ All notable changes to this project are documented here. The format follows
   idle_stop`, `delete ...: finished` (or `orphaned`, `ttl`, `logins`, `drain`, ...),
   `register <runner> on <machine>` and `unregister <runner>: <why>`. It logs a `start:`
   line with the version, repository and pools, and a `summary:` line of each pool's
-  machines up and runners busy and today's spend at the first tick and then hourly. A
+  machines up and runners busy and today's spend (or, until 00:00 UTC after a restart,
+  that it is unknown and counted as the cap) at the first tick and then hourly. A
   tick with nothing to do logs nothing; no line carries a secret or jit config. Before,
   `journalctl -u sw-boat-runner -f` showed only errors. `run::Loop::set_log` sends the
   lines elsewhere.

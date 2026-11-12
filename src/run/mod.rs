@@ -575,11 +575,8 @@ impl<'a> Loop<'a> {
                 format!("pool {}: {up} up, {busy} busy", p.name)
             })
             .collect();
-        let spent = self.ledger.spent_cents();
-        self.log(format_args!(
-            "summary: {}; spent {spent}c today",
-            pools.join("; ")
-        ));
+        let spend = self.ledger.spend_note();
+        self.log(format_args!("summary: {}; {spend}", pools.join("; ")));
     }
 
     /// `drain` is running: every delete and unregister is for the drain.
