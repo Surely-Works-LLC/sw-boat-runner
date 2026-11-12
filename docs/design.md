@@ -67,8 +67,9 @@ personal logins (GitHub token, model logins) into every machine forked from it, 
 though the daemon forks with `noEnv`. `check` cannot see this. Before it registers a
 runner, the daemon asks boat whether the machine holds its creator's logins
 (`holdsCreatorLogins`); if so, or if boat does not say, it registers nothing and logs an
-error that names the snapshot. A job's fork is deleted and the pool's forks back off; a
-kept machine waits until it is stopped and resumed.
+error that names the snapshot. A job's fork, or a kept machine in a pool without
+`resume`, is deleted; a kept machine in a pool with `resume` is stopped, as its resume
+scrubs the logins. Either way the pool's forks, of jobs and of kept machines, back off.
 
 ```sh
 boat new --no-env --type large   # the pool's machine_type; prints the machine's id
@@ -128,7 +129,12 @@ Every action that costs a start passes the pool's `paid_start_cents_per_day` che
 tick at that quote. At a quote of 0 it plans no more starts than the fewest left among
 boat's minute, hour and day windows, because the price past them is not known until the
 next tick. Before each start that follows an accepted one, the daemon reads `GET /limits`
-again and makes no more starts that tick if the price changed. One account serves every pool, so each pool's
+again and makes no more starts that tick if the price changed. A quote read after an
+accepted start (that read, or the next tick's) that is above the price booked for it
+means the start may have cost the new price, as when someone else on the account took
+the last included start first; the difference is booked too. When it was the daemon's
+own start that used the last included one, this counts a free start as paid, which only
+delays paid starts. One account serves every pool, so each pool's
 cap is checked against the account-wide spend, including the starts that pools earlier in
 the file planned in the same tick. Prices are counted in whole cents, and a positive price
 under half a cent counts as 1 cent, so a paid start is never counted as free.
@@ -238,6 +244,41 @@ counterexample TLC finds without it.
   answer, and the daemon makes no more starts that tick. A refusal adds nothing.
 - Restart spend (`FixCrashSpend`): see [Start budget](#start-budget).
 
+The listing-lag and lost-create waits count from the request's answer, not from the
+start of the tick, whose earlier requests can take up to the request timeout each. A
+resume without a definite answer is held as in flight, like an accepted one, so the next
+tick does not resume (and pay for) it again.
+
+A `Register` whose file write or start command fails after GitHub issued the jit config
+leaves a runner that would stay `Registered` until `register_timeout_s`, holding its slot
+and covering a job. The daemon notes it: while GitHub lists it and it has never been
+online it is left out of the snapshot and deleted first thing the next tick, and its
+machine takes no other action that tick if the delete fails. A start command that timed
+out may still have run, so the runner may be starting (waiting out the snapshot copy,
+up to 600 s) when its registration is deleted; it then fails to connect and exits, and
+the slot's next start command kills it with `pkill` in any case. Once GitHub lists it
+online it is kept as any other runner.
+
+## Errors
+
+An error no later tick can fix (boat 401 or 402, a boat 403 to anything but a start,
+GitHub 401 or a 403 that is not a rate limit) skips the rest of the tick's registers
+and starts, but every other unregister, delete and stop of the tick still runs. A boat
+403 to a fork or resume can be one pool's alone, such as a `machine_type` the plan does
+not allow: that pool makes no start for 60 s, doubling to 10 min, and other pools go on.
+A 403 for the whole account fails the next tick's reads. After such an error `run` tries
+the full tick again after 15 s, doubling to 10 min, rather than exit and lose what a
+restart costs (today's spend, the 90 s restart wait, and every `Up` job fork through
+`FixCrashSeen`). The ticks in between still run every `tick_s`, cleanup only:
+unregisters, deletes and stops, no registers or starts; if one of them fails the same
+way, none runs again until the next try. A stop signal ends the waits at once. If the
+errors last 30 min it observes once more, runs the unregisters, deletes and stops
+`decide` asks for, stops every kept `Up` machine no `Busy` or `Registered` runner holds,
+and exits. On this way out a stop goes ahead even when GitHub refuses the runner delete
+with such an error, since nothing could stop the machine otherwise; and when GitHub
+refuses the observe, the kept machines boat lists up that had no runner at the last
+observe, and none registered since, are stopped from boat's listing alone.
+
 ## GitHub requests
 
 The REST API allows a token a number of requests an hour: 5,000 for a personal access
@@ -340,7 +381,7 @@ process saw it online is `Registered` until that timeout.
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`; or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that the pool's listing does not show `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, each id and
@@ -357,7 +398,22 @@ changed after it was made, and without this rule it would hold a `max_boxes` box
 boat's 30-day TTL. A `Stopping` one is deleted once it is `Stopped`.
 A `Busy` runner keeps its machine even past `fork_ttl_s`, which counts from the machine's
 last state change. The policy accepts `fork_ttl_s` from 1 to 2592000 (30 days, boat's
-longest TTL) and rejects anything else rather than clamping it.
+longest TTL) and rejects anything else rather than clamping it. `check` and `run` warn
+about one not above `register_timeout_s` plus 300 s, as the fork's TTL may then end
+before its runner is online; it is a warning so that a policy that loaded before an
+upgrade still loads. A `Busy` runner on a job fork within 10 minutes of `fork_ttl_s` is logged as a
+warning once, since boat archives the machine at its TTL, job or no job.
+
+An ephemeral machine is orphaned when it is `Up`, no runner on it is `Busy`, and its own
+job is not queued and was last seen queued 60 s ago (`ORPHAN_GRACE_S`; a job this
+process never saw queued counts from the machine coming up). One with a runner online
+(`Idle` or `Registered`) is orphaned only once the pool has had no queued job for those
+60 s, counted from when one was last seen, as the listing may not show yet that the
+runner took one. A JIT runner takes any job its labels match, so a fork made for one
+job may run another: while jobs are queued, as many forks that no `Busy` runner holds as
+there are queued jobs stay, whichever job each was made for. The delete removes the
+runners first, and GitHub refuses to delete one that took a job since, which keeps the
+fork (`FixStaleAct`).
 
 An ephemeral machine's job has finished when the machine is `Stopped`, or when it is `Up`
 with no live runner and either a runner was seen on it or it has been `Up` longer than

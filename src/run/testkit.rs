@@ -229,3 +229,24 @@ pub(super) const JOBS_70_71: &str = r#"{"id":70,"run_attempt":1,"status":"queued
     {"id":71,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}"#;
 pub(super) const LISTED_55: &str = r#"{"id":"bx_55555555","state":"provisioning",
     "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}"#;
+
+/// One answer of a fake that lists `listing` in pool `ci`, no runners, and jobs `jobs` in
+/// run 5, with included starts; anything else as `reply`.
+pub(super) fn lagging_reply(s: &Sent, listing: &str, jobs: &str) -> Response {
+    let url = s.url.as_str();
+    if s.method == "GET" && url.starts_with(&format!("{BOAT}/sandboxes?")) {
+        let body = format!(
+            r#"{{"sandboxes":[{listing}],
+               "pageInfo":{{"nextCursor":null,"hasMore":false,"limit":200}}}}"#
+        );
+        respond(200, &[], &body)
+    } else if s.method == "GET" && url.starts_with(&format!("{GH}/runners?")) {
+        respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+    } else if s.method == "GET" && url.contains("/runs/5/jobs") {
+        respond(200, &[], &format!(r#"{{"jobs":[{jobs}]}}"#))
+    } else if s.method == "GET" && url.ends_with("/v1/limits") {
+        respond(200, &[], r#"{"canStart":true,"nextStartDollars":0}"#)
+    } else {
+        reply(s)
+    }
+}

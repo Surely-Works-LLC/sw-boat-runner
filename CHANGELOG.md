@@ -47,12 +47,50 @@ All notable changes to this project are documented here. The format follows
   killed. `run --drain-on-stop` drains the pools in the same process first.
   The `runners` workflow uses it and waits for the daemon, and runs `drain` only when the
   daemon did not finish.
+- An error no tick can fix no longer ends the tick before its cleanup: the tick's other
+  unregisters, deletes and stops still run, and only its registers and starts are
+  skipped. `run` then tries again after 15 s, doubling to 10 min, instead of exiting at
+  once, so a restart loop no longer resets today's spend, closes starts for 90 s and
+  deletes every up job fork each time. While it waits it still runs cleanup-only ticks
+  (unregisters, deletes, stops) every `tick_s`, and a stop signal ends the wait at once.
+  After 30 min of such errors it runs the cleanup `decide` asks for, stops the kept
+  machines no runner holds (even when GitHub refuses the runner delete, or the observe),
+  and exits.
+- A boat 403 to one pool's fork or resume (a `machine_type` the plan does not allow)
+  backs off that pool's starts, 60 s doubling to 10 min, and logs an error; other pools go
+  on. Before, it stopped the daemon for every pool.
+- A `Register` whose file write or start command fails no longer holds its slot and
+  covers a job for `register_timeout_s`: the next tick deletes the GitHub runner and
+  frees the slot.
+- A kept machine holding its creator's logins no longer blocks its pool: it is deleted,
+  or stopped in a pool with `resume`, whose resume scrubs the logins, and the pool's kept
+  forks back off as job forks do.
+- A start that boat charged above the quote `decide` saw (someone else on the account
+  took the last included start first) now counts against `paid_start_cents_per_day`: a
+  quote read after an accepted start that is above its booked price books the
+  difference. Before, the daemon could pay past its cap.
+- A resume without an answer is held as in flight, so the next tick does not resume and
+  pay for it again.
+- The listing-lag, lost-create and `Retry-After` waits count from the request's answer,
+  not from the start of the tick, which can be minutes earlier after slow requests.
+- A job's fork whose job left the queue (cancelled or re-run) is deleted 60 s after the
+  job was last seen queued, instead of after `register_timeout_s` or `fork_ttl_s`. One
+  with an `Idle` or `Registered` runner waits until the pool has had no queued job for
+  60 s, and while jobs are queued as many forks as there are jobs, that no `Busy` runner
+  holds, stay. Its runner is deleted first, so one that just took a job keeps it.
 
 ### Added
 
 - Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
   error, once per other daemon, when a machine forked by another daemon for the same
   repository and pool appears while it runs.
+
+### Changed
+
+- `check` and `run` warn about a `fork_ttl_s` that is not above `register_timeout_s` plus
+  300 s; a fork's TTL then may end before its runner comes online.
+- `run` warns once about a job fork whose `Busy` runner comes within 10 minutes of
+  `fork_ttl_s`, after which boat archives the machine.
 
 ## [0.2.0] - 2026-11-11
 

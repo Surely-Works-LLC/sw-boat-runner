@@ -15,6 +15,12 @@ use MachineState::{Gone, Starting, Stopped, Stopping, Up};
 use Placement::{Fork, Resume, Slot};
 use RunnerState::{Busy, Idle, Offline, Registered};
 
+/// How long after its job was last seen queued a job's fork with no runner online is
+/// deleted (`orphaned`). The grace counts from the job, not from the machine coming up,
+/// so a job that left the queue a moment ago, maybe to a runner the listing does not show
+/// busy yet, keeps its fork.
+pub const ORPHAN_GRACE_S: u64 = 60;
+
 /// The actions for `pool`, in this order: unregisters, deletes, registers, resumes, kept
 /// forks, job forks, stops. Inputs are sorted first, so their order in `snap` does not
 /// matter. `snap.queued` holds only the jobs routed to this pool (see `run::route`).
@@ -122,6 +128,8 @@ struct View<'a> {
     jobs: Vec<JobKey>,
     /// The pool's machines `Up` or `Starting`, against `max_boxes`.
     boxes: usize,
+    /// The pool's job forks deleted as `orphaned`, by id.
+    orphans: Vec<&'a str>,
 }
 
 impl<'a> View<'a> {
@@ -139,7 +147,8 @@ impl<'a> View<'a> {
         jobs.sort();
         jobs.dedup();
         let boxes = machines.iter().filter(|m| matches!(m.state, Up | Starting));
-        View {
+        let mut v = View {
+            orphans: Vec::new(),
             boxes: boxes.count(),
             snap,
             pool,
@@ -147,7 +156,9 @@ impl<'a> View<'a> {
             runners,
             by_machine,
             jobs,
-        }
+        };
+        v.orphans = v.orphans();
+        v
     }
 
     /// Register: fresh ephemeral machines first, as they are already paid for, then free
@@ -203,7 +214,9 @@ impl<'a> View<'a> {
         let on = self.on(m);
         if m.is_ephemeral() {
             let expired = self.age(m) > self.pool.fork_ttl_s;
-            m.state != Gone && !holds(on, &[Busy]) && (self.finished(m) || expired)
+            m.state != Gone
+                && !holds(on, &[Busy])
+                && (self.finished(m) || expired || self.orphaned(m))
         } else {
             match m.state {
                 Stopped => !self.pool.has(Resume) && !holds(on, &[Busy]),
@@ -223,6 +236,66 @@ impl<'a> View<'a> {
             Stopped => true,
             Starting | Stopping | Gone => false,
         }
+    }
+
+    /// Job forks with nothing left to run (spec has no counterpart): `Up`, no runner on
+    /// it `Busy`, and its own job not queued, last seen queued `ORPHAN_GRACE_S` ago (or,
+    /// never seen, that long after it came up). One with a runner online (`Idle` or
+    /// `Registered`) also waits until the pool has had no queued job for the grace,
+    /// counted from when one was last seen, since that runner may be taking one the
+    /// listing does not show yet. A JIT runner takes any job its labels match, so a fork
+    /// made for one job may run another: while jobs are queued, enough forks no `Busy`
+    /// runner holds stay to cover every one, whichever job each was made for. `act`
+    /// deletes a fork's runners before the fork, and GitHub refuses to delete one that
+    /// took a job since, which keeps the fork.
+    fn orphans(&self) -> Vec<&'a str> {
+        let now = self.snap.now;
+        let quiet = |t: u64| now.saturating_sub(t) >= ORPHAN_GRACE_S;
+        let pool_quiet = |m: &Machine| {
+            self.jobs.is_empty()
+                && quiet(
+                    self.snap
+                        .queued_at
+                        .get(&self.pool.name)
+                        .copied()
+                        .unwrap_or(m.since),
+                )
+        };
+        let candidates = self.ephemeral().filter(|m| {
+            let Some(job) = m.job else {
+                return false;
+            };
+            let on = self.on(m);
+            let online = on.iter().any(|r| r.state != Offline);
+            m.state == Up
+                && !holds(on, &[Busy])
+                && self.jobs.binary_search(&job).is_err()
+                && quiet(m.job_queued_at.unwrap_or(m.since))
+                && (!online || pool_quiet(m))
+        });
+        // A fork that can still take a job: starting, or up and neither finished nor past
+        // its TTL, with no runner or only `Registered` and `Idle` ones.
+        let free = self
+            .ephemeral()
+            .filter(|m| match m.state {
+                Starting => true,
+                Up => {
+                    !self.finished(m)
+                        && self.age(m) <= self.pool.fork_ttl_s
+                        && self
+                            .on(m)
+                            .iter()
+                            .all(|r| matches!(r.state, Registered | Idle))
+                }
+                Stopping | Stopped | Gone => false,
+            })
+            .count();
+        let spare = free.saturating_sub(self.jobs.len());
+        candidates.map(|m| m.id.as_str()).take(spare).collect()
+    }
+
+    fn orphaned(&self, m: &Machine) -> bool {
+        self.orphans.contains(&m.id.as_str())
     }
 
     /// Every runner is JIT: once offline it never comes back, and it holds its slot.
@@ -335,6 +408,7 @@ mod tests {
             since: NOW - 7200,
             last_busy: NOW - 7200,
             job: None,
+            job_queued_at: None,
         }
     }
 
@@ -377,6 +451,7 @@ mod tests {
                 spent_today_cents: 0,
                 free_starts_left: None,
             },
+            queued_at: Default::default(),
         }
     }
 
@@ -448,7 +523,7 @@ mod tests {
         // A starting kept machine counts; an ephemeral one does not.
         let s = snap(
             vec![machine("m1", Ms::Starting), forked("f1", 1, Ms::Up)],
-            vec![],
+            vec![runner("f1", 0, Rs::Busy)],
             &[],
         );
         assert_eq!(decide(&s, &p), [fork_kept()]);
@@ -614,6 +689,114 @@ mod tests {
         assert_eq!(decide(&snap(vec![used], vec![], &[]), &p), [delete("m1")]);
     }
 
+    /// Job 1 was cancelled. Its fork goes `ORPHAN_GRACE_S` after the job was last seen
+    /// queued, not after `register_timeout_s` or `fork_ttl_s`.
+    #[test]
+    fn a_fork_whose_job_was_cancelled_is_deleted_after_a_short_grace() {
+        let p = pool("fork", "");
+        assert!(p.register_timeout_s > ORPHAN_GRACE_S);
+        let gone = |queued_at: u64| Machine {
+            job_queued_at: Some(queued_at),
+            ..forked("m1", 1, Ms::Up)
+        };
+        let quiet = |mut s: Snapshot, at: u64| {
+            s.queued_at.insert("ci".into(), at);
+            s
+        };
+        let long_ago = NOW - ORPHAN_GRACE_S;
+        let just_now = NOW - ORPHAN_GRACE_S + 1;
+        // No runner: the grace counts from the job, not from the machine coming up.
+        let s = snap(vec![gone(long_ago)], vec![], &[]);
+        assert_eq!(decide(&s, &p), [delete("m1")]);
+        let s = snap(vec![gone(just_now)], vec![], &[]);
+        assert_eq!(decide(&s, &p), NOTHING);
+
+        // An Idle or Registered runner: the pool must have had no queued job for the grace.
+        for state in [Rs::Registered, Rs::Idle] {
+            let on = vec![runner("m1", 0, state)];
+            let s = quiet(snap(vec![gone(long_ago)], on.clone(), &[]), long_ago);
+            assert!(decide(&s, &p).contains(&delete("m1")), "{state:?}");
+            let s = quiet(snap(vec![gone(long_ago)], on, &[]), just_now);
+            assert!(!decide(&s, &p).contains(&delete("m1")), "{state:?}");
+        }
+        let busy = snap(vec![gone(long_ago)], vec![runner("m1", 0, Rs::Busy)], &[]);
+        assert_eq!(decide(&busy, &p), NOTHING);
+
+        // Job 2 has a fork no Busy runner holds, so job 1's has nothing to run.
+        let s = snap(
+            vec![gone(long_ago), forked("m2", 2, Ms::Starting)],
+            vec![],
+            &[2],
+        );
+        assert_eq!(decide(&s, &p), [delete("m1")]);
+        // Job 2 has none (no budget for it), so job 1's fork takes it.
+        let mut s = snap(vec![gone(long_ago)], vec![], &[2]);
+        s.limits.can_start = false;
+        assert_eq!(decide(&s, &p), [register("m1", 0)]);
+    }
+
+    /// m2, forked for job 2, runs job 1; m1, forked for job 1, is up with no runner yet
+    /// and is job 2's only hope; m3's runner went offline after its job. m3 cannot run
+    /// job 2, so it does not count as cover: m1 stays and takes job 2.
+    #[test]
+    fn a_finished_fork_does_not_cover_a_queued_job() {
+        let p = pool("fork", "");
+        let m1 = Machine {
+            job_queued_at: Some(NOW - 600),
+            ..forked("m1", 1, Ms::Up)
+        };
+        let m3 = Machine {
+            job_queued_at: Some(NOW - 600),
+            ..forked("m3", 3, Ms::Up)
+        };
+        let s = snap(
+            vec![m1, forked("m2", 2, Ms::Up), m3],
+            vec![runner("m2", 0, Rs::Busy), runner("m3", 0, Rs::Offline)],
+            &[2],
+        );
+        let actions = decide(&s, &p);
+        assert!(!actions.contains(&delete("m1")), "{actions:?}");
+        assert!(actions.contains(&register("m1", 0)), "{actions:?}");
+    }
+
+    /// The reviewer's swap: m2, forked for job 2, came up first and its runner took job 1.
+    /// m1's Idle runner is the only one left for job 2, so m1 stays, and so does a fork
+    /// whose runner the listing shows Idle a moment after it took its job.
+    #[test]
+    fn a_fork_that_can_still_run_a_queued_job_stays() {
+        let p = pool("fork", "");
+        let m1 = Machine {
+            job_queued_at: Some(NOW - 600),
+            ..forked("m1", 1, Ms::Up)
+        };
+        let swapped = snap(
+            vec![m1.clone(), forked("m2", 2, Ms::Up)],
+            vec![runner("m1", 0, Rs::Idle), runner("m2", 0, Rs::Busy)],
+            &[2],
+        );
+        assert!(!decide(&swapped, &p).contains(&delete("m1")));
+        // Without a runner on m1 the same holds: m2 cannot take job 2.
+        let swapped = snap(
+            vec![m1, forked("m2", 2, Ms::Up)],
+            vec![runner("m2", 0, Rs::Busy)],
+            &[2],
+        );
+        assert!(!decide(&swapped, &p).contains(&delete("m1")));
+
+        // Up 300 s, its job seen queued last tick; the runner just took it.
+        let mut s = snap(
+            vec![Machine {
+                since: NOW - 300,
+                job_queued_at: Some(NOW - 15),
+                ..forked("m1", 1, Ms::Up)
+            }],
+            vec![runner("m1", 0, Rs::Idle)],
+            &[],
+        );
+        s.queued_at.insert("ci".into(), NOW - 15);
+        assert_eq!(decide(&s, &p), NOTHING);
+    }
+
     #[test]
     fn hybrid_fills_a_slot_then_resumes_then_forks() {
         let p = pool("hybrid", "");
@@ -775,6 +958,7 @@ mod tests {
                             since,
                             last_busy,
                             job: job.map(|(id, attempt)| JobKey { id, attempt }),
+                            job_queued_at: None,
                         })
                         .collect(),
                     runners: runners
@@ -802,6 +986,7 @@ mod tests {
                         spent_today_cents: limits.2,
                         free_starts_left: None,
                     },
+                    queued_at: Default::default(),
                 })
         }
 
@@ -959,6 +1144,7 @@ mod tests {
                         since: 0,
                         last_busy: 1000 - idle % pool.idle_stop_s.max(1),
                         job: None,
+                        job_queued_at: None,
                     })
                     .collect();
                 let snap = Snapshot {
@@ -967,6 +1153,7 @@ mod tests {
                     runners: vec![],
                     queued: vec![],
                     limits: Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None },
+                    queued_at: Default::default(),
                 };
                 let actions = decide(&snap, &pool);
                 prop_assert!(actions.is_empty(), "{actions:?}");
@@ -1078,7 +1265,16 @@ mod tests {
                     };
                     let leaked = finished || age > pool.fork_ttl_s;
                     let deleted = actions.contains(&Action::Delete { machine: m.id.clone() });
-                    prop_assert_eq!(deleted, leaked && !busy, "{:?}", m);
+                    if leaked {
+                        prop_assert_eq!(deleted, !busy, "{:?}", m);
+                    } else if deleted {
+                        // Only an orphan: up, no Busy runner, its job not queued.
+                        let queued = snap
+                            .queued
+                            .iter()
+                            .any(|j| pool.serves(&j.labels) && Some(j.key) == m.job);
+                        prop_assert!(m.state == Ms::Up && !busy && !queued, "{:?}", m);
+                    }
                 }
             }
 
