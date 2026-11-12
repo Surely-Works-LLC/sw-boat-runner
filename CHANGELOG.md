@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `run`'s `register` line ends with the pool's queued jobs and how long the oldest has
+  waited since the daemon first saw it queued (`: 3 queued, oldest 42s`), and a runner
+  this process registered logs `online <runner> <n>s after its register` when GitHub
+  first lists it online. Together they tell queueing for capacity from the daemon's own
+  delay.
 ### Added
 
 - `tests/sim_scenarios.rs`: a seven-minute boat outage (every request answers 500) during

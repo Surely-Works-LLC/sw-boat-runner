@@ -49,6 +49,11 @@ pub(super) struct Memory {
     queued_seen: HashMap<JobKey, UnixSecs>,
     /// When a job each pool serves first was last seen queued, by pool.
     pool_queued: std::collections::BTreeMap<String, UnixSecs>,
+    /// When each job queued now was first seen queued, for the register log's wait.
+    first_queued: HashMap<JobKey, UnixSecs>,
+    /// Runners this process registered that came online at the last observe, with the
+    /// seconds from register to online, for the log.
+    came_online: Vec<(String, u64)>,
     /// When this process started. A job it never saw queued counts as queued then, for
     /// `orphaned`: one may have been queued just before a restart.
     started: UnixSecs,
@@ -179,8 +184,9 @@ impl Memory {
                 continue;
             }
             let online = r.status == "online";
-            if online && !self.online.contains(&r.name) {
-                self.online.insert(r.name.clone());
+            if online && self.online.insert(r.name.clone()) && n.registered_at >= self.started {
+                let took = now.saturating_sub(n.registered_at);
+                self.came_online.push((r.name.clone(), took));
             }
             let state = github::runner_state(online, r.busy, self.online.contains(&r.name));
             if let Some((machine, _)) = self.abandoned.get(&r.name) {
@@ -344,11 +350,37 @@ impl Memory {
         machines
     }
 
+    /// The jobs of `queued` that go to `pool` and the longest any of them has been seen
+    /// queued at `now`, or `None` when none does.
+    pub(super) fn queue_wait(
+        &self,
+        cfg: &Config,
+        pool: &str,
+        queued: &[crate::model::QueuedJob],
+        now: UnixSecs,
+    ) -> Option<(usize, u64)> {
+        let first: Vec<UnixSecs> = queued
+            .iter()
+            .filter(|j| {
+                cfg.pools
+                    .iter()
+                    .find(|p| p.serves(&j.labels))
+                    .is_some_and(|p| p.name == pool)
+            })
+            .map(|j| self.first_queued.get(&j.key).copied().unwrap_or(now))
+            .collect();
+        let oldest = first.iter().min()?;
+        Some((first.len(), now.saturating_sub(*oldest)))
+    }
+
     /// Notes that `queued` were seen queued at `now`, each job for the first pool in the
     /// file that serves it, as `run::plan` routes it.
     fn saw_queued(&mut self, cfg: &Config, now: UnixSecs, queued: &[crate::model::QueuedJob]) {
+        let keys: HashSet<JobKey> = queued.iter().map(|j| j.key).collect();
+        self.first_queued.retain(|j, _| keys.contains(j));
         for j in queued {
             self.queued_seen.insert(j.key, now);
+            self.first_queued.entry(j.key).or_insert(now);
             if let Some(p) = cfg.pools.iter().find(|p| p.serves(&j.labels)) {
                 self.pool_queued.insert(p.name.clone(), now);
             }
@@ -387,6 +419,9 @@ impl Loop<'_> {
         let lag_s = HTTP_TIMEOUT.as_secs().saturating_add(self.cfg.tick_s);
         let (runners, runner_ids, abandoned) =
             self.memory.runners(self.cfg, now, lag_s, gh_runners);
+        for (name, took) in std::mem::take(&mut self.memory.came_online) {
+            self.log(format_args!("online {name} {took}s after its register"));
+        }
         self.memory.saw_queued(self.cfg, now, &queued);
         let machines = self.memory.machines(now, lag_s, listed, &runners);
         let limits = Limits {
@@ -430,6 +465,39 @@ mod tests {
     use super::*;
     use crate::decide::decide;
     use crate::model::Placement;
+
+    fn queued(ids: &[u64]) -> Vec<crate::model::QueuedJob> {
+        ids.iter()
+            .map(|&id| crate::model::QueuedJob {
+                key: JobKey { id, attempt: 1 },
+                labels: vec!["self-hosted".into(), "large".into()],
+            })
+            .collect()
+    }
+
+    /// The register log's wait counts from when a job was first seen queued, restarts when
+    /// it leaves the queue and comes back, and goes only to the first pool that serves it.
+    #[test]
+    fn queue_wait_counts_from_first_sight_for_the_first_pool() {
+        let mut cfg = config();
+        let mut wide = cfg.pools[0].clone();
+        wide.name = "wide".into();
+        wide.labels.push("gpu".into());
+        cfg.pools.push(wide);
+        let mut memory = Memory::new(NOW);
+        memory.saw_queued(&cfg, NOW, &queued(&[70]));
+        let both = queued(&[70, 71]);
+        memory.saw_queued(&cfg, NOW + 30, &both);
+        assert_eq!(
+            memory.queue_wait(&cfg, "ci", &both, NOW + 30),
+            Some((2, 30))
+        );
+        assert_eq!(memory.queue_wait(&cfg, "wide", &both, NOW + 30), None);
+        memory.saw_queued(&cfg, NOW + 45, &queued(&[71]));
+        let back = queued(&[70]);
+        memory.saw_queued(&cfg, NOW + 60, &back);
+        assert_eq!(memory.queue_wait(&cfg, "ci", &back, NOW + 60), Some((1, 0)));
+    }
 
     /// The runner ran job 70 and went away between two ticks, and GitHub requeued the job.
     #[test]

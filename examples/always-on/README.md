@@ -112,7 +112,11 @@ service a copy with `LoadCredential`. It then enables a systemd service that run
 daemon as an unprivileged dynamic user with a read-only file system, no access to home
 directories, and no way to gain privileges. An enabled service starts again after the
 machine stops and resumes, and the daemon is safe to restart at any time.
-`journalctl -u sw-boat-runner` shows what it does.
+`journalctl -u sw-boat-runner` shows what it does. Each `register` line ends with the
+pool's queued jobs and how long the oldest has waited since the daemon first saw it, and
+an `online` line gives the seconds from a register to its runner coming online, so a
+long wait while every machine is busy reads as capacity and one beside an idle machine
+as the daemon's.
 
 Run the script over `boat ssh`, not `boat exec`: boat keeps every command sent through
 `exec` for 90 days. Do not pass the keys on the command line either, where they land in
