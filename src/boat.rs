@@ -185,10 +185,19 @@ fn fork_labels(
     labels
 }
 
+/// How much a `stray_report` line matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Severity {
+    /// Nothing to do.
+    Info,
+    /// Machines nothing deletes, or that two repositories' daemons may share.
+    Warn,
+}
+
 /// What a listing of every daemon machine on the account says about the policy for `repo`
 /// with `pools`: lines to print, none when all is well. Machines of a pool the policy no
 /// longer has are never listed by `run` again, so nothing deletes them.
-pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<String> {
+pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<(Severity, String)> {
     let repo = repo_label(repo);
     let live = all
         .iter()
@@ -196,6 +205,8 @@ pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<S
     let mut ours: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut legacy: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut adopted: BTreeMap<&str, usize> = BTreeMap::new();
+    // Pools of the policy that another repository's 0.3.0 daemon uses too.
+    let mut shared: BTreeSet<&str> = BTreeSet::new();
     for sb in live {
         let Some(pool) = sb.label(POOL_LABEL) else {
             continue;
@@ -203,6 +214,9 @@ pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<S
         let known = pools.contains(&pool);
         match (sb.label(REPO_LABEL), known) {
             (Some(r), false) if r == repo => ours.entry(pool).or_default().push(&sb.id),
+            (Some(r), true) if r != repo => {
+                shared.insert(pool);
+            }
             (None, false) => legacy.entry(pool).or_default().push(&sb.id),
             (None, true) => *adopted.entry(pool).or_default() += 1,
             _ => {}
@@ -216,33 +230,61 @@ pub(crate) fn stray_report(repo: &str, pools: &[&str], all: &[Sandbox]) -> Vec<S
     };
     let mut out = Vec::new();
     for (pool, ids) in &ours {
-        out.push(format!(
-            "pool {pool} is not in the policy but has {} machine(s) of {repo}: {}; nothing \
-             deletes them. Put the pool back and run `sw-boat-runner drain <policy.toml>`, \
-             or once their runners are done: {}",
-            ids.len(),
-            ids.join(", "),
-            delete(ids),
+        out.push((
+            Severity::Warn,
+            format!(
+                "pool {pool} is not in the policy but has {} machine(s) of {repo}: {}; \
+                 nothing deletes them. Put the pool back and run `sw-boat-runner drain \
+                 <policy.toml>`, or once their runners are done: {}",
+                ids.len(),
+                ids.join(", "),
+                delete(ids),
+            ),
         ));
     }
     for (pool, ids) in &legacy {
-        out.push(format!(
-            "pool {pool} is not in the policy and has {} machine(s) without a repo label \
-             (made before 0.3.0, so maybe another repository's): {}. If they are {repo}'s, \
-             put the pool back and run `sw-boat-runner drain <policy.toml>`, or once their \
-             runners are done: {}",
-            ids.len(),
-            ids.join(", "),
-            delete(ids),
+        out.push((
+            Severity::Warn,
+            format!(
+                "pool {pool} is not in the policy and has {} machine(s) without a repo label \
+                 (made before 0.3.0, so maybe another repository's): {}. If they are \
+                 {repo}'s, put the pool back and run `sw-boat-runner drain <policy.toml>`, \
+                 or once their runners are done: {}",
+                ids.len(),
+                ids.join(", "),
+                delete(ids),
+            ),
         ));
     }
+    // Machines without a repo label are a risk only when another repository may use the
+    // same pool name on this account.
+    let risk = !legacy.is_empty() || !shared.is_empty();
     for (pool, n) in &adopted {
-        out.push(format!(
-            "pool {pool}: {n} machine(s) have no repo label (made before 0.3.0) and are \
-             adopted as {repo}'s. If another repository's daemon has a pool {pool} on this \
-             boat account, it adopts them too: drain the pool once \
-             (`sw-boat-runner drain <policy.toml>`) so new machines carry the label"
-        ));
+        let line = if risk {
+            (
+                Severity::Warn,
+                format!(
+                    "pool {pool}: {n} machine(s) have no repo label (made before 0.3.0) and \
+                     are adopted as {repo}'s, and this boat account has machines of another \
+                     repository or pool that may share the name {pool}. A daemon older than \
+                     0.3.0 filters on the pool label only, so it takes every machine of pool \
+                     {pool}, labelled or not: upgrade every repository's daemon to 0.3.0, \
+                     then drain pool {pool} (`sw-boat-runner drain <policy.toml>`) so all its \
+                     machines carry the repo label"
+                ),
+            )
+        } else {
+            (
+                Severity::Info,
+                format!(
+                    "pool {pool}: {n} machine(s) from before 0.3.0 have no repo label and are \
+                     adopted as {repo}'s. That is harmless while only {repo} uses the pool \
+                     name {pool} on this boat account; draining the pool to relabel them is \
+                     optional"
+                ),
+            )
+        };
+        out.push(line);
     }
     out
 }
@@ -1128,6 +1170,52 @@ mod tests {
             json!({"sw-boat-runner":"ci","sw-boat-runner-repo":"octo/repo",
                    "sw-boat-runner-daemon":"h-1-9"})
         );
+    }
+
+    /// Pre-0.3.0 machines of a policy pool are only an info line, unless the account shows
+    /// that another repository may use the same pool name.
+    #[test]
+    fn adopted_machines_warn_only_when_another_repository_may_share_the_pool() {
+        let sb = |id: &str, pool: &str, repo: Option<&str>| {
+            let mut labels = BTreeMap::from([(POOL_LABEL.to_string(), pool.to_string())]);
+            if let Some(r) = repo {
+                labels.insert(REPO_LABEL.into(), r.into());
+            }
+            Sandbox {
+                id: id.into(),
+                state: "idle".into(),
+                labels,
+                holds_creator_logins: None,
+            }
+        };
+        let severities = |all: &[Sandbox]| {
+            stray_report("O/R", &["ci"], all)
+                .into_iter()
+                .map(|(s, _)| s)
+                .collect::<Vec<_>>()
+        };
+        let mine = [
+            sb("bx_22222222", "ci", None),
+            sb("bx_33333333", "ci", Some("o/r")),
+        ];
+        assert_eq!(severities(&mine), [Severity::Info]);
+        let line = &stray_report("o/r", &["ci"], &mine)[0].1;
+        assert!(
+            line.contains("harmless") && line.contains("optional"),
+            "{line}"
+        );
+
+        // Another repository's 0.3.0 daemon has a pool `ci` too.
+        let shared = [mine[0].clone(), sb("bx_44444444", "ci", Some("o/other"))];
+        assert_eq!(severities(&shared), [Severity::Warn]);
+        let line = &stray_report("o/r", &["ci"], &shared)[0].1;
+        assert!(line.contains("upgrade every repository's daemon"), "{line}");
+
+        // Unlabelled machines of a pool this policy does not have: maybe another
+        // repository's daemon, older than 0.3.0.
+        let unknown = [mine[0].clone(), sb("bx_55555555", "boat", None)];
+        assert_eq!(severities(&unknown), [Severity::Warn, Severity::Warn]);
+        assert!(severities(&[]).is_empty());
     }
 
     /// A machine another daemon forked after this one's first listing is reported once;

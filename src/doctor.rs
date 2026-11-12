@@ -453,7 +453,10 @@ fn stray_machines(r: &mut Report, cfg: &Config, boat: &boat::Client) {
     };
     let pools: Vec<&str> = cfg.pools.iter().map(|p| p.name.as_str()).collect();
     let report = boat::stray_report(&cfg.repo, &pools, &all);
-    if report.is_empty() {
+    if report
+        .iter()
+        .all(|(severity, _)| *severity == boat::Severity::Info)
+    {
         r.ok(
             "machines",
             format!(
@@ -462,8 +465,11 @@ fn stray_machines(r: &mut Report, cfg: &Config, boat: &boat::Client) {
             ),
         );
     }
-    for line in report {
-        r.warn("machines", line);
+    for (severity, line) in report {
+        match severity {
+            boat::Severity::Info => r.ok("machines", line),
+            boat::Severity::Warn => r.warn("machines", line),
+        }
     }
 }
 

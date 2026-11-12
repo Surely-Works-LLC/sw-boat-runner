@@ -115,32 +115,40 @@ pub fn run(
     let pools: Vec<&str> = cfg.pools.iter().map(|p| p.name.as_str()).collect();
     match tick_loop.boat.list_daemon_machines() {
         Ok(all) => {
-            for warning in boat::stray_report(&cfg.repo, &pools, &all) {
-                eprintln!("warning: {warning}");
+            for (severity, line) in boat::stray_report(&cfg.repo, &pools, &all) {
+                match severity {
+                    boat::Severity::Info => eprintln!("info: {line}"),
+                    boat::Severity::Warn => eprintln!("warning: {line}"),
+                }
             }
         }
         Err(e) => eprintln!("listing every pool's machines: {e}"),
     }
-    let period = Duration::from_secs(cfg.tick_s.max(1));
-    while !stop.load(Ordering::SeqCst) {
-        let started = Instant::now();
-        tick_loop.tick(unix_now(), &decide)?;
-        let step = Duration::from_millis(200);
-        while !stop.load(Ordering::SeqCst) && started.elapsed() < period {
-            std::thread::sleep(step.min(period.saturating_sub(started.elapsed())));
+    let stopped = || stop.load(Ordering::SeqCst);
+    // Sleeps until the next tick is due, or a signal.
+    let mut wait = |d: Duration| {
+        let end = Instant::now() + d;
+        while !stopped() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(200)));
         }
-    }
-    if !opts.drain_on_stop {
-        eprintln!("run: stopped by a signal");
-        return Ok(0);
-    }
-    eprintln!("run: stopped by a signal; draining");
-    tick_loop.drain_settled(DrainOpts::new(cfg), &mut unix_now, &mut std::thread::sleep)
+    };
+    tick_loop.serve(
+        &decide,
+        opts,
+        &stopped,
+        &mut unix_now,
+        &mut wait,
+        &mut std::thread::sleep,
+    )
 }
 
 /// A flag SIGINT and SIGTERM set. The shutdown hook goes first, so it sees the flag unset
 /// on the first signal and exits on the second.
-fn stop_on_signal() -> Arc<AtomicBool> {
+pub(crate) fn stop_on_signal() -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let _ = signal_hook::flag::register_conditional_shutdown(sig, 130, Arc::clone(&stop));
@@ -470,6 +478,38 @@ impl<'a> Loop<'a> {
         }
     }
 
+    /// Ticks every `tick_s` until `stop` says so, checked after each tick, so the tick in
+    /// progress always finishes. `wait` sleeps until the next tick is due and may return
+    /// early once `stop` is set. Then drains with `opts.drain_on_stop`, still knowing the
+    /// forks boat has not listed, pausing with `sleep`, which a set `stop` must not cut
+    /// short. Returns the machines that drain left, else 0.
+    fn serve(
+        &mut self,
+        decide: &dyn Fn(&Snapshot, &Pool) -> Vec<Action>,
+        opts: RunOpts,
+        stop: &dyn Fn() -> bool,
+        clock: &mut dyn FnMut() -> UnixSecs,
+        wait: &mut dyn FnMut(Duration),
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<usize, Error> {
+        let period = self.cfg.tick_s.max(1);
+        while !stop() {
+            let started = clock();
+            self.tick(started, decide)?;
+            if stop() {
+                break;
+            }
+            let spent = clock().saturating_sub(started);
+            wait(Duration::from_secs(period.saturating_sub(spent)));
+        }
+        if !opts.drain_on_stop {
+            eprintln!("run: stopped by a signal");
+            return Ok(0);
+        }
+        eprintln!("run: stopped by a signal; draining");
+        self.drain_settled(DrainOpts::new(self.cfg), clock, sleep)
+    }
+
     fn pool(&self, name: &str) -> Result<&'a Pool, Error> {
         self.cfg
             .pools
@@ -755,6 +795,73 @@ mod tests {
         let cfg = config();
         assert_eq!(DrainOpts::new(&cfg).settle_s, 105);
         assert_eq!(list_lag_s(&cfg), HTTP_TIMEOUT.as_secs() + cfg.tick_s);
+    }
+
+    /// `serve` on a clock that only its waits and sleeps move, from `NOW`. `decide` forks
+    /// job 70 on the first tick and then the stop flag is set, as by a signal during that
+    /// tick. Returns the result, the ticks run and the time it returned.
+    fn serve_at(fake: &Fake, opts: RunOpts, stop_after: usize) -> (usize, usize, UnixSecs) {
+        let cfg = config();
+        let t = std::cell::Cell::new(NOW);
+        let ticks = std::cell::Cell::new(0);
+        let stop = AtomicBool::new(false);
+        let decide = |s: &Snapshot, _: &Pool| {
+            ticks.set(ticks.get() + 1);
+            if ticks.get() == stop_after {
+                stop.store(true, Ordering::SeqCst);
+            }
+            if s.machines.is_empty() && ticks.get() == 1 {
+                vec![fork(Some(70))]
+            } else {
+                Vec::new()
+            }
+        };
+        let advance = |d: Duration| t.set(t.get() + d.as_secs());
+        let left = started(&cfg, fake)
+            .serve(
+                &decide,
+                opts,
+                &|| stop.load(Ordering::SeqCst),
+                &mut || t.get(),
+                &mut |d| advance(d),
+                &mut |d| advance(d),
+            )
+            .unwrap();
+        (left, ticks.get(), t.get())
+    }
+
+    /// A signal during the third tick: that tick finishes, no fourth starts, and nothing
+    /// is deleted without `--drain-on-stop`.
+    #[test]
+    fn a_signal_ends_the_loop_after_the_current_tick() {
+        let fake = lagging(|_| "", |_| JOB_70);
+        assert_eq!(serve_at(&fake, RunOpts::default(), 3), (0, 3, NOW + 30));
+        assert_eq!(forks(&fake).len(), 1);
+        assert!(!requests(&fake).iter().any(|r| r.starts_with("DELETE")));
+    }
+
+    /// The daemon forks for job 70 and is stopped; boat never lists the fork while the
+    /// daemon runs. `--drain-on-stop` still deletes it, because this process remembers the
+    /// fork, and then waits out the listing lag with nothing listed.
+    #[test]
+    fn drain_on_stop_deletes_a_fork_boat_has_not_listed() {
+        let fake = lagging(|_| "", |_| JOB_70);
+        let opts = RunOpts {
+            drain_on_stop: true,
+        };
+        let (left, ticks, _) = serve_at(&fake, opts, 1);
+        assert_eq!((left, ticks), (0, 1));
+        let delete = format!("DELETE {BOAT}/sandboxes/bx_55555555");
+        assert!(requests(&fake).contains(&delete), "{:?}", requests(&fake));
+    }
+
+    /// The handlers set the flag on the first signal and leave the process running.
+    #[test]
+    fn a_signal_sets_the_stop_flag() {
+        let stop = stop_on_signal();
+        assert!(!stop.load(Ordering::SeqCst));
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        assert!(stop.load(Ordering::SeqCst));
     }
 
     fn job(id: u64, labels: &[&str]) -> QueuedJob {

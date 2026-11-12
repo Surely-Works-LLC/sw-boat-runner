@@ -26,10 +26,15 @@ All notable changes to this project are documented here. The format follows
 - Daemons of two repositories with the same pool name on one boat account no longer stop,
   delete and register runners on each other's machines. Forks now carry
   `sw-boat-runner-repo=<owner>/<name>` next to `sw-boat-runner=<pool>`, and a daemon keeps
-  only its repository's machines. Machines made before 0.3.0 have no repo label and are
-  adopted, so an upgrade orphans none; boat cannot relabel a machine, so a pool two
-  repositories already shared stays shared until those machines are drained. `run` and
-  `doctor` warn about them.
+  only its repository's machines. This holds once every daemon on the boat account runs
+  0.3.0: an older daemon filters on the pool label alone and still takes every machine
+  with its pool name, so where two repositories share a pool name, upgrade both. Machines
+  made before 0.3.0 have no repo label and are adopted, so an upgrade orphans none. boat
+  cannot relabel a machine, and a resumed kept machine is never forked again, so they may
+  stay; `run` and `doctor` note them in one info line, harmless while one repository uses
+  the pool name. They warn, and suggest draining after the upgrade, only when the account
+  shows another repository's machines with that pool name or unlabelled machines in a
+  pool the policy does not have.
 - A pool removed from or renamed in the policy no longer leaks its machines silently:
   `doctor` lists this repository's machines in pools the policy does not have and prints
   the `drain` or `boat delete` command, and `run` warns about them once at start.
@@ -38,7 +43,8 @@ All notable changes to this project are documented here. The format follows
   for the request timeout plus a tick (`--settle-s` to change), and fails with machines left
   after `--timeout-s` (default 900).
 - `run` handles SIGINT and SIGTERM: it finishes the current tick and exits 0; a second
-  signal exits at once. `run --drain-on-stop` drains the pools in the same process first.
+  signal exits at once. A tick that outlasts the supervisor's stop timeout is still
+  killed. `run --drain-on-stop` drains the pools in the same process first.
   The `runners` workflow uses it and waits for the daemon, and runs `drain` only when the
   daemon did not finish.
 

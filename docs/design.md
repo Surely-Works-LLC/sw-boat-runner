@@ -163,11 +163,21 @@ Pool names come from labels, so two repositories on one boat account can both ha
 `boat`. The repo label keeps their daemons apart. boat filters on one label and cannot
 change a machine's labels, so the daemon filters on the repo label itself, and a machine
 made before 0.3.0, which has only the pool label, is adopted by every daemon with that
-pool name. An upgrade orphans nothing; a pool that two repositories shared before 0.3.0
-stays shared until those machines are gone, and `run` and `doctor` warn about them. Once at
-start, `run` lists every `sw-boat-runner` machine on the account (boat has no filter on a
-label's key alone), and both commands warn about this repository's machines in a pool
-the policy no longer has, which no tick lists or deletes.
+pool name, so an upgrade orphans nothing. A warm or pool machine that is resumed is never
+forked again, so adopted machines can stay for good. That is harmless while one
+repository uses the pool name, and `run` and `doctor` say so in an info line; draining to
+relabel them is optional.
+
+The separation holds only once every daemon on the account runs 0.3.0. A daemon older
+than 0.3.0 filters on the pool label alone, so it takes as its own every machine with
+its pool name, including another repository's labelled forks. Where two repositories
+share a pool name, upgrade both daemons first; draining the pool then leaves only
+labelled machines. `run` and `doctor` warn about adopted machines when the account
+shows that risk: another repository's machines with one of the policy's pool names, or
+unlabelled machines in a pool the policy does not have. Once at start, `run` lists every
+`sw-boat-runner` machine on the account (boat has no filter on a label's key alone), and
+both commands warn about this repository's machines in a pool the policy no longer has,
+which no tick lists or deletes.
 
 Each fork also carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A machine that
 first shows up after the daemon's first listing of its pool, labelled by another daemon,
@@ -260,7 +270,10 @@ token bucket in `src/github.rs`:
   list for the request timeout plus a tick (`FixListLag`), so it repeats every tick until
   boat has listed none for that long (`--settle-s`). SIGINT and SIGTERM let `run` finish
   its tick and exit; with `--drain-on-stop` it drains first, with its in-flight forks
-  still in memory.
+  still in memory. A tick can take longer than a supervisor's stop timeout (systemd's
+  default `TimeoutStopSec` is 90 s, the same as one request's timeout), and a SIGKILL
+  then cuts it short as before: a fork it sent may be listed only after the next start,
+  which the restart wait (`FixKeptInflight`) covers.
 
 The runner list and the queued runs' jobs rarely change, so most of those reads are 304s.
 An in-progress run's jobs change with every step, and such a run can still queue a later
