@@ -49,6 +49,9 @@ pub(super) struct Memory {
     queued_seen: HashMap<JobKey, UnixSecs>,
     /// When a job each pool serves first was last seen queued, by pool.
     pool_queued: std::collections::BTreeMap<String, UnixSecs>,
+    /// When this process started. A job it never saw queued counts as queued then, for
+    /// `orphaned`: one may have been queued just before a restart.
+    started: UnixSecs,
 }
 
 struct Seen {
@@ -78,6 +81,19 @@ enum Kind {
 }
 
 impl Memory {
+    /// The memory of a process that started at `now`.
+    pub(super) fn new(now: UnixSecs) -> Self {
+        Memory {
+            started: now,
+            ..Memory::default()
+        }
+    }
+
+    /// When `job` was last seen queued, or this process's start if it never was.
+    fn queued_at(&self, job: JobKey) -> UnixSecs {
+        self.queued_seen.get(&job).copied().unwrap_or(self.started)
+    }
+
     pub(super) fn forked(&mut self, id: String, pool: &str, job: Option<JobKey>, now: UnixSecs) {
         let kind = Kind::Fork {
             pool: pool.to_string(),
@@ -273,7 +289,7 @@ impl Memory {
                     pool,
                     state,
                     job,
-                    job_queued_at: job.and_then(|j| self.queued_seen.get(&j).copied()),
+                    job_queued_at: job.map(|j| self.queued_at(j)),
                 }
             })
             .collect();
@@ -319,7 +335,7 @@ impl Memory {
                     since: s.sent,
                     last_busy: s.sent.saturating_sub(1),
                     job: *job,
-                    job_queued_at: job.and_then(|j| self.queued_seen.get(&j).copied()),
+                    job_queued_at: job.map(|j| self.queued_at(j)),
                 }),
             }
         }
@@ -385,7 +401,15 @@ impl Loop<'_> {
             runners,
             queued,
             limits,
-            queued_at: self.memory.pool_queued.clone(),
+            queued_at: self
+                .cfg
+                .pools
+                .iter()
+                .map(|p| {
+                    let at = self.memory.pool_queued.get(&p.name).copied();
+                    (p.name.clone(), at.unwrap_or(self.memory.started))
+                })
+                .collect(),
         };
         self.memory.warn_near_ttl(self.cfg, now, &snapshot);
         self.last_observe = Some(super::LastObserve {
@@ -587,6 +611,35 @@ mod tests {
         assert!(!warned(&tick_loop));
         observed(&mut tick_loop, NOW + 3_000);
         assert!(warned(&tick_loop));
+    }
+
+    /// After a restart nothing is known of when the jobs were last queued. An up fork
+    /// whose job is not queued, with an Idle runner that may have just taken it, is kept
+    /// for `ORPHAN_GRACE_S` from the process's start, not deleted at once.
+    #[test]
+    fn after_a_restart_an_idle_fork_waits_the_grace_from_the_start() {
+        let cfg = config();
+        let fake = crate::transport::fake::Fake::new(|s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                let body = r#"{"total_count":1,"runners":[
+                    {"id":15,"name":"sbr-ci-bx_66666666-0-900","status":"online","busy":false}]}"#;
+                return crate::transport::fake::respond(200, &[], body);
+            }
+            let fork = r#"{"id":"bx_66666666","state":"running",
+                "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}"#;
+            lagging_reply(s, fork, "")
+        });
+        let mut tick_loop = Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), NOW);
+        let delete = format!("DELETE {BOAT}/sandboxes/bx_66666666");
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop
+            .tick(NOW + crate::decide::ORPHAN_GRACE_S - 1, decide)
+            .unwrap();
+        assert!(!requests(&fake).contains(&delete), "{:?}", requests(&fake));
+        tick_loop
+            .tick(NOW + crate::decide::ORPHAN_GRACE_S, decide)
+            .unwrap();
+        assert!(requests(&fake).contains(&delete), "{:?}", requests(&fake));
     }
 
     #[test]

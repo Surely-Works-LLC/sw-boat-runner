@@ -273,9 +273,22 @@ impl<'a> View<'a> {
                 && quiet(m.job_queued_at.unwrap_or(m.since))
                 && (!online || pool_quiet(m))
         });
+        // A fork that can still take a job: starting, or up and neither finished nor past
+        // its TTL, with no runner or only `Registered` and `Idle` ones.
         let free = self
             .ephemeral()
-            .filter(|m| matches!(m.state, Up | Starting) && !holds(self.on(m), &[Busy]))
+            .filter(|m| match m.state {
+                Starting => true,
+                Up => {
+                    !self.finished(m)
+                        && self.age(m) <= self.pool.fork_ttl_s
+                        && self
+                            .on(m)
+                            .iter()
+                            .all(|r| matches!(r.state, Registered | Idle))
+                }
+                Stopping | Stopped | Gone => false,
+            })
             .count();
         let spare = free.saturating_sub(self.jobs.len());
         candidates.map(|m| m.id.as_str()).take(spare).collect()
@@ -720,6 +733,30 @@ mod tests {
         let mut s = snap(vec![gone(long_ago)], vec![], &[2]);
         s.limits.can_start = false;
         assert_eq!(decide(&s, &p), [register("m1", 0)]);
+    }
+
+    /// m2, forked for job 2, runs job 1; m1, forked for job 1, is up with no runner yet
+    /// and is job 2's only hope; m3's runner went offline after its job. m3 cannot run
+    /// job 2, so it does not count as cover: m1 stays and takes job 2.
+    #[test]
+    fn a_finished_fork_does_not_cover_a_queued_job() {
+        let p = pool("fork", "");
+        let m1 = Machine {
+            job_queued_at: Some(NOW - 600),
+            ..forked("m1", 1, Ms::Up)
+        };
+        let m3 = Machine {
+            job_queued_at: Some(NOW - 600),
+            ..forked("m3", 3, Ms::Up)
+        };
+        let s = snap(
+            vec![m1, forked("m2", 2, Ms::Up), m3],
+            vec![runner("m2", 0, Rs::Busy), runner("m3", 0, Rs::Offline)],
+            &[2],
+        );
+        let actions = decide(&s, &p);
+        assert!(!actions.contains(&delete("m1")), "{actions:?}");
+        assert!(actions.contains(&register("m1", 0)), "{actions:?}");
     }
 
     /// The reviewer's swap: m2, forked for job 2, came up first and its runner took job 1.
