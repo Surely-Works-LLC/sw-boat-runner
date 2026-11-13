@@ -30,10 +30,14 @@ const KEY: &str = "/etc/sw-boat-runner/github-app.pem";
 const BIN: &str = "/usr/local/bin/sw-boat-runner";
 const UNIT: &str = "/etc/systemd/system/sw-boat-runner.service";
 const SERVICE: &str = "sw-boat-runner";
-const HOMEPAGE: &str = "https://github.com/Surely-Works-LLC/sw-boat-runner";
-/// docs/new-app.html on GitHub Pages: it posts the manifest to GitHub, and GitHub sends
-/// the browser back to it with the code to paste into setup.
-const NEW_APP_PAGE: &str = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
+/// The repository sw-boat-runner comes from, unless `SBR_UPSTREAM` names a fork.
+const UPSTREAM: &str = "Surely-Works-LLC/sw-boat-runner";
+/// docs/new-app.html on the upstream's GitHub Pages: it posts the manifest to GitHub, and
+/// GitHub sends the browser back to it with the code to paste into setup. A fork's page
+/// is derived from `SBR_UPSTREAM`, or set with `SBR_NEW_APP_PAGE`.
+const DEFAULT_NEW_APP_PAGE: &str = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
+/// Where `setup` finds systemd; without it there is nothing to install the service into.
+const SYSTEMD_DIR: &str = "/run/systemd/system";
 const DEFAULT_LABELS: &str = "self-hosted, boat";
 /// The name offered for a snapshot setup builds when the account has none.
 const DEFAULT_SNAPSHOT: &str = "sbr-runner";
@@ -90,7 +94,102 @@ unconfigured, and is checked and saved as `sw-boat-runner snapshot` does.
 Secrets come from the environment or a prompt without echo, never from arguments:
 BOAT_API_KEY, GITHUB_TOKEN (with --pat), SBR_APP_CODE (the code GitHub returns after the
 App is created). An existing App: set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE and,
-optionally, GITHUB_APP_INSTALLATION_ID.";
+optionally, GITHUB_APP_INSTALLATION_ID.
+
+Without --remote, setup needs systemd (/run/systemd/system) and stops before any prompt
+when it is missing. A fork installs from itself with SBR_UPSTREAM=owner/name; its App
+page is then https://<owner>.github.io/<name>/new-app.html, or SBR_NEW_APP_PAGE.";
+
+/// Where sw-boat-runner comes from: the upstream repository, or a fork named by
+/// `SBR_UPSTREAM`. A fork's App page is its own GitHub Pages copy of docs/new-app.html,
+/// unless `SBR_NEW_APP_PAGE` names another address.
+#[derive(Debug, PartialEq, Eq)]
+struct Source {
+    repo: String,
+    new_app_page: String,
+}
+
+impl Source {
+    fn new(repo: Option<String>, page: Option<String>) -> Result<Source, String> {
+        let repo = repo.unwrap_or_else(|| UPSTREAM.to_string());
+        // It goes into URLs and a shell command on a remote machine.
+        let part_ok = |p: &str| {
+            !p.is_empty()
+                && !p.starts_with(['.', '-'])
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        };
+        match repo.split_once('/') {
+            Some((owner, name)) if part_ok(owner) && part_ok(name) => {}
+            _ => return Err(format!("SBR_UPSTREAM {repo:?} is not owner/name")),
+        }
+        let new_app_page = match page {
+            Some(page) => {
+                let ok = page.strip_prefix("https://").is_some_and(|rest| {
+                    !rest.is_empty()
+                        && rest.bytes().all(|b| {
+                            b.is_ascii_alphanumeric()
+                                || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'~' | b'%')
+                        })
+                });
+                if !ok {
+                    return Err(format!(
+                        "SBR_NEW_APP_PAGE {page:?} is not an https:// address without a query"
+                    ));
+                }
+                page
+            }
+            None if repo == UPSTREAM => DEFAULT_NEW_APP_PAGE.to_string(),
+            None => {
+                let (owner, name) = repo.split_once('/').expect("checked above");
+                format!(
+                    "https://{}.github.io/{name}/new-app.html",
+                    owner.to_lowercase()
+                )
+            }
+        };
+        Ok(Source { repo, new_app_page })
+    }
+
+    /// `SBR_UPSTREAM` and `SBR_NEW_APP_PAGE`, checked.
+    fn from_env() -> Result<Source, String> {
+        Source::new(
+            given(&None, "SBR_UPSTREAM"),
+            given(&None, "SBR_NEW_APP_PAGE"),
+        )
+    }
+
+    /// The project's page on GitHub, the App's homepage.
+    fn homepage(&self) -> String {
+        format!("https://github.com/{}", self.repo)
+    }
+}
+
+/// The source `setup` checked first thing; the upstream if the environment is wrong,
+/// which `setup` has already refused.
+fn source() -> Source {
+    Source::from_env()
+        .unwrap_or_else(|_| Source::new(None, None).expect("the upstream is a valid source"))
+}
+
+/// Local `setup` installs a systemd service: without systemd here it stops before any
+/// prompt, so no App is created for a machine that cannot run the daemon. A dry run
+/// still prints the plan, with a warning.
+fn systemd_preflight(has_systemd: bool, dry_run: bool) -> Result<(), String> {
+    if has_systemd {
+        return Ok(());
+    }
+    let why = format!(
+        "this machine has no systemd ({SYSTEMD_DIR} is missing), so setup cannot install \
+         the service here; run `sw-boat-runner setup --remote` from here to install on a \
+         boat machine, or see \"Any other host\" in examples/always-on/README.md"
+    );
+    if dry_run {
+        eprintln!("warning: {why}\n");
+        return Ok(());
+    }
+    Err(why)
+}
 
 /// A credential. It has no `Debug` or `Display`, so it cannot be printed by accident.
 pub struct Secret(String);
@@ -188,9 +287,18 @@ pub fn cli(args: &[&str]) -> ExitCode {
 
 /// The policy: the file `--policy` names, or one from the three prompts. The snapshot
 /// prompt may build a snapshot, and leaves the boat key it asked for in `boat_key`.
-fn choose_policy(opts: &Options, boat_key: &mut Option<Secret>) -> Result<String, String> {
+/// `after_repo` runs as soon as the repository is known, before any other prompt; it may
+/// stop setup, or set `boat_key` itself.
+fn choose_policy(
+    opts: &Options,
+    boat_key: &mut Option<Secret>,
+    after_repo: impl FnOnce(&str, &mut Option<Secret>) -> Result<(), String>,
+) -> Result<String, String> {
     if let Some(path) = &opts.policy {
-        return std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let cfg = policy::parse(&text).map_err(|e| format!("policy: {e}"))?;
+        after_repo(&cfg.repo, boat_key)?;
+        return Ok(text);
     }
     let repo = value(
         &opts.repo,
@@ -198,6 +306,13 @@ fn choose_policy(opts: &Options, boat_key: &mut Option<Secret>) -> Result<String
         "Repository (owner/name)",
         default_repo,
     )?;
+    // Before the hook, which may ask for the boat key, and before a snapshot build.
+    if !repo_ok(&repo) {
+        return Err(format!(
+            "repository {repo:?} is not owner/name in GitHub's characters"
+        ));
+    }
+    after_repo(&repo, boat_key)?;
     let labels = value(
         &opts.labels,
         "SBR_LABELS",
@@ -299,11 +414,19 @@ fn list_saved(key: &str) -> Option<Vec<crate::boat::SavedSnapshot>> {
 }
 
 fn setup(opts: &Options) -> Result<(), String> {
+    setup_with(opts, Path::new(SYSTEMD_DIR).is_dir())
+}
+
+/// `setup`, with whether this machine has systemd given, so a test can check that the
+/// preflight comes before the first prompt.
+fn setup_with(opts: &Options, has_systemd: bool) -> Result<(), String> {
+    Source::from_env()?;
     if opts.remote {
         return remote::run(opts);
     }
+    systemd_preflight(has_systemd, opts.dry_run)?;
     let mut boat_key = None;
-    let policy_text = choose_policy(opts, &mut boat_key)?;
+    let policy_text = choose_policy(opts, &mut boat_key, |_, _| Ok(()))?;
     let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
     let bin = match &opts.bin {
         Some(b) => b.clone(),
@@ -1006,8 +1129,9 @@ fn create_app(
         "Create the GitHub App: open this link in your browser, check what the page lists \
          and press its button.\nGitHub then asks you to confirm the app.\n\n\
          {link}\n\n\
-         GitHub then opens {NEW_APP_PAGE}?code=...; copy the whole address it shows\n\
-         (if that page does not load, copy the address from the address bar).\n"
+         GitHub then opens {}?code=...; copy the whole address it shows\n\
+         (if that page does not load, copy the address from the address bar).\n",
+        source().new_app_page
     );
     let pasted = secret("SBR_APP_CODE", "Paste the address (or just the code)")?;
     let code = parse_code(pasted.expose(), &state)?;
@@ -1075,7 +1199,8 @@ fn pages_link(
         OwnerKind::Organization => "org",
     };
     let mut link = format!(
-        "{NEW_APP_PAGE}#owner={owner}&kind={kind}&repo={repo_name}&state={state}&name={app}"
+        "{}#owner={owner}&kind={kind}&repo={repo_name}&state={state}&name={app}",
+        source().new_app_page
     );
     if let Some(r) = redirect {
         link.push_str("&redirect=");
@@ -1165,12 +1290,14 @@ fn app_name(repo_name: &str, random: &str) -> String {
 /// A private App with no webhook and only the permissions the daemon uses:
 /// Administration write to register runners, Actions read to see queued jobs.
 fn manifest(repo: &str, name: &str) -> Value {
+    let source = source();
+    let homepage = source.homepage();
     json!({
         "name": name,
-        "url": HOMEPAGE,
+        "url": homepage,
         "description": format!("sw-boat-runner for {repo}"),
-        "hook_attributes": { "url": HOMEPAGE, "active": false },
-        "redirect_url": NEW_APP_PAGE,
+        "hook_attributes": { "url": homepage, "active": false },
+        "redirect_url": source.new_app_page,
         "public": false,
         "default_permissions": { "administration": "write", "actions": "read" },
         "default_events": [],
@@ -1689,7 +1816,7 @@ mod tests {
             json!({"administration": "write", "actions": "read"})
         );
         assert_eq!(m["default_events"], json!([]));
-        assert_eq!(m["redirect_url"], NEW_APP_PAGE);
+        assert_eq!(m["redirect_url"], DEFAULT_NEW_APP_PAGE);
         let name = app_name(&"n".repeat(40), "0123abcdef");
         assert!(name.len() <= 34 && name.ends_with("-0123abcd"), "{name}");
         assert_eq!(app_name("sbr-e2e", "0123abcdef"), "sbr-e2e-0123abcd");
@@ -1742,24 +1869,24 @@ mod tests {
         let code = |s: &str| parse_code(s, "st").map(|c| c.expose().to_string());
         assert_eq!(code("abc123").unwrap(), "abc123");
         assert_eq!(
-            code(&format!("{NEW_APP_PAGE}?code=abc123&state=st")).unwrap(),
+            code(&format!("{DEFAULT_NEW_APP_PAGE}?code=abc123&state=st")).unwrap(),
             "abc123"
         );
         assert_eq!(
-            code(&format!(" {NEW_APP_PAGE}?state=st&code=a_1#x ")).unwrap(),
+            code(&format!(" {DEFAULT_NEW_APP_PAGE}?state=st&code=a_1#x ")).unwrap(),
             "a_1"
         );
         assert!(
-            code(&format!("{NEW_APP_PAGE}?code=abc"))
+            code(&format!("{DEFAULT_NEW_APP_PAGE}?code=abc"))
                 .unwrap_err()
                 .contains("no state")
         );
         assert!(
-            code(&format!("{NEW_APP_PAGE}?code=abc&state=other"))
+            code(&format!("{DEFAULT_NEW_APP_PAGE}?code=abc&state=other"))
                 .unwrap_err()
                 .contains("state")
         );
-        assert!(code(&format!("{NEW_APP_PAGE}?state=st")).is_err());
+        assert!(code(&format!("{DEFAULT_NEW_APP_PAGE}?state=st")).is_err());
         assert!(code("../x").is_err());
         assert!(code("").is_err());
     }
@@ -2188,8 +2315,9 @@ mod tests {
     #[test]
     fn the_pages_manifest_matches_setups() {
         let page = include_str!("../../docs/new-app.html");
-        assert!(page.contains(&format!("const PAGE_URL = \"{NEW_APP_PAGE}\";")));
-        assert!(page.contains(&format!("const HOMEPAGE = \"{HOMEPAGE}\";")));
+        assert!(page.contains(&format!("const PAGE_URL = \"{DEFAULT_NEW_APP_PAGE}\";")));
+        let homepage = Source::new(None, None).unwrap().homepage();
+        assert!(page.contains(&format!("const HOMEPAGE = \"{homepage}\";")));
         let m = manifest("acme/app", "n");
         let perms: Vec<String> = m["default_permissions"]
             .as_object()
@@ -2297,5 +2425,125 @@ mod tests {
         assert_eq!(pick("7").unwrap(), "7");
         assert!(pick("9").unwrap_err().contains("1 to 3"));
         assert!(pick_snapshot("", &names, None).is_err());
+    }
+
+    #[test]
+    fn without_systemd_setup_stops_before_anything_else() {
+        assert!(systemd_preflight(true, false).is_ok());
+        let err = systemd_preflight(false, false).unwrap_err();
+        assert!(
+            err.starts_with("this machine has no systemd")
+                && err.contains("`sw-boat-runner setup --remote`")
+                && err.contains("Any other host")
+                && err.contains("examples/always-on/README.md"),
+            "{err}"
+        );
+        // A dry run warns and goes on to print the plan.
+        assert!(systemd_preflight(false, true).is_ok());
+
+        // setup checks before choose_policy: a bad repository would fail there first.
+        let opts = Options {
+            repo: Some("not a repo".into()),
+            ..Options::default()
+        };
+        let err = setup_with(&opts, false).unwrap_err();
+        assert!(err.starts_with("this machine has no systemd"), "{err}");
+        let err = setup_with(&opts, true).unwrap_err();
+        assert!(err.contains("\"not a repo\" is not owner/name"), "{err}");
+    }
+
+    #[test]
+    fn choose_policy_runs_after_repo_before_any_other_prompt() {
+        // Labels and snapshot are left to their prompts: a hook that stops setup means
+        // neither is asked (they would read stdin and fail with another error).
+        let opts = Options {
+            repo: Some("acme/app".into()),
+            ..Options::default()
+        };
+        let mut key = None;
+        let mut seen = None;
+        let err = choose_policy(&opts, &mut key, |repo, k| {
+            seen = Some(repo.to_string());
+            *k = Some(Secret("k".into()));
+            Err("stop".into())
+        })
+        .unwrap_err();
+        assert_eq!(err, "stop");
+        assert_eq!(seen.as_deref(), Some("acme/app"));
+        assert_eq!(key.unwrap().expose(), "k");
+
+        // A bad repository stops before the hook.
+        let bad = Options {
+            repo: Some("acme/app/x".into()),
+            ..Options::default()
+        };
+        let err = choose_policy(&bad, &mut None, |_, _| panic!("the hook ran")).unwrap_err();
+        assert!(err.contains("is not owner/name"), "{err}");
+
+        // With --policy, the hook gets the file's repository.
+        let dir = std::env::temp_dir().join(format!("sbr-choose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        let text = policy_text("acme/from-file", &["self-hosted".into()], "s");
+        std::fs::write(&path, &text).unwrap();
+        let opts = Options {
+            policy: Some(path.clone()),
+            ..Options::default()
+        };
+        let mut seen = None;
+        let got = choose_policy(&opts, &mut None, |repo, _| {
+            seen = Some(repo.to_string());
+            Ok(())
+        });
+        assert_eq!(got.unwrap(), text);
+        assert_eq!(seen.as_deref(), Some("acme/from-file"));
+        let err = choose_policy(&opts, &mut None, |_, _| Err("stop".into())).unwrap_err();
+        assert_eq!(err, "stop");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fork_installs_from_itself() {
+        let upstream = Source::new(None, None).unwrap();
+        assert_eq!(upstream.repo, UPSTREAM);
+        assert_eq!(upstream.new_app_page, DEFAULT_NEW_APP_PAGE);
+        assert_eq!(
+            upstream.homepage(),
+            "https://github.com/Surely-Works-LLC/sw-boat-runner"
+        );
+        // The upstream's page is the one its own rule derives.
+        let derived = Source::new(Some("Surely-Works-LLC/sw-boat".into()), None).unwrap();
+        assert_eq!(
+            derived.new_app_page,
+            "https://surely-works-llc.github.io/sw-boat/new-app.html"
+        );
+        let fork = Source::new(Some("Acme/sbr".into()), None).unwrap();
+        assert_eq!(fork.new_app_page, "https://acme.github.io/sbr/new-app.html");
+        assert_eq!(fork.homepage(), "https://github.com/Acme/sbr");
+        let page = "https://pages.example.com/sbr/new-app.html";
+        let own = Source::new(Some("acme/sbr".into()), Some(page.into())).unwrap();
+        assert_eq!(own.new_app_page, page);
+        for bad in [
+            "acme",
+            "acme/",
+            "/sbr",
+            "acme/sbr/x",
+            "a b/c",
+            "acme/$(id)",
+            "../x",
+            "-acme/sbr",
+            "acme/-sbr",
+        ] {
+            assert!(Source::new(Some(bad.into()), None).is_err(), "{bad}");
+        }
+        for bad in [
+            "http://acme.github.io/x",
+            "https://",
+            "https://a/x?y=1",
+            "https://a/x#y",
+            "https://a/\"x",
+        ] {
+            assert!(Source::new(None, Some(bad.into())).is_err(), "{bad}");
+        }
     }
 }

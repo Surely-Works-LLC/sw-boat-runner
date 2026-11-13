@@ -20,6 +20,8 @@ const FAKE_BIN: &str = r#"#!/bin/sh
     echo "args: $*"
     echo "GITHUB_TOKEN=${GITHUB_TOKEN-unset} GH_TOKEN=${GH_TOKEN-unset}"
     echo "from: $FROM"
+    echo "source: ${SBR_UPSTREAM-unset}"
+    echo "attest: ${SBR_ATTEST_TOKEN-unset}"
 } >> "$FAKE_LOG"
 "#;
 
@@ -66,15 +68,30 @@ const FAKE_GETCONF: &str = r#"#!/bin/sh
 [ "$1" = GNU_LIBC_VERSION ] && echo "glibc ${FAKE_GLIBC:-2.39}"
 "#;
 
-/// `$FAKE_GH`: `ok`, `old` (no `gh attestation`), `bad` (the attestation fails) or
-/// `out` (not logged in).
+/// `$FAKE_GH`: `ok`, `old` (no `gh attestation`), `bad` (the attestation fails), `out`
+/// (not logged in) or `token` (signed in only by GH_TOKEN or GITHUB_TOKEN, as on a boat
+/// machine).
 const FAKE_GH: &str = r#"#!/bin/sh
-echo "gh $*" >> "$FAKE_LOG"
+echo "gh $* GH_TOKEN=${GH_TOKEN-unset}" >> "$FAKE_LOG"
 case "$1 $2" in
-    "auth status") [ "$FAKE_GH" != out ] ;;
+    "auth status")
+        case $FAKE_GH in
+            out) exit 1 ;;
+            token) [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] ;;
+            *) exit 0 ;;
+        esac ;;
     "--version "*) echo "gh version 2.20.0 (2022-11-01)" ;;
     "attestation --help") [ "$FAKE_GH" != old ] ;;
-    "attestation verify") [ "$FAKE_GH" = ok ] ;;
+    "attestation verify")
+        case $FAKE_GH in
+            ok | token) exit 0 ;;
+            flaky)
+                # Fails the first time only, as a network error would.
+                [ -f "$FAKE_LOG.flaky" ] && exit 0
+                : > "$FAKE_LOG.flaky"
+                exit 1 ;;
+            *) exit 1 ;;
+        esac ;;
     *) exit 1 ;;
 esac
 "#;
@@ -82,6 +99,7 @@ esac
 /// Installs the fake binary under `--root`.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 echo "cargo $*" >> "$FAKE_LOG"
+echo "cargo env: GITHUB_TOKEN=${GITHUB_TOKEN-unset} GH_TOKEN=${GH_TOKEN-unset} attest=${SBR_ATTEST_TOKEN-unset}" >> "$FAKE_LOG"
 root=''
 while [ $# -gt 0 ]; do
     [ "$1" = --root ] && root=$2
@@ -267,8 +285,8 @@ fn the_latest_release_is_downloaded_and_checked() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&format!(
-            "sw-boat-runner {TAG} for x86_64-unknown-linux-gnu, SHA-256 and build provenance \
-             attestation checked"
+            "sw-boat-runner {TAG} for x86_64-unknown-linux-gnu, SHA-256 checked and \
+             attestation verified"
         )),
         "{stdout}"
     );
@@ -355,16 +373,42 @@ fn an_old_gh_warns_and_a_failed_attestation_stops() {
     );
     assert!(setup_args(&log).is_some(), "{log}");
 
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("SHA-256 only: gh too old"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
     let (out, log) = r.run(&[], &[("SBR_REF", TAG), ("FAKE_GH", "out")]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("attestation not checked"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("SHA-256 only: gh not signed in"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(!log.contains("gh attestation"), "{log}");
 
     let r = Run::new("gh-bad");
     let (out, log) = r.run(&[], &[("SBR_REF", TAG), ("FAKE_GH", "bad")]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("failed its attestation check"));
+    let err = stderr(&out);
+    assert!(
+        err.contains("failed its attestation check twice")
+            && err.contains("-R Surely-Works-LLC/sw-boat-runner")
+            && err.contains("run the install again"),
+        "{err}"
+    );
+    assert_eq!(log.matches("gh attestation verify").count(), 2, "{log}");
     assert_eq!(setup_args(&log), None, "{log}");
+
+    // One failure, then a pass: installed.
+    let r = Run::new("gh-flaky");
+    let (out, log) = r.run(&[], &[("SBR_REF", TAG), ("FAKE_GH", "flaky")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("trying once more"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("attestation verified"));
+    assert_eq!(log.matches("gh attestation verify").count(), 2, "{log}");
+    assert!(setup_args(&log).is_some(), "{log}");
 }
 
 #[test]
@@ -378,4 +422,128 @@ fn another_platform_stops_with_a_hint() {
         stderr(&out)
     );
     assert!(!log.contains("cargo "), "{log}");
+}
+
+/// `setup --remote` moves the boat machine's token to SBR_ATTEST_TOKEN: gh checks the
+/// attestation with it, and neither setup nor anything else sees it.
+#[test]
+fn the_machines_token_checks_the_attestation_and_nothing_else() {
+    let r = Run::new("machine-token");
+    let env = [
+        ("SBR_REF", TAG),
+        ("FAKE_GH", "token"),
+        ("SBR_ATTEST_TOKEN", "creator-token"),
+        ("GITHUB_APP_ID", "42"),
+        ("GITHUB_APP_PRIVATE_KEY_FILE", "/x/app.pem"),
+    ];
+    let (out, log) = r.run(&["policy.toml"], &env);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("attestation verified"), "{stdout}");
+    assert!(
+        log.contains("gh auth status GH_TOKEN=creator-token")
+            && log.contains("-R Surely-Works-LLC/sw-boat-runner GH_TOKEN=creator-token"),
+        "{log}"
+    );
+    assert!(
+        log.contains("GITHUB_TOKEN=unset GH_TOKEN=unset\nfrom: release")
+            && log.contains("attest: unset"),
+        "{log}"
+    );
+
+    // No token and no other sign-in: SHA-256 only, and it says so.
+    let (out, log) = r.run(&["policy.toml"], &[("SBR_REF", TAG), ("FAKE_GH", "token")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("SHA-256 only: gh not signed in"),
+        "{stdout}"
+    );
+    assert!(!log.contains("gh attestation verify"), "{log}");
+}
+
+/// A cargo build runs build scripts and proc-macros: it gets no GitHub token, except the
+/// personal token asked for.
+#[test]
+fn a_cargo_build_sees_no_token() {
+    let r = Run::new("cargo-token");
+    let tokens = [
+        ("GITHUB_TOKEN", "creator-token"),
+        ("GH_TOKEN", "creator-token"),
+        ("SBR_ATTEST_TOKEN", "creator-token"),
+    ];
+    for git_ref in ["main", "0123abcd"] {
+        let mut env = vec![("SBR_REF", git_ref)];
+        env.extend(tokens);
+        let (out, log) = r.run(&[], &env);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            log.contains("cargo env: GITHUB_TOKEN=unset GH_TOKEN=unset attest=unset"),
+            "{log}"
+        );
+    }
+    // An old glibc builds a tag the same way.
+    let mut env = vec![("SBR_REF", TAG), ("FAKE_GLIBC", "2.31")];
+    env.extend(tokens);
+    let (out, log) = r.run(&[], &env);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        log.contains("cargo env: GITHUB_TOKEN=unset GH_TOKEN=unset"),
+        "{log}"
+    );
+
+    // With --pat the personal token is the point.
+    let (out, log) = r.run(&["--pat"], &[("SBR_REF", "main"), ("GITHUB_TOKEN", "pat")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(log.contains("cargo env: GITHUB_TOKEN=pat "), "{log}");
+}
+
+#[test]
+fn a_fork_installs_from_itself() {
+    let r = Run::new("fork");
+    let (out, log) = r.run(&[], &[("SBR_UPSTREAM", "acme/sbr")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        log.contains("curl https://github.com/acme/sbr/releases/latest"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "curl https://github.com/acme/sbr/releases/download/{TAG}/"
+        )),
+        "{log}"
+    );
+    assert!(log.contains("-R acme/sbr"), "{log}");
+    assert!(log.contains("source: acme/sbr"), "{log}");
+    let (out, log) = r.run(&[], &[("SBR_UPSTREAM", "acme/sbr"), ("SBR_REF", "main")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        log.contains("--git https://github.com/acme/sbr --branch main"),
+        "{log}"
+    );
+
+    // The default is the upstream, and setup hears of it too.
+    let (_, log) = r.run(&[], &[]);
+    assert!(
+        log.contains("source: Surely-Works-LLC/sw-boat-runner"),
+        "{log}"
+    );
+
+    for bad in [
+        "acme",
+        "acme/sbr/x",
+        "acme/$(id)",
+        "../x",
+        "-acme/sbr",
+        "acme/-sbr",
+    ] {
+        let (out, log) = r.run(&[], &[("SBR_UPSTREAM", bad)]);
+        assert!(!out.status.success(), "{bad}");
+        assert!(
+            stderr(&out).contains("is not owner/name"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!log.contains("curl"), "{log}");
+    }
 }
