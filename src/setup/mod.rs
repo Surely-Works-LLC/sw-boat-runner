@@ -115,7 +115,7 @@ impl Source {
         // It goes into URLs and a shell command on a remote machine.
         let part_ok = |p: &str| {
             !p.is_empty()
-                && !p.starts_with('.')
+                && !p.starts_with(['.', '-'])
                 && p.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         };
@@ -306,6 +306,12 @@ fn choose_policy(
         "Repository (owner/name)",
         default_repo,
     )?;
+    // Before the hook, which may ask for the boat key, and before a snapshot build.
+    if !repo_ok(&repo) {
+        return Err(format!(
+            "repository {repo:?} is not owner/name in GitHub's characters"
+        ));
+    }
     after_repo(&repo, boat_key)?;
     let labels = value(
         &opts.labels,
@@ -408,11 +414,17 @@ fn list_saved(key: &str) -> Option<Vec<crate::boat::SavedSnapshot>> {
 }
 
 fn setup(opts: &Options) -> Result<(), String> {
+    setup_with(opts, Path::new(SYSTEMD_DIR).is_dir())
+}
+
+/// `setup`, with whether this machine has systemd given, so a test can check that the
+/// preflight comes before the first prompt.
+fn setup_with(opts: &Options, has_systemd: bool) -> Result<(), String> {
     Source::from_env()?;
     if opts.remote {
         return remote::run(opts);
     }
-    systemd_preflight(Path::new(SYSTEMD_DIR).is_dir(), opts.dry_run)?;
+    systemd_preflight(has_systemd, opts.dry_run)?;
     let mut boat_key = None;
     let policy_text = choose_policy(opts, &mut boat_key, |_, _| Ok(()))?;
     let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
@@ -2428,6 +2440,66 @@ mod tests {
         );
         // A dry run warns and goes on to print the plan.
         assert!(systemd_preflight(false, true).is_ok());
+
+        // setup checks before choose_policy: a bad repository would fail there first.
+        let opts = Options {
+            repo: Some("not a repo".into()),
+            ..Options::default()
+        };
+        let err = setup_with(&opts, false).unwrap_err();
+        assert!(err.starts_with("this machine has no systemd"), "{err}");
+        let err = setup_with(&opts, true).unwrap_err();
+        assert!(err.contains("\"not a repo\" is not owner/name"), "{err}");
+    }
+
+    #[test]
+    fn choose_policy_runs_after_repo_before_any_other_prompt() {
+        // Labels and snapshot are left to their prompts: a hook that stops setup means
+        // neither is asked (they would read stdin and fail with another error).
+        let opts = Options {
+            repo: Some("acme/app".into()),
+            ..Options::default()
+        };
+        let mut key = None;
+        let mut seen = None;
+        let err = choose_policy(&opts, &mut key, |repo, k| {
+            seen = Some(repo.to_string());
+            *k = Some(Secret("k".into()));
+            Err("stop".into())
+        })
+        .unwrap_err();
+        assert_eq!(err, "stop");
+        assert_eq!(seen.as_deref(), Some("acme/app"));
+        assert_eq!(key.unwrap().expose(), "k");
+
+        // A bad repository stops before the hook.
+        let bad = Options {
+            repo: Some("acme/app/x".into()),
+            ..Options::default()
+        };
+        let err = choose_policy(&bad, &mut None, |_, _| panic!("the hook ran")).unwrap_err();
+        assert!(err.contains("is not owner/name"), "{err}");
+
+        // With --policy, the hook gets the file's repository.
+        let dir = std::env::temp_dir().join(format!("sbr-choose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        let text = policy_text("acme/from-file", &["self-hosted".into()], "s");
+        std::fs::write(&path, &text).unwrap();
+        let opts = Options {
+            policy: Some(path.clone()),
+            ..Options::default()
+        };
+        let mut seen = None;
+        let got = choose_policy(&opts, &mut None, |repo, _| {
+            seen = Some(repo.to_string());
+            Ok(())
+        });
+        assert_eq!(got.unwrap(), text);
+        assert_eq!(seen.as_deref(), Some("acme/from-file"));
+        let err = choose_policy(&opts, &mut None, |_, _| Err("stop".into())).unwrap_err();
+        assert_eq!(err, "stop");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2459,6 +2531,8 @@ mod tests {
             "a b/c",
             "acme/$(id)",
             "../x",
+            "-acme/sbr",
+            "acme/-sbr",
         ] {
             assert!(Source::new(Some(bad.into()), None).is_err(), "{bad}");
         }

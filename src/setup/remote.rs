@@ -173,7 +173,36 @@ fn release_ref() -> Result<String, String> {
     {
         return Err(format!("SBR_REF {r:?} is not a tag, commit or branch name"));
     }
+    if older_than_remote(&r) {
+        return Err(format!(
+            "SBR_REF {r} is older than {OLDEST_REMOTE}: its install.sh does not keep the \
+             machine's GITHUB_TOKEN from the daemon; pick {OLDEST_REMOTE} or newer"
+        ));
+    }
     Ok(r)
+}
+
+/// The oldest release whose install.sh `setup --remote` runs.
+const OLDEST_REMOTE: &str = "v0.3.0";
+
+/// Whether `r` is a release tag `vX.Y.Z...` before `OLDEST_REMOTE`. A commit or branch
+/// is taken as asked.
+fn older_than_remote(r: &str) -> bool {
+    let version = |r: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = r.strip_prefix('v')?.splitn(3, '.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor, patch.parse().ok()?))
+    };
+    match (version(r), version(OLDEST_REMOTE)) {
+        (Some(v), Some(oldest)) => v < oldest,
+        _ => false,
+    }
 }
 
 /// The same choice as `setup`, without an earlier setup's env file to reuse.
@@ -874,6 +903,15 @@ fn write_script(name: &str) -> String {
 
 /// Runs install.sh at `git_ref` with the staged files; the secrets come from the files,
 /// never from this text, and the directory is deleted whatever happens.
+/// A boat machine comes with its creator's GH_TOKEN or GITHUB_TOKEN. It is moved to
+/// SBR_ATTEST_TOKEN, which install.sh gives only to `gh` for the attestation check, so it
+/// reaches neither a cargo build nor `setup` (nor an older install.sh, which would take
+/// GITHUB_TOKEN for the daemon's token).
+const ATTEST_TOKEN: &str = "SBR_ATTEST_TOKEN=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+export SBR_ATTEST_TOKEN
+unset GITHUB_TOKEN GH_TOKEN
+";
+
 fn install_script(source: &str, git_ref: &str, auth: &Auth, files: &Staged) -> String {
     let github = match auth {
         // install.sh takes the token only when asked to.
@@ -884,9 +922,6 @@ fn install_script(source: &str, git_ref: &str, auth: &Auth, files: &Staged) -> S
         Auth::App {
             id, installation, ..
         } => {
-            // A boat machine comes with its creator's GITHUB_TOKEN. It stays for install.sh,
-            // whose `gh attestation verify` needs a signed-in gh; install.sh unsets it
-            // before `setup`, which runs without --pat.
             let mut s = format!(
                 "export GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE=\"$d/{}\"\n",
                 files.secret_file
@@ -905,7 +940,7 @@ cd \"$d\" || exit 1
 curl --proto '=https' -fsSL -o install.sh https://raw.githubusercontent.com/{source}/{git_ref}/examples/always-on/install.sh || exit 1
 BOAT_API_KEY=$(cat boat-key) || exit 1
 export BOAT_API_KEY SBR_REF={git_ref} SBR_UPSTREAM={source}
-{github}bash install.sh policy.toml
+{ATTEST_TOKEN}{github}bash install.sh policy.toml
 "
     )
 }
@@ -1282,9 +1317,11 @@ mod tests {
             "export GITHUB_APP_ID=42 GITHUB_APP_PRIVATE_KEY_FILE=\"$d/app.pem\"\n\
              export GITHUB_APP_INSTALLATION_ID=77\n"
         ));
-        // The machine's GITHUB_TOKEN stays for install.sh's attestation check; install.sh
-        // unsets it for `setup` itself.
-        assert!(!s.contains("unset"), "{s}");
+        // The machine's token goes only to install.sh's attestation check.
+        assert!(
+            s.contains(&format!("{ATTEST_TOKEN}export GITHUB_APP_ID=42 ")),
+            "{s}"
+        );
         assert!(s.contains("trap 'rm -rf \"$d\"' EXIT"));
         assert!(s.ends_with("bash install.sh policy.toml\n"));
         assert!(!s.contains("PRIVATE KEY"));
@@ -1298,6 +1335,11 @@ mod tests {
         );
         assert!(pat.contains("GITHUB_TOKEN=$(cat github-token)") && !pat.contains("ghp_x"));
         assert!(pat.contains("export GITHUB_TOKEN SBR_PAT=1\n"), "{pat}");
+        // The personal token is set after the machine's is moved away.
+        assert!(
+            pat.contains(&format!("{ATTEST_TOKEN}GITHUB_TOKEN=$(cat github-token)")),
+            "{pat}"
+        );
         // A fork installs from itself, and says so to the machine.
         assert!(pat.contains(
             "https://raw.githubusercontent.com/acme/sw-boat-runner/main/examples/always-on/install.sh"
@@ -1324,6 +1366,24 @@ mod tests {
         assert_eq!(check("0123abc").unwrap(), "0123abc");
         for bad in ["v1;rm -rf", "-x", "../x", "a b", "$(id)", "a'b"] {
             assert!(check(bad).is_err(), "{bad}");
+        }
+        // Releases before v0.3.0 hand the machine's GITHUB_TOKEN to the daemon.
+        for old in ["v0.1.0", "v0.2.9", "v0.2.10-rc1"] {
+            assert!(
+                check(old).unwrap_err().contains("older than v0.3.0"),
+                "{old}"
+            );
+        }
+        for ok in [
+            "v0.3.0",
+            "v0.3.1-rc1",
+            "v0.10.0",
+            "v1.0.0",
+            "v0",
+            "main",
+            "0123abc",
+        ] {
+            assert_eq!(check(ok).unwrap(), ok);
         }
         assert_eq!(
             release_ref().unwrap(),
@@ -1366,5 +1426,45 @@ mod tests {
         );
         let shell = plan("acme/app", &GitHub::Shell("7".into()), "main", false, false);
         assert!(shell.contains("use GitHub App 7"), "{shell}");
+    }
+}
+
+#[cfg(test)]
+mod attest_tests {
+    use super::ATTEST_TOKEN;
+    use std::process::Command;
+
+    /// `ATTEST_TOKEN` in bash with `env`: SBR_ATTEST_TOKEN, then whether GH_TOKEN and
+    /// GITHUB_TOKEN are left.
+    fn moved(env: &[(&str, &str)]) -> String {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!(
+                "set -u\n{ATTEST_TOKEN}echo \"$SBR_ATTEST_TOKEN ${{GH_TOKEN-unset}} \
+                 ${{GITHUB_TOKEN-unset}}\"; bash -c 'echo \"child $SBR_ATTEST_TOKEN\"'"
+            ))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("SBR_ATTEST_TOKEN");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_machines_token_is_kept_only_for_the_attestation() {
+        assert_eq!(
+            moved(&[("GH_TOKEN", "gh"), ("GITHUB_TOKEN", "github")]),
+            "gh unset unset\nchild gh\n"
+        );
+        assert_eq!(
+            moved(&[("GITHUB_TOKEN", "github")]),
+            "github unset unset\nchild github\n"
+        );
+        assert_eq!(moved(&[("GH_TOKEN", "gh")]), "gh unset unset\nchild gh\n");
+        assert_eq!(moved(&[]), " unset unset\nchild \n");
     }
 }

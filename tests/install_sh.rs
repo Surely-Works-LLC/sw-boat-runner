@@ -21,6 +21,7 @@ const FAKE_BIN: &str = r#"#!/bin/sh
     echo "GITHUB_TOKEN=${GITHUB_TOKEN-unset} GH_TOKEN=${GH_TOKEN-unset}"
     echo "from: $FROM"
     echo "source: ${SBR_UPSTREAM-unset}"
+    echo "attest: ${SBR_ATTEST_TOKEN-unset}"
 } >> "$FAKE_LOG"
 "#;
 
@@ -71,7 +72,7 @@ const FAKE_GETCONF: &str = r#"#!/bin/sh
 /// (not logged in) or `token` (signed in only by GH_TOKEN or GITHUB_TOKEN, as on a boat
 /// machine).
 const FAKE_GH: &str = r#"#!/bin/sh
-echo "gh $*" >> "$FAKE_LOG"
+echo "gh $* GH_TOKEN=${GH_TOKEN-unset}" >> "$FAKE_LOG"
 case "$1 $2" in
     "auth status")
         case $FAKE_GH in
@@ -81,7 +82,16 @@ case "$1 $2" in
         esac ;;
     "--version "*) echo "gh version 2.20.0 (2022-11-01)" ;;
     "attestation --help") [ "$FAKE_GH" != old ] ;;
-    "attestation verify") [ "$FAKE_GH" = ok ] || [ "$FAKE_GH" = token ] ;;
+    "attestation verify")
+        case $FAKE_GH in
+            ok | token) exit 0 ;;
+            flaky)
+                # Fails the first time only, as a network error would.
+                [ -f "$FAKE_LOG.flaky" ] && exit 0
+                : > "$FAKE_LOG.flaky"
+                exit 1 ;;
+            *) exit 1 ;;
+        esac ;;
     *) exit 1 ;;
 esac
 "#;
@@ -89,6 +99,7 @@ esac
 /// Installs the fake binary under `--root`.
 const FAKE_CARGO: &str = r#"#!/bin/sh
 echo "cargo $*" >> "$FAKE_LOG"
+echo "cargo env: GITHUB_TOKEN=${GITHUB_TOKEN-unset} GH_TOKEN=${GH_TOKEN-unset} attest=${SBR_ATTEST_TOKEN-unset}" >> "$FAKE_LOG"
 root=''
 while [ $# -gt 0 ]; do
     [ "$1" = --root ] && root=$2
@@ -380,8 +391,24 @@ fn an_old_gh_warns_and_a_failed_attestation_stops() {
     let r = Run::new("gh-bad");
     let (out, log) = r.run(&[], &[("SBR_REF", TAG), ("FAKE_GH", "bad")]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("failed its attestation check"));
+    let err = stderr(&out);
+    assert!(
+        err.contains("failed its attestation check twice")
+            && err.contains("-R Surely-Works-LLC/sw-boat-runner")
+            && err.contains("run the install again"),
+        "{err}"
+    );
+    assert_eq!(log.matches("gh attestation verify").count(), 2, "{log}");
     assert_eq!(setup_args(&log), None, "{log}");
+
+    // One failure, then a pass: installed.
+    let r = Run::new("gh-flaky");
+    let (out, log) = r.run(&[], &[("SBR_REF", TAG), ("FAKE_GH", "flaky")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("trying once more"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("attestation verified"));
+    assert_eq!(log.matches("gh attestation verify").count(), 2, "{log}");
+    assert!(setup_args(&log).is_some(), "{log}");
 }
 
 #[test]
@@ -397,15 +424,15 @@ fn another_platform_stops_with_a_hint() {
     assert!(!log.contains("cargo "), "{log}");
 }
 
-/// `setup --remote` runs install.sh on a boat machine whose gh is signed in only by its
-/// creator's GITHUB_TOKEN: the attestation is checked with it, and setup runs without it.
+/// `setup --remote` moves the boat machine's token to SBR_ATTEST_TOKEN: gh checks the
+/// attestation with it, and neither setup nor anything else sees it.
 #[test]
-fn the_machines_token_checks_the_attestation_but_does_not_reach_setup() {
+fn the_machines_token_checks_the_attestation_and_nothing_else() {
     let r = Run::new("machine-token");
     let env = [
         ("SBR_REF", TAG),
         ("FAKE_GH", "token"),
-        ("GITHUB_TOKEN", "creator-token"),
+        ("SBR_ATTEST_TOKEN", "creator-token"),
         ("GITHUB_APP_ID", "42"),
         ("GITHUB_APP_PRIVATE_KEY_FILE", "/x/app.pem"),
     ];
@@ -414,12 +441,13 @@ fn the_machines_token_checks_the_attestation_but_does_not_reach_setup() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("attestation verified"), "{stdout}");
     assert!(
-        log.contains("gh attestation verify ")
-            && log.contains("-R Surely-Works-LLC/sw-boat-runner"),
+        log.contains("gh auth status GH_TOKEN=creator-token")
+            && log.contains("-R Surely-Works-LLC/sw-boat-runner GH_TOKEN=creator-token"),
         "{log}"
     );
     assert!(
-        log.contains("GITHUB_TOKEN=unset GH_TOKEN=unset\nfrom: release"),
+        log.contains("GITHUB_TOKEN=unset GH_TOKEN=unset\nfrom: release")
+            && log.contains("attest: unset"),
         "{log}"
     );
 
@@ -432,6 +460,42 @@ fn the_machines_token_checks_the_attestation_but_does_not_reach_setup() {
         "{stdout}"
     );
     assert!(!log.contains("gh attestation verify"), "{log}");
+}
+
+/// A cargo build runs build scripts and proc-macros: it gets no GitHub token, except the
+/// personal token asked for.
+#[test]
+fn a_cargo_build_sees_no_token() {
+    let r = Run::new("cargo-token");
+    let tokens = [
+        ("GITHUB_TOKEN", "creator-token"),
+        ("GH_TOKEN", "creator-token"),
+        ("SBR_ATTEST_TOKEN", "creator-token"),
+    ];
+    for git_ref in ["main", "0123abcd"] {
+        let mut env = vec![("SBR_REF", git_ref)];
+        env.extend(tokens);
+        let (out, log) = r.run(&[], &env);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            log.contains("cargo env: GITHUB_TOKEN=unset GH_TOKEN=unset attest=unset"),
+            "{log}"
+        );
+    }
+    // An old glibc builds a tag the same way.
+    let mut env = vec![("SBR_REF", TAG), ("FAKE_GLIBC", "2.31")];
+    env.extend(tokens);
+    let (out, log) = r.run(&[], &env);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        log.contains("cargo env: GITHUB_TOKEN=unset GH_TOKEN=unset"),
+        "{log}"
+    );
+
+    // With --pat the personal token is the point.
+    let (out, log) = r.run(&["--pat"], &[("SBR_REF", "main"), ("GITHUB_TOKEN", "pat")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(log.contains("cargo env: GITHUB_TOKEN=pat "), "{log}");
 }
 
 #[test]
@@ -465,7 +529,14 @@ fn a_fork_installs_from_itself() {
         "{log}"
     );
 
-    for bad in ["acme", "acme/sbr/x", "acme/$(id)", "../x"] {
+    for bad in [
+        "acme",
+        "acme/sbr/x",
+        "acme/$(id)",
+        "../x",
+        "-acme/sbr",
+        "acme/-sbr",
+    ] {
         let (out, log) = r.run(&[], &[("SBR_UPSTREAM", bad)]);
         assert!(!out.status.success(), "{bad}");
         assert!(

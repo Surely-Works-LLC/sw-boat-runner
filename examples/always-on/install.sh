@@ -16,11 +16,15 @@
 # commit or branch, and a release on a host with glibc older than 2.35. Any other failure
 # (network, a missing release file, a server error, a checksum or attestation mismatch)
 # stops the script. Pin a tag or commit for production. SBR_UPSTREAM=owner/name installs
-# from a fork instead; setup gets it too.
+# from a fork instead; setup gets it too. SBR_ATTEST_TOKEN, which `setup --remote` sets
+# to the machine's GitHub token, goes only to the `gh` calls that check the attestation.
 set -euo pipefail
 
+attest_token=${SBR_ATTEST_TOKEN:-}
+unset SBR_ATTEST_TOKEN
+
 repo=${SBR_UPSTREAM:-Surely-Works-LLC/sw-boat-runner}
-if ! [[ $repo =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+if ! [[ $repo =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*/[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
     echo "SBR_UPSTREAM $repo is not owner/name; not installing" >&2
     exit 1
 fi
@@ -43,6 +47,15 @@ fi
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+
+# gh, signed in with SBR_ATTEST_TOKEN when it was given, else as gh already is.
+attest_gh() {
+    if [ -n "$attest_token" ]; then
+        GH_TOKEN=$attest_token gh "$@"
+    else
+        gh "$@"
+    fi
+}
 
 # fetch URL FILE: downloads URL to FILE and prints the HTTP status, or fails on a network
 # error. The caller decides what each status means.
@@ -104,19 +117,28 @@ download() {
         echo "$file from $tag does not match its SHA256SUMS; not installing" >&2
         exit 1
     fi
-    # gh signs in with GH_TOKEN or GITHUB_TOKEN when set: they are unset only for setup.
+    # gh signs in with SBR_ATTEST_TOKEN, GH_TOKEN or GITHUB_TOKEN; the last two are unset
+    # only for setup and a cargo build.
     if ! command -v gh >/dev/null; then
         checked="SHA-256 only: gh not installed, attestation not checked"
-    elif ! gh auth status >/dev/null 2>&1; then
+    elif ! attest_gh auth status >/dev/null 2>&1; then
         checked="SHA-256 only: gh not signed in, attestation not checked"
     elif ! gh attestation --help >/dev/null 2>&1; then
         # `gh attestation` came in gh 2.49.
         echo "warning: $(gh --version | head -1) has no \`gh attestation\`; not checking the attestation" >&2
         checked="SHA-256 only: gh too old, attestation not checked"
     else
-        if ! gh attestation verify "$tmp/$file" -R "$repo"; then
-            echo "$file from $tag failed its attestation check; not installing" >&2
-            exit 1
+        # Once more after a failure, which may be the network or Sigstore; a second
+        # failure stops the install.
+        if ! attest_gh attestation verify "$tmp/$file" -R "$repo"; then
+            echo "gh attestation verify failed; trying once more" >&2
+            sleep 3
+            if ! attest_gh attestation verify "$tmp/$file" -R "$repo"; then
+                echo "$file from $tag failed its attestation check twice (gh attestation" \
+                    "verify -R $repo, output above); not installing. If gh reports a network" \
+                    "or Sigstore error, run the install again." >&2
+                exit 1
+            fi
         fi
         checked="SHA-256 checked and attestation verified"
     fi
@@ -138,6 +160,9 @@ elif ! download; then
 fi
 if [ -z "${bin:-}" ]; then
     echo "building ${from[*]} with cargo"
+    # Build scripts and proc-macros run here: no GitHub token reaches them unless it is
+    # the personal token asked for.
+    if [ -z "$pat" ]; then unset GITHUB_TOKEN GH_TOKEN; fi
     if ! command -v cargo >/dev/null; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
         # shellcheck source=/dev/null
