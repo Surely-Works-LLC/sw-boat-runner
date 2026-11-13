@@ -13,8 +13,23 @@ All notable changes to this project are documented here. The format follows
   this process registered logs `online <runner> <n>s after its register` when GitHub
   first lists it online. Together they tell queueing for capacity from the daemon's own
   delay.
+- Local `setup` refuses a host without systemd before it asks anything.
+- `setup --remote` uses the signed-in boat CLI to look for a machine that already runs
+  the daemon for the repository before it asks for the boat API key.
+- `install.sh` verifies the release's build provenance attestation when `gh` is signed
+  in, and says which checks ran.
+- A missing argument names the argument and the command's usage.
+- The README lists what you need before the quick start, gives numbered steps for the
+  laptop and on-machine paths with checksum and attestation checks, and gains an
+  Operating section (upgrade, key rotation, uninstall). It states the scope (one daemon
+  per repository, repository-level runners, Linux with systemd), that the App page is
+  served from `main`, and that the TLA+ model covers the 0.2.0 loop.
+
 ### Added
 
+- `SBR_REPO=<owner>/<repo>` points `install.sh` and `setup` at a fork: its releases, and
+  its App page at `https://<owner>.github.io/<repo>/new-app.html` unless
+  `SBR_NEW_APP_PAGE` names another.
 - `tests/sim_scenarios.rs`: a seven-minute boat outage (every request answers 500) during
   a warm pool's long job. The daemon keeps running, touches no machine, leaves the busy
   runner alone and serves the job queued meanwhile within two ticks of boat coming back.
@@ -36,8 +51,6 @@ Upgrading from 0.2.0:
 - Each fork carries `sw-boat-runner-daemon=<host>-<pid>-<start time>`. A daemon logs an
   error, once per other daemon, when a machine forked by another daemon for the same
   repository and pool appears while it runs.
-
-
 - `setup --remote` stops when a boat machine already runs the daemon for the
   repository (labelled `sw-boat-runner-host`, or named `sw-boat-runner <repo>`), and
   `--replace` deletes that machine once `doctor` finds no FAIL on the new one.
@@ -48,8 +61,6 @@ Upgrading from 0.2.0:
   finish its tick on SIGTERM.
 - `tests/install_sh.rs` runs `install.sh` with fake `curl`, `uname`, `getconf`, `gh` and
   `cargo`; CI runs shellcheck on it.
-
-
 - `tests/sim`: a stateful fake boat and GitHub over virtual time that the real
   `run::Loop` runs against. boat's machines boot, stop, expire on their TTL and lose their
   disk, behind a listing that lags; GitHub's runners come online only once their JIT
@@ -66,7 +77,6 @@ Upgrading from 0.2.0:
   300 s; a fork's TTL then may end before its runner comes online.
 - `run` warns once about a job fork whose `Busy` runner comes within 10 minutes of
   `fork_ttl_s`, after which boat archives the machine.
-
 - `setup` and `setup --remote` ignore `GITHUB_TOKEN` unless `--pat` is given, and say
   so. They used to refuse to run while it was set. A rerun whose
   `/etc/sw-boat-runner/env` holds a personal token and no App keeps that token, so an
@@ -100,7 +110,6 @@ Upgrading from 0.2.0:
   account probably owns them; left alone") with no `boat delete` or `drain` command.
   Delete and drain advice stays for machines labelled with this repository in a pool
   the policy no longer has.
-
 - Queued and in-progress runs, and each run's jobs, are read past the first page of 100
   (up to 10 pages, stopping once `total_count` is covered). A matrix of more than 100
   jobs no longer hangs with its later jobs never seen.
@@ -171,8 +180,6 @@ Upgrading from 0.2.0:
   with an `Idle` or `Registered` runner waits until the pool has had no queued job for
   60 s, and while jobs are queued as many forks as there are jobs, that no `Busy` runner
   holds, stay. Its runner is deleted first, so one that just took a job keeps it.
-
-
 - `setup --remote` waits for `boat ssh` when writing its input fails, and an install
   failure says the machine is kept, may hold the keys in `~/.sbr-setup`, and gives
   `boat delete <id> --yes`.

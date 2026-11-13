@@ -1,7 +1,7 @@
-//! One whole-loop test per known bug, each asserting the behaviour the fix should give.
-//! They fail on v0.2.0, so each is `#[ignore]`d with the fix it waits for; the PR that
-//! fixes a bug removes its `#[ignore]`. Run them with `cargo test --test sim_known_bugs
-//! -- --ignored`.
+//! Whole-loop regression tests, one per fixed bug, each asserting the behaviour the fix
+//! gives. One more test is `#[ignore]`d by design: two daemons on one repository and
+//! pool name only warn (see docs/design.md). Run it with `cargo test --test
+//! sim_known_bugs -- --ignored`.
 
 mod sim;
 

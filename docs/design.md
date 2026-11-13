@@ -423,6 +423,9 @@ with no live runner and either a runner was seen on it or it has been `Up` longe
 
 ## Properties
 
+TLC checks the model of the 0.2.0 loop; repository scoping, `drain`'s settle wait and
+the early delete of a fork whose job left the queue are not in it yet ([spec/README.md](../spec/README.md)).
+
 Safety, checked by TLC. Every property below but `OneJobPerRunner`, which is GitHub's
 behaviour, also has a property test on one tick of `decide`, named after it in
 `src/decide.rs`; for liveness the test checks the tick that makes progress.
