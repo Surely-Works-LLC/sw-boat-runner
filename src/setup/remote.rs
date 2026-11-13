@@ -30,7 +30,6 @@ const RUN_LABEL: &str = "sw-boat-runner-daemon-run";
 const HOST_LABEL: &str = "sw-boat-runner-host";
 /// The directory on the machine that holds the secrets until install.sh has run.
 const STAGE: &str = "$HOME/.sbr-setup";
-const REPO: &str = "Surely-Works-LLC/sw-boat-runner";
 
 /// Where the GitHub access comes from.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,30 +42,35 @@ enum GitHub {
 
 pub(super) fn run(opts: &Options) -> Result<(), String> {
     let git_ref = release_ref()?;
+    let source = Source::from_env()?;
     let github = github_plan(opts)?;
     if !opts.dry_run {
         boat_cli_ready()?;
     }
-    // A dry run asks no secret: the key only lists snapshots when it is in the environment.
-    let mut boat_key = if opts.dry_run {
-        None
-    } else {
-        Some(secret("BOAT_API_KEY", "boat API key")?)
-    };
-    let policy_text = choose_policy(opts, &mut boat_key)?;
+    // As soon as the repository is known, before the boat key, the other prompts and the
+    // App: two daemons for one repository would compete for its jobs, and whoever has one
+    // hears so before pasting anything. A dry run asks no secret: the key only lists
+    // snapshots when it is in the environment.
+    let mut replaced = Vec::new();
+    let mut boat_key = None;
+    let policy_text = choose_policy(opts, &mut boat_key, |repo, key| {
+        if opts.dry_run {
+            return Ok(());
+        }
+        let (found, k) = check_daemons(
+            repo,
+            opts.replace,
+            boat_list,
+            || secret("BOAT_API_KEY", "boat API key"),
+            |k| labelled_daemons(k, repo),
+        )?;
+        replaced = found;
+        *key = Some(k);
+        Ok(())
+    })?;
     let cfg = policy::parse(&policy_text).map_err(|e| format!("policy: {e}"))?;
     println!("Policy:\n\n{policy_text}");
     show_check(&policy_text)?;
-    // Before the App: two daemons for one repository would compete for its jobs.
-    let replaced = if opts.dry_run {
-        Vec::new()
-    } else {
-        let key = boat_key.as_ref().expect("asked above").expose().to_string();
-        let t = Ureq::new(Duration::from_secs(30));
-        let found = existing_daemons(&boat::Client::new(&t, key), &cfg.repo)?;
-        refuse_second_daemon(&cfg.repo, &found, opts.replace)?;
-        found
-    };
     if opts.dry_run {
         print!(
             "{}",
@@ -123,7 +127,7 @@ pub(super) fn run(opts: &Options) -> Result<(), String> {
         }
     };
     println!("+ boat ssh {id} <install.sh at {git_ref}, then `sw-boat-runner setup` there>\n");
-    let script = install_script(&git_ref, &auth, &files);
+    let script = install_script(&source.repo, &git_ref, &auth, &files);
     match boat_ssh(&id, &script, None) {
         Ok(true) => {}
         Ok(false) => {
@@ -249,8 +253,9 @@ fn plan(repo: &str, github: &GitHub, git_ref: &str, paste: bool, replace: bool) 
         "stop, unless --replace"
     };
     format!(
-        "Would, from this computer (it asks for BOAT_API_KEY without echo first):\n\n\
-         0. look for a boat machine that already runs the daemon for {repo} and {existing}\n\
+        "Would, from this computer:\n\n\
+         0. look with `boat list --all --json` for a boat machine that already runs the \
+            daemon for {repo} and {existing}; then ask for BOAT_API_KEY without echo\n\
          1. {app_step}\n\
          2. create an always-on boat {MACHINE_TYPE} machine called `{MACHINE_NAME} {repo}` (no auto-stop, \
             not noEnv) and wait until it runs\n\
@@ -355,7 +360,8 @@ fn create_app_here(
         }
         _ => {
             println!(
-                "GitHub then opens {NEW_APP_PAGE}?code=...; copy the whole address it shows.\n"
+                "GitHub then opens {}?code=...; copy the whole address it shows.\n",
+                source().new_app_page
             );
             let pasted = secret("SBR_APP_CODE", "Paste the address (or just the code)")?;
             parse_code(pasted.expose(), &state)?
@@ -668,10 +674,9 @@ struct Daemon {
     state: String,
 }
 
-/// The daemon machines `setup --remote` made for `repo`: by `HOST_LABEL`, or, for
-/// those made before the label, by the name it gives them. From `boat list --all --json`,
-/// and boat's label search when that list is cut short.
-fn existing_daemons(boat: &boat::Client, repo: &str) -> Result<Vec<Daemon>, String> {
+/// `boat list --all --json`, from the boat CLI, which is signed in before setup asks for
+/// any key.
+fn boat_list() -> Result<Value, String> {
     let out = Command::new("boat")
         .args(["list", "--all", "--json"])
         .env("BOAT_NO_UPDATE", "1")
@@ -682,26 +687,58 @@ fn existing_daemons(boat: &boat::Client, repo: &str) -> Result<Vec<Daemon>, Stri
     let listed: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
     if !out.status.success() || !listed["sandboxes"].is_array() {
         return Err(format!(
-            "`boat list --all --json` failed ({}), so setup cannot tell whether a daemon for \
-             {repo} already runs; fix that and try again",
+            "`boat list --all --json` failed ({}), so setup cannot tell whether a daemon \
+             already runs for the repository; fix that and try again",
             out.status
         ));
     }
+    Ok(listed)
+}
+
+/// The machines boat's label search finds with `HOST_LABEL` for `repo`, through the API.
+fn labelled_daemons(key: &Secret, repo: &str) -> Result<Vec<Daemon>, String> {
+    let t = Ureq::new(Duration::from_secs(30));
+    let boat = boat::Client::new(&t, key.expose().to_string());
+    let labelled = boat
+        .list_labelled(HOST_LABEL, &repo_key(repo))
+        .map_err(|e| format!("look for a daemon machine for {repo}: {e}"))?;
+    Ok(labelled
+        .into_iter()
+        .filter(|m| !gone(&m.state))
+        .map(|m| Daemon {
+            id: m.id,
+            state: m.state,
+        })
+        .collect())
+}
+
+/// The daemon machines `setup --remote` made for `repo`, and the boat key, asked for
+/// only once the CLI's list (`list`) shows none, or `--replace` will take their place.
+/// They are found by `HOST_LABEL`, or, for those made before the label, by the name it
+/// gives them. Only when the list is cut short does the key's label search (`labelled`)
+/// look further.
+fn check_daemons(
+    repo: &str,
+    replace: bool,
+    list: impl FnOnce() -> Result<Value, String>,
+    ask_key: impl FnOnce() -> Result<Secret, String>,
+    labelled: impl FnOnce(&Secret) -> Result<Vec<Daemon>, String>,
+) -> Result<(Vec<Daemon>, Secret), String> {
+    let listed = list()?;
     let mut found = daemons_in(&listed, repo);
+    if !replace && !found.is_empty() {
+        refuse_second_daemon(repo, &found, replace)?;
+    }
+    let key = ask_key()?;
     if listed["pageInfo"]["hasMore"] == Value::Bool(true) {
-        let labelled = boat
-            .list_labelled(HOST_LABEL, &repo_key(repo))
-            .map_err(|e| format!("look for a daemon machine for {repo}: {e}"))?;
-        for m in labelled {
-            if !gone(&m.state) && !found.iter().any(|d| d.id == m.id) {
-                found.push(Daemon {
-                    id: m.id,
-                    state: m.state,
-                });
+        for d in labelled(&key)? {
+            if !found.iter().any(|f| f.id == d.id) {
+                found.push(d);
             }
         }
     }
-    Ok(found)
+    refuse_second_daemon(repo, &found, replace)?;
+    Ok((found, key))
 }
 
 /// A machine that no longer runs anything.
@@ -837,7 +874,7 @@ fn write_script(name: &str) -> String {
 
 /// Runs install.sh at `git_ref` with the staged files; the secrets come from the files,
 /// never from this text, and the directory is deleted whatever happens.
-fn install_script(git_ref: &str, auth: &Auth, files: &Staged) -> String {
+fn install_script(source: &str, git_ref: &str, auth: &Auth, files: &Staged) -> String {
     let github = match auth {
         // install.sh takes the token only when asked to.
         Auth::Pat(_) => format!(
@@ -847,11 +884,11 @@ fn install_script(git_ref: &str, auth: &Auth, files: &Staged) -> String {
         Auth::App {
             id, installation, ..
         } => {
-            // A boat machine comes with its creator's GITHUB_TOKEN, which install.sh would
-            // take for a personal token.
+            // A boat machine comes with its creator's GITHUB_TOKEN. It stays for install.sh,
+            // whose `gh attestation verify` needs a signed-in gh; install.sh unsets it
+            // before `setup`, which runs without --pat.
             let mut s = format!(
-                "unset GITHUB_TOKEN GH_TOKEN\n\
-                 export GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE=\"$d/{}\"\n",
+                "export GITHUB_APP_ID={id} GITHUB_APP_PRIVATE_KEY_FILE=\"$d/{}\"\n",
                 files.secret_file
             );
             if let Some(i) = installation {
@@ -865,9 +902,9 @@ fn install_script(git_ref: &str, auth: &Auth, files: &Staged) -> String {
 d=\"{STAGE}\"
 trap 'rm -rf \"$d\"' EXIT
 cd \"$d\" || exit 1
-curl --proto '=https' -fsSL -o install.sh https://raw.githubusercontent.com/{REPO}/{git_ref}/examples/always-on/install.sh || exit 1
+curl --proto '=https' -fsSL -o install.sh https://raw.githubusercontent.com/{source}/{git_ref}/examples/always-on/install.sh || exit 1
 BOAT_API_KEY=$(cat boat-key) || exit 1
-export BOAT_API_KEY SBR_REF={git_ref}
+export BOAT_API_KEY SBR_REF={git_ref} SBR_SOURCE_REPO={source}
 {github}bash install.sh policy.toml
 "
     )
@@ -1063,7 +1100,7 @@ mod tests {
                  "labels": {}},
                 {"id": "bx_cccccccc", "state": "deleted", "name": "sw-boat-runner acme/app"},
                 {"id": "bx_dddddddd", "state": "idle", "name": "sw-boat-runner acme/app2"},
-                {"id": "bx_eeeeeeee", "state": "idle", "name": "mjth-ci",
+                {"id": "bx_eeeeeeee", "state": "idle", "name": "acme-tests",
                  "labels": {"sw-boat-runner": "acme"}},
                 // A pool fork with the daemon-identity label of #36: not a host.
                 {"id": "bx_ffffffff", "state": "idle", "name": "acme-ci",
@@ -1095,6 +1132,89 @@ mod tests {
         );
         assert!(refuse_second_daemon("acme/app", &found, true).is_ok());
         assert!(refuse_second_daemon("acme/app", &[], false).is_ok());
+    }
+
+    /// `check_daemons` with `listed` from the CLI and `labelled` from the API; what it
+    /// returned, whether it asked for the key, and whether it used the API.
+    fn check(
+        listed: Value,
+        replace: bool,
+        labelled: Vec<Daemon>,
+    ) -> (Result<Vec<Daemon>, String>, bool, bool) {
+        let mut asked = false;
+        let mut searched = false;
+        let got = check_daemons(
+            "acme/app",
+            replace,
+            || Ok(listed),
+            || {
+                asked = true;
+                Ok(Secret("key".into()))
+            },
+            |k| {
+                assert_eq!(k.expose(), "key");
+                searched = true;
+                Ok(labelled)
+            },
+        )
+        .map(|(found, _)| found);
+        (got, asked, searched)
+    }
+
+    #[test]
+    fn an_existing_daemon_stops_setup_before_the_boat_key() {
+        let daemon = |id: &str| Daemon {
+            id: id.into(),
+            state: "idle".into(),
+        };
+        let one = serde_json::json!({
+            "pageInfo": {"hasMore": false},
+            "sandboxes": [{"id": "bx_aaaaaaaa", "state": "idle", "name": "sw-boat-runner acme/app"}]
+        });
+        let (got, asked, searched) = check(one.clone(), false, vec![]);
+        assert!(got.unwrap_err().contains("already runs the daemon"));
+        assert!(!asked && !searched, "the key was asked for");
+        // Even when the list is cut short, what it shows is enough to stop.
+        let mut cut = one.clone();
+        cut["pageInfo"]["hasMore"] = Value::Bool(true);
+        let (got, asked, _) = check(cut, false, vec![]);
+        assert!(got.is_err() && !asked);
+
+        // --replace goes on, asks for the key, and replaces what it found.
+        let (got, asked, searched) = check(one, true, vec![]);
+        assert_eq!(got.unwrap(), [daemon("bx_aaaaaaaa")]);
+        assert!(asked && !searched);
+
+        // None listed: the key, and no API search while the list is whole.
+        let none = serde_json::json!({"pageInfo": {"hasMore": false}, "sandboxes": []});
+        let (got, asked, searched) = check(none, false, vec![daemon("bx_zzzzzzzz")]);
+        assert_eq!(got.unwrap(), []);
+        assert!(asked && !searched);
+
+        // A list cut short: the label search with the key looks further.
+        let more = serde_json::json!({"pageInfo": {"hasMore": true}, "sandboxes": []});
+        let (got, asked, searched) = check(more.clone(), false, vec![daemon("bx_zzzzzzzz")]);
+        assert!(
+            got.unwrap_err()
+                .starts_with("boat machine bx_zzzzzzzz (idle)")
+        );
+        assert!(asked && searched);
+        let (got, _, searched) = check(more, false, vec![]);
+        assert!(got.unwrap().is_empty() && searched);
+
+        // A failed list stops before the key.
+        let mut asked = false;
+        let got = check_daemons(
+            "acme/app",
+            false,
+            || Err("boat list failed".into()),
+            || {
+                asked = true;
+                Ok(Secret("key".into()))
+            },
+            |_| Ok(vec![]),
+        );
+        assert!(got.is_err() && !asked);
     }
 
     #[test]
@@ -1144,6 +1264,7 @@ mod tests {
             staged: None,
         };
         let s = install_script(
+            "Surely-Works-LLC/sw-boat-runner",
             "v0.3.0",
             &app,
             &Staged {
@@ -1153,17 +1274,22 @@ mod tests {
         assert!(s.contains(
             "https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.0/examples/always-on/install.sh"
         ));
-        assert!(s.contains("export BOAT_API_KEY SBR_REF=v0.3.0\n"));
+        assert!(s.contains(
+            "export BOAT_API_KEY SBR_REF=v0.3.0 SBR_SOURCE_REPO=Surely-Works-LLC/sw-boat-runner\n"
+        ));
         assert!(s.contains("BOAT_API_KEY=$(cat boat-key)"));
         assert!(s.contains(
-            "unset GITHUB_TOKEN GH_TOKEN\n\
-             export GITHUB_APP_ID=42 GITHUB_APP_PRIVATE_KEY_FILE=\"$d/app.pem\"\n\
+            "export GITHUB_APP_ID=42 GITHUB_APP_PRIVATE_KEY_FILE=\"$d/app.pem\"\n\
              export GITHUB_APP_INSTALLATION_ID=77\n"
         ));
+        // The machine's GITHUB_TOKEN stays for install.sh's attestation check; install.sh
+        // unsets it for `setup` itself.
+        assert!(!s.contains("unset"), "{s}");
         assert!(s.contains("trap 'rm -rf \"$d\"' EXIT"));
         assert!(s.ends_with("bash install.sh policy.toml\n"));
         assert!(!s.contains("PRIVATE KEY"));
         let pat = install_script(
+            "acme/sw-boat-runner",
             "main",
             &Auth::Pat(Secret("ghp_x".into())),
             &Staged {
@@ -1172,6 +1298,14 @@ mod tests {
         );
         assert!(pat.contains("GITHUB_TOKEN=$(cat github-token)") && !pat.contains("ghp_x"));
         assert!(pat.contains("export GITHUB_TOKEN SBR_PAT=1\n"), "{pat}");
+        // A fork installs from itself, and says so to the machine.
+        assert!(pat.contains(
+            "https://raw.githubusercontent.com/acme/sw-boat-runner/main/examples/always-on/install.sh"
+        ));
+        assert!(
+            pat.contains("SBR_SOURCE_REPO=acme/sw-boat-runner\n"),
+            "{pat}"
+        );
         assert!(!s.contains("SBR_PAT"), "{s}");
         assert_eq!(
             write_script("boat-key"),
@@ -1220,7 +1354,8 @@ mod tests {
         assert!(p.contains("journalctl -u sw-boat-runner -f"), "{p}");
         assert!(
             p.contains(
-                "0. look for a boat machine that already runs the daemon for acme/app and stop"
+                "0. look with `boat list --all --json` for a boat machine that already runs \
+                 the daemon for acme/app and stop, unless --replace; then ask for BOAT_API_KEY"
             ),
             "{p}"
         );

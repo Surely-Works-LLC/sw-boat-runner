@@ -38,13 +38,90 @@ fn help_and_version_go_to_stdout() {
 }
 
 #[test]
-fn unknown_arguments_print_usage_and_exit_2() {
-    for args in [&[][..], &["--bogus"], &["check"], &["run", "a", "b"]] {
+fn unknown_arguments_print_why_and_the_usage_and_exit_2() {
+    for (args, why) in [
+        (&[][..], "missing a command"),
+        (&["--bogus"], "unknown option \"--bogus\""),
+        (&["bogus"], "unknown command \"bogus\""),
+        (&["check"], "check: missing the policy file (<policy.toml>)"),
+        (&["run"], "run: missing the policy file (<policy.toml>)"),
+        (&["drain"], "drain: missing the policy file (<policy.toml>)"),
+        (&["plan"], "plan: missing the policy file (<policy.toml>)"),
+        (&["check", "a", "b"], "check: unexpected argument \"b\""),
+        (&["plan", "a", "b", "c"], "plan: unexpected argument \"c\""),
+    ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}");
-        assert!(text(&out.stderr).starts_with("usage:"), "{args:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.starts_with(&format!("sw-boat-runner: {why}\n\nusage:")),
+            "{args:?}: {err}"
+        );
     }
+}
+
+#[test]
+fn bad_run_and_drain_flags_say_what_is_wrong() {
+    let dir = std::env::temp_dir().join(format!("sbr-cli-flags-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("policy.toml");
+    std::fs::write(
+        &path,
+        "repo = \"acme/app\"\n[[pool]]\nname = \"ci\"\nlabels = [\"self-hosted\"]\n\
+         machine_type = \"large\"\nsnapshot = \"s\"\nmax_boxes = 2\n",
+    )
+    .unwrap();
+    let policy = path.to_str().unwrap();
+    for (args, why) in [
+        (vec!["run", policy, "b"], "run: unknown argument \"b\""),
+        (
+            vec!["drain", policy, "--bogus"],
+            "drain: unknown argument \"--bogus\"",
+        ),
+        (
+            vec!["drain", policy, "--settle-s"],
+            "drain: --settle-s needs a number of seconds",
+        ),
+        (
+            vec!["drain", policy, "--timeout-s", "x"],
+            "drain: --timeout-s \"x\" is not a number of seconds",
+        ),
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = text(&out.stderr);
+        assert!(
+            err.starts_with(&format!("sw-boat-runner: {why}\n\nusage:")),
+            "{args:?}: {err}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Without systemd, a real local setup stops before its first prompt. Only where this
+/// host has no systemd, such as macOS; the unit test covers the check itself.
+#[test]
+fn setup_without_systemd_stops_before_any_prompt() {
+    if std::path::Path::new("/run/systemd/system").is_dir() {
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_sw-boat-runner"))
+        .arg("setup")
+        .env_remove("BOAT_API_KEY")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GITHUB_APP_ID")
+        .env_remove("SBR_REPO")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("the binary runs");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "{}", text(&out.stdout));
+    let err = text(&out.stderr);
+    assert!(
+        err.starts_with("setup: this machine has no systemd") && !err.contains("Repository"),
+        "{err}"
+    );
 }
 
 #[test]

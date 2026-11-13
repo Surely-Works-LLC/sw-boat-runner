@@ -59,38 +59,58 @@ fn main() -> ExitCode {
                     },
                 )
             }),
-            _ => usage(),
+            [flag, ..] => usage(&format!("run: unknown argument {flag:?}")),
         },
         ["drain", policy, flags @ ..] => with_policy(policy, |cfg| match drain_opts(cfg, flags) {
-            Some(opts) => cmd_drain(cfg, opts),
-            None => usage(),
+            Ok(opts) => cmd_drain(cfg, opts),
+            Err(e) => usage(&format!("drain: {e}")),
         }),
         ["snapshot", rest @ ..] => cmd_snapshot(rest),
         ["setup", rest @ ..] => sw_boat_runner::setup::cli(rest),
         ["doctor", rest @ ..] => sw_boat_runner::doctor::cli(rest),
-        _ => usage(),
+        _ => usage(&what_is_wrong(&args)),
     }
 }
 
-fn usage() -> ExitCode {
-    eprintln!("{USAGE}");
+/// Why `args` matched no command, for the line before the usage.
+fn what_is_wrong(args: &[&str]) -> String {
+    match args {
+        [] => "missing a command".into(),
+        ["check" | "plan" | "run" | "drain"] => {
+            format!("{}: missing the policy file (<policy.toml>)", args[0])
+        }
+        ["check", _, extra, ..] | ["plan", _, _, extra, ..] => {
+            format!("{}: unexpected argument {extra:?}", args[0])
+        }
+        [other, ..] if other.starts_with('-') => format!("unknown option {other:?}"),
+        [other, ..] => format!("unknown command {other:?}"),
+    }
+}
+
+fn usage(why: &str) -> ExitCode {
+    eprintln!("sw-boat-runner: {why}\n\n{USAGE}");
     ExitCode::from(2)
 }
 
-/// `drain`'s flags, each a number of seconds; `None` for anything else.
-fn drain_opts(cfg: &model::Config, flags: &[&str]) -> Option<run::DrainOpts> {
+/// `drain`'s flags, each a number of seconds; what is wrong with them otherwise.
+fn drain_opts(cfg: &model::Config, flags: &[&str]) -> Result<run::DrainOpts, String> {
     let mut opts = run::DrainOpts::new(cfg);
     let mut rest = flags;
-    while let [flag, value, tail @ ..] = rest {
-        let value: u64 = value.parse().ok()?;
-        match *flag {
-            "--settle-s" => opts.settle_s = value,
-            "--timeout-s" => opts.timeout_s = value,
-            _ => return None,
-        }
+    while let [flag, tail @ ..] = rest {
+        let slot = match *flag {
+            "--settle-s" => &mut opts.settle_s,
+            "--timeout-s" => &mut opts.timeout_s,
+            _ => return Err(format!("unknown argument {flag:?}")),
+        };
+        let [value, tail @ ..] = tail else {
+            return Err(format!("{flag} needs a number of seconds"));
+        };
+        *slot = value
+            .parse()
+            .map_err(|_| format!("{flag} {value:?} is not a number of seconds"))?;
         rest = tail;
     }
-    rest.is_empty().then_some(opts)
+    Ok(opts)
 }
 
 fn with_policy(path: &str, cmd: impl FnOnce(&model::Config) -> ExitCode) -> ExitCode {

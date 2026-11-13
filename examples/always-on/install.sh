@@ -6,17 +6,25 @@
 # With a policy file, setup uses it instead of asking. GITHUB_APP_ID and
 # GITHUB_APP_PRIVATE_KEY_FILE mean an App you already have. A personal token is used
 # only when you ask for it, with SBR_PAT=1 or --pat; otherwise GITHUB_TOKEN and GH_TOKEN
-# are unset for setup, since every boat machine has its creator's GITHUB_TOKEN.
+# are unset for setup, since every boat machine has its creator's GITHUB_TOKEN. They stay
+# set for the download, so that `gh` can check the attestation with them.
 # SBR_REF picks the version: unset for the latest release, a tag starting with v and a
 # digit, a commit hash or a branch. For a release (Linux x86_64 or arm64) it downloads the
-# static binary, checks it against the release's SHA256SUMS and, when `gh` is installed
-# and logged in, its build provenance attestation. Only two cases build with cargo: a
+# prebuilt binary (dynamically linked against glibc 2.35 or newer), checks it against the
+# release's SHA256SUMS and, when `gh` is installed and signed in, its build provenance
+# attestation; it prints which of the two checks ran. Only two cases build with cargo: a
 # commit or branch, and a release on a host with glibc older than 2.35. Any other failure
 # (network, a missing release file, a server error, a checksum or attestation mismatch)
-# stops the script. Pin a tag or commit for production.
+# stops the script. Pin a tag or commit for production. SBR_SOURCE_REPO=owner/name installs
+# from a fork instead; setup gets it too.
 set -euo pipefail
 
-repo=Surely-Works-LLC/sw-boat-runner
+repo=${SBR_SOURCE_REPO:-Surely-Works-LLC/sw-boat-runner}
+if ! [[ $repo =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+    echo "SBR_SOURCE_REPO $repo is not owner/name; not installing" >&2
+    exit 1
+fi
+export SBR_SOURCE_REPO=$repo
 ref=${SBR_REF:-}
 
 args=()
@@ -96,18 +104,21 @@ download() {
         echo "$file from $tag does not match its SHA256SUMS; not installing" >&2
         exit 1
     fi
-    if ! command -v gh >/dev/null || ! gh auth status >/dev/null 2>&1; then
-        checked="SHA-256 checked; attestation not checked (needs gh, logged in)"
+    # gh signs in with GH_TOKEN or GITHUB_TOKEN when set: they are unset only for setup.
+    if ! command -v gh >/dev/null; then
+        checked="SHA-256 only: gh not installed, attestation not checked"
+    elif ! gh auth status >/dev/null 2>&1; then
+        checked="SHA-256 only: gh not signed in, attestation not checked"
     elif ! gh attestation --help >/dev/null 2>&1; then
         # `gh attestation` came in gh 2.49.
         echo "warning: $(gh --version | head -1) has no \`gh attestation\`; not checking the attestation" >&2
-        checked="SHA-256 checked; attestation not checked (gh too old)"
+        checked="SHA-256 only: gh too old, attestation not checked"
     else
         if ! gh attestation verify "$tmp/$file" -R "$repo"; then
             echo "$file from $tag failed its attestation check; not installing" >&2
             exit 1
         fi
-        checked="SHA-256 and build provenance attestation checked"
+        checked="SHA-256 checked and attestation verified"
     fi
     # set -e does not apply here: download runs as an `if` condition.
     if ! tar -xzf "$tmp/$file" -C "$tmp" sw-boat-runner; then
