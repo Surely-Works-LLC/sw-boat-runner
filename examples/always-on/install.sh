@@ -15,16 +15,16 @@
 # attestation; it prints which of the two checks ran. Only two cases build with cargo: a
 # commit or branch, and a release on a host with glibc older than 2.35. Any other failure
 # (network, a missing release file, a server error, a checksum or attestation mismatch)
-# stops the script. Pin a tag or commit for production. SBR_SOURCE_REPO=owner/name installs
+# stops the script. Pin a tag or commit for production. SBR_UPSTREAM=owner/name installs
 # from a fork instead; setup gets it too.
 set -euo pipefail
 
-repo=${SBR_SOURCE_REPO:-Surely-Works-LLC/sw-boat-runner}
+repo=${SBR_UPSTREAM:-Surely-Works-LLC/sw-boat-runner}
 if ! [[ $repo =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*/[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
-    echo "SBR_SOURCE_REPO $repo is not owner/name; not installing" >&2
+    echo "SBR_UPSTREAM $repo is not owner/name; not installing" >&2
     exit 1
 fi
-export SBR_SOURCE_REPO=$repo
+export SBR_UPSTREAM=$repo
 ref=${SBR_REF:-}
 
 args=()

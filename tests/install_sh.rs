@@ -20,7 +20,7 @@ const FAKE_BIN: &str = r#"#!/bin/sh
     echo "args: $*"
     echo "GITHUB_TOKEN=${GITHUB_TOKEN-unset} GH_TOKEN=${GH_TOKEN-unset}"
     echo "from: $FROM"
-    echo "source: ${SBR_SOURCE_REPO-unset}"
+    echo "source: ${SBR_UPSTREAM-unset}"
 } >> "$FAKE_LOG"
 "#;
 
@@ -437,7 +437,7 @@ fn the_machines_token_checks_the_attestation_but_does_not_reach_setup() {
 #[test]
 fn a_fork_installs_from_itself() {
     let r = Run::new("fork");
-    let (out, log) = r.run(&[], &[("SBR_SOURCE_REPO", "acme/sbr")]);
+    let (out, log) = r.run(&[], &[("SBR_UPSTREAM", "acme/sbr")]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
         log.contains("curl https://github.com/acme/sbr/releases/latest"),
@@ -451,7 +451,7 @@ fn a_fork_installs_from_itself() {
     );
     assert!(log.contains("-R acme/sbr"), "{log}");
     assert!(log.contains("source: acme/sbr"), "{log}");
-    let (out, log) = r.run(&[], &[("SBR_SOURCE_REPO", "acme/sbr"), ("SBR_REF", "main")]);
+    let (out, log) = r.run(&[], &[("SBR_UPSTREAM", "acme/sbr"), ("SBR_REF", "main")]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(
         log.contains("--git https://github.com/acme/sbr --branch main"),
@@ -466,7 +466,7 @@ fn a_fork_installs_from_itself() {
     );
 
     for bad in ["acme", "acme/sbr/x", "acme/$(id)", "../x"] {
-        let (out, log) = r.run(&[], &[("SBR_SOURCE_REPO", bad)]);
+        let (out, log) = r.run(&[], &[("SBR_UPSTREAM", bad)]);
         assert!(!out.status.success(), "{bad}");
         assert!(
             stderr(&out).contains("is not owner/name"),

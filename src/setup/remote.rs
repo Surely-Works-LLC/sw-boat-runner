@@ -904,7 +904,7 @@ trap 'rm -rf \"$d\"' EXIT
 cd \"$d\" || exit 1
 curl --proto '=https' -fsSL -o install.sh https://raw.githubusercontent.com/{source}/{git_ref}/examples/always-on/install.sh || exit 1
 BOAT_API_KEY=$(cat boat-key) || exit 1
-export BOAT_API_KEY SBR_REF={git_ref} SBR_SOURCE_REPO={source}
+export BOAT_API_KEY SBR_REF={git_ref} SBR_UPSTREAM={source}
 {github}bash install.sh policy.toml
 "
     )
@@ -1275,7 +1275,7 @@ mod tests {
             "https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.0/examples/always-on/install.sh"
         ));
         assert!(s.contains(
-            "export BOAT_API_KEY SBR_REF=v0.3.0 SBR_SOURCE_REPO=Surely-Works-LLC/sw-boat-runner\n"
+            "export BOAT_API_KEY SBR_REF=v0.3.0 SBR_UPSTREAM=Surely-Works-LLC/sw-boat-runner\n"
         ));
         assert!(s.contains("BOAT_API_KEY=$(cat boat-key)"));
         assert!(s.contains(
@@ -1302,10 +1302,7 @@ mod tests {
         assert!(pat.contains(
             "https://raw.githubusercontent.com/acme/sw-boat-runner/main/examples/always-on/install.sh"
         ));
-        assert!(
-            pat.contains("SBR_SOURCE_REPO=acme/sw-boat-runner\n"),
-            "{pat}"
-        );
+        assert!(pat.contains("SBR_UPSTREAM=acme/sw-boat-runner\n"), "{pat}");
         assert!(!s.contains("SBR_PAT"), "{s}");
         assert_eq!(
             write_script("boat-key"),

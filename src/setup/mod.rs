@@ -30,11 +30,11 @@ const KEY: &str = "/etc/sw-boat-runner/github-app.pem";
 const BIN: &str = "/usr/local/bin/sw-boat-runner";
 const UNIT: &str = "/etc/systemd/system/sw-boat-runner.service";
 const SERVICE: &str = "sw-boat-runner";
-/// The repository sw-boat-runner comes from, unless `SBR_SOURCE_REPO` names a fork.
+/// The repository sw-boat-runner comes from, unless `SBR_UPSTREAM` names a fork.
 const UPSTREAM: &str = "Surely-Works-LLC/sw-boat-runner";
 /// docs/new-app.html on the upstream's GitHub Pages: it posts the manifest to GitHub, and
 /// GitHub sends the browser back to it with the code to paste into setup. A fork's page
-/// is derived from `SBR_SOURCE_REPO`, or set with `SBR_NEW_APP_PAGE`.
+/// is derived from `SBR_UPSTREAM`, or set with `SBR_NEW_APP_PAGE`.
 const DEFAULT_NEW_APP_PAGE: &str = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
 /// Where `setup` finds systemd; without it there is nothing to install the service into.
 const SYSTEMD_DIR: &str = "/run/systemd/system";
@@ -97,11 +97,11 @@ App is created). An existing App: set GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY_FILE
 optionally, GITHUB_APP_INSTALLATION_ID.
 
 Without --remote, setup needs systemd (/run/systemd/system) and stops before any prompt
-when it is missing. A fork installs from itself with SBR_SOURCE_REPO=owner/name; its App
+when it is missing. A fork installs from itself with SBR_UPSTREAM=owner/name; its App
 page is then https://<owner>.github.io/<name>/new-app.html, or SBR_NEW_APP_PAGE.";
 
 /// Where sw-boat-runner comes from: the upstream repository, or a fork named by
-/// `SBR_SOURCE_REPO`. A fork's App page is its own GitHub Pages copy of docs/new-app.html,
+/// `SBR_UPSTREAM`. A fork's App page is its own GitHub Pages copy of docs/new-app.html,
 /// unless `SBR_NEW_APP_PAGE` names another address.
 #[derive(Debug, PartialEq, Eq)]
 struct Source {
@@ -121,7 +121,7 @@ impl Source {
         };
         match repo.split_once('/') {
             Some((owner, name)) if part_ok(owner) && part_ok(name) => {}
-            _ => return Err(format!("SBR_SOURCE_REPO {repo:?} is not owner/name")),
+            _ => return Err(format!("SBR_UPSTREAM {repo:?} is not owner/name")),
         }
         let new_app_page = match page {
             Some(page) => {
@@ -151,10 +151,10 @@ impl Source {
         Ok(Source { repo, new_app_page })
     }
 
-    /// `SBR_SOURCE_REPO` and `SBR_NEW_APP_PAGE`, checked.
+    /// `SBR_UPSTREAM` and `SBR_NEW_APP_PAGE`, checked.
     fn from_env() -> Result<Source, String> {
         Source::new(
-            given(&None, "SBR_SOURCE_REPO"),
+            given(&None, "SBR_UPSTREAM"),
             given(&None, "SBR_NEW_APP_PAGE"),
         )
     }
