@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-13
+
 ### Changed
 
 - `run`'s `register` line ends with the pool's queued jobs and how long the oldest has
@@ -20,7 +22,16 @@ All notable changes to this project are documented here. The format follows
   snapshot, which it lists with the key.
 - The `--remote` install now verifies the release attestation: it no longer unsets the
   token before `install.sh`. `install.sh` prints `SHA-256 checked and attestation
-  verified` or `SHA-256 only: <reason>`.
+  verified` or `SHA-256 only: <reason>`. The machine's token reaches only the two `gh`
+  calls (as `SBR_ATTEST_TOKEN`), never a cargo build or `setup` without `--pat`, and a
+  failed verify is retried once before the install stops.
+- `setup --remote` refuses `SBR_REF` tags older than v0.3.0, whose `install.sh` would
+  hand the machine's token to the daemon.
+- `doctor` reports a snapshot whose source machine is gone as ok, not warn: `setup` and
+  `snapshot` delete the noEnv machine they save, and the daemon checks for logins before
+  each register. A fresh `setup` now ends with no warning.
+- Releases build with a pinned toolchain (`rust-toolchain.toml`) and `macos-15`; CI
+  checks the MSRV (1.85) and runs `cargo deny`.
 - `docs/new-app.html` takes its own address and the App's homepage from where it is
   served, so a fork's GitHub Pages copy names the fork; `file://` and other hosts keep
   upstream's. The manifest is otherwise unchanged. The live page serves every released
@@ -298,7 +309,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/releases/tag/v0.1.0
