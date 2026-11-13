@@ -1,0 +1,7 @@
+# The exact toolchain for CI and release builds, so a tag rebuilds the same binary.
+# Bump it in a pull request of its own. The MSRV (rust-version in Cargo.toml) is
+# checked separately by the `msrv` job in ci.yml.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

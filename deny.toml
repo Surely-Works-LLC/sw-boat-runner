@@ -1,0 +1,36 @@
+# cargo-deny configuration: `cargo deny check` in CI (the `deny` job in ci.yml).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory, unmaintained and unsound included, fails the check unless
+# it is listed here with a reason.
+ignore = []
+
+[licenses]
+# The licenses the dependency tree actually uses. Add one only after reading it.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0", # webpki-roots: the Mozilla root certificates
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate are worth knowing about, not worth failing on.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

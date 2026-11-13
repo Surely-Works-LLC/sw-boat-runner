@@ -1,0 +1,62 @@
+name: Bug report
+description: The daemon did something it should not, or did not do something it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report a vulnerability through the Security tab instead; see [SECURITY.md](https://github.com/Surely-Works-LLC/sw-boat-runner/blob/main/SECURITY.md).
+        Remove any key or token, and change private repository and snapshot names, before you submit.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`sw-boat-runner --version`, and the commit you built if you know it."
+      placeholder: sw-boat-runner 0.3.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install path
+      description: How the daemon was installed.
+      options:
+        - setup --remote from another computer
+        - install.sh or setup on the machine itself
+        - In a workflow (the reusable runners workflow)
+        - Built from source (cargo install or cargo build)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      description: Where the daemon ran, and where you ran `setup --remote` if you did.
+      placeholder: Ubuntu 24.04 x86_64 boat machine; setup --remote from macOS 15 arm64
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: policy
+    attributes:
+      label: Policy
+      description: "`policy.toml`, with the repository name and snapshot changed if they are private."
+      render: toml
+  - type: textarea
+    id: plan
+    attributes:
+      label: Plan output
+      description: "`sw-boat-runner plan policy.toml` output at the time, if you have it."
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log lines
+      description: "Lines around the problem (`journalctl -u sw-boat-runner` on the always-on example)."
+      render: text

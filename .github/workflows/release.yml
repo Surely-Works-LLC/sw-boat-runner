@@ -32,8 +32,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          # For `check` and `plan` on a Mac.
-          - os: macos-latest
+          # The full client on Apple silicon, `setup --remote` included, not only `check` and `plan`.
+          # A fixed image, not macos-latest, so the build does not move under a tag.
+          - os: macos-15
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -41,7 +42,8 @@ jobs:
           persist-credentials: false
       - name: The tag matches Cargo.toml
         run: grep -qx "version = \"${TAG#v}\"" Cargo.toml || { echo "Cargo.toml version is not ${TAG#v}" >&2; exit 1; }
-      - run: rustup toolchain install stable --profile minimal -t "$TARGET"
+      # The exact toolchain in rust-toolchain.toml, so a tag rebuilds the same binary.
+      - run: rustup toolchain install && rustup target add "$TARGET"
       # No cache: a release builds from nothing, so no other run's cache goes into it.
       - run: cargo build --locked --release --target "$TARGET"
       - name: Package

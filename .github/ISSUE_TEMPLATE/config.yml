@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Surely-Works-LLC/sw-boat-runner/security/advisories/new
+    about: Report it privately through GitHub's private vulnerability reporting, not in a public issue. SECURITY.md has the scope.

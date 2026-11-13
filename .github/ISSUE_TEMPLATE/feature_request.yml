@@ -1,0 +1,26 @@
+name: Feature request
+description: Something sw-boat-runner should do that it does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The behaviour, flag or policy key you have in mind, if you have one.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or other approaches you considered.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`sw-boat-runner --version`, if it matters."

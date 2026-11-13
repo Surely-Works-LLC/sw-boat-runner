@@ -1236,14 +1236,14 @@ mod tests {
         // daemon older than 0.3.0, so adopted machines warn.
         let unknown = [
             mine[0].clone(),
-            sb("bx_55555555", "mjth", None),
-            sb("bx_66666666", "mjth", None),
+            sb("bx_55555555", "batch", None),
+            sb("bx_66666666", "batch", None),
         ];
         assert_eq!(severities(&unknown), [Severity::Info, Severity::Warn]);
         let line = &stray_report("o/r", &["ci"], &unknown)[0].1;
         assert_eq!(
             line,
-            "pool mjth: 2 machines from before 0.3.0 are not in this policy; another daemon \
+            "pool batch: 2 machines from before 0.3.0 are not in this policy; another daemon \
              on this boat account probably owns them; left alone"
         );
         assert!(!line.contains("bx_") && !line.contains("delete") && !line.contains("drain"));

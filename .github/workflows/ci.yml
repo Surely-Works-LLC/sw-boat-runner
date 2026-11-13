@@ -16,7 +16,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy
+      # The toolchain, components included, comes from rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
       # tests/install_sh.rs runs the script itself, under cargo test.
@@ -24,6 +25,33 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- check examples/always-on/policy.toml
+  # The oldest Rust that Cargo.toml's rust-version promises still builds every target.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install the rust-version toolchain
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          [ -n "$msrv" ] || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv
+      - run: cargo "+$MSRV" check --locked --all-targets
+  # Advisories, licenses and sources of the dependency tree, from deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
   # The release workflow's targets, so a tag never meets a build that fails.
   release:
     name: release (${{ matrix.target }})
@@ -39,13 +67,13 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal -t "$TARGET"
+      - run: rustup toolchain install && rustup target add "$TARGET"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Per runner image: build scripts built on a newer glibc do not run on an older one.
