@@ -93,7 +93,11 @@ jobs:
           repository: Surely-Works-LLC/sw-boat-runner
           ref: ${{ inputs.ref }}
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      # The toolchain pinned in rust-toolchain.toml at that ref; stable for a ref older
+      # than the file.
+      - run: |
+          if [ -f rust-toolchain.toml ]; then rustup toolchain install
+          else rustup toolchain install stable --profile minimal; fi
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --locked --release
       # The pool's label names this run and attempt, so no other run's daemon sees its

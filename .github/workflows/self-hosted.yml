@@ -1,11 +1,10 @@
 name: self-hosted
 # Runs this repository's tests on a boat machine that sw-boat-runner forks for the job,
-# through the reusable `runners` workflow. Both jobs are skipped until the repository
-# variable BOAT_SNAPSHOT is set; examples/in-workflow/README.md has the setup. The daemon
-# signs in as the GitHub App in the variable BOAT_APP_ID and the secret BOAT_APP_PRIVATE_KEY.
+# through the reusable `runners` workflow. It runs only when started by hand (Actions,
+# self-hosted, Run workflow) on main, and needs the repository variable BOAT_SNAPSHOT;
+# examples/in-workflow/README.md has the setup. The daemon signs in as the GitHub App in
+# the variable BOAT_APP_ID and the secret BOAT_APP_PRIVATE_KEY.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,7 +13,7 @@ permissions:
 # one from a pull request that edits a workflow: examples/in-workflow/README.md#pull-requests.
 jobs:
   runners:
-    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main'
     # actions: read lets the run's own token list the run's jobs.
     permissions:
       contents: read
@@ -28,7 +27,7 @@ jobs:
       BOAT_API_KEY: ${{ secrets.BOAT_API_KEY }}
       app-private-key: ${{ secrets.BOAT_APP_PRIVATE_KEY }}
   test:
-    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: vars.BOAT_SNAPSHOT != '' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, "boat-${{ github.run_id }}-${{ github.run_attempt }}"]
     timeout-minutes: 25
     steps:
