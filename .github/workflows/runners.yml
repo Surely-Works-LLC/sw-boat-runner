@@ -35,7 +35,7 @@ on:
         # Required, with no default: a caller that pins `uses:` but leaves `ref` out would
         # otherwise build whatever main is now, with its keys in the job.
         description: >-
-          The sw-boat-runner tag or commit to build, such as v0.3.0. Keep it the same as
+          The sw-boat-runner tag or commit to build, such as v0.3.1. Keep it the same as
           the ref in the caller's `uses:` line.
         required: true
         type: string

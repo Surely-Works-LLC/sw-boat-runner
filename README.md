@@ -45,7 +45,7 @@ take ten hosts.
 Releases run on Linux x86_64 and arm64 with glibc 2.35 or newer, and `--remote` also on
 macOS arm64. On an Intel Mac, build from source (`cargo install`, as in
 [Any other host](examples/always-on/README.md#any-other-host)). Use the release you
-tested; v0.3.0 below is an example.
+tested; v0.3.1 below is an example.
 
 ### From your laptop (recommended)
 
@@ -54,7 +54,7 @@ tested; v0.3.0 below is an example.
    ```sh
    # macOS arm64. On Linux: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
    T=sw-boat-runner-aarch64-apple-darwin.tar.gz
-   base=https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.3.0
+   base=https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.3.1
    curl -fsSLO "$base/$T"
    curl -fsSLO "$base/SHA256SUMS"
    grep " $T\$" SHA256SUMS | shasum -a 256 -c
@@ -89,8 +89,8 @@ On a boat machine, or any Ubuntu host with systemd and sudo:
 2. Get install.sh at the tag you tested and run it with the same tag:
 
    ```sh
-   curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.0/examples/always-on/install.sh
-   SBR_REF=v0.3.0 bash install.sh
+   curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.1/examples/always-on/install.sh
+   SBR_REF=v0.3.1 bash install.sh
    ```
 
    It checks the binary against the release's `SHA256SUMS`, and its attestation when `gh`

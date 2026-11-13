@@ -562,7 +562,9 @@ fn pool_snapshot(r: &mut Report, boat: &boat::Client, pool: &Pool) {
                 ),
                 None => r.warn("snapshot", format!("{what}: boat did not say; {unknown}")),
             },
-            Err(boat::Error::NotFound) => r.warn(
+            // `setup` and `snapshot` delete the noEnv machine they save, so this is the
+            // usual case, and the check before each register covers it.
+            Err(boat::Error::NotFound) => r.ok(
                 "snapshot",
                 format!("{what}: its source {id} is gone, so {unknown}"),
             ),
