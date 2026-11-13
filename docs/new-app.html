@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-N5LYZY2hkDJn9j3DeWDtQUEc4EfDOvsvmvv5DnKty5M='; style-src 'unsafe-inline'; form-action https://github.com; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-OstmnTqxbRJ1wqktfKKp9Kpw3jOuIJd2dPtON1+ZfDA='; style-src 'unsafe-inline'; form-action https://github.com; base-uri 'none'">
 <meta name="referrer" content="no-referrer">
 <title>sw-boat-runner: new GitHub App</title>
 <style>
@@ -27,13 +27,32 @@ input[type=text] { font: 0.9em ui-monospace, monospace; width: 100%; box-sizing:
 <main id="main"><p>This page needs JavaScript. It sends nothing anywhere except the form you post to GitHub.</p></main>
 <script>
 "use strict";
-// Keep in sync with manifest() in src/setup.rs; a test there checks these strings.
-const PAGE_URL = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
-const HOMEPAGE = "https://github.com/Surely-Works-LLC/sw-boat-runner";
+// Keep in sync with manifest() in src/setup/mod.rs; a test there checks these strings.
 const PERMISSIONS = { "administration": "write", "actions": "read" };
 
 const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO = /^[A-Za-z0-9._-]{1,100}$/;
+
+// This page's address and the repository it belongs to. A copy on a fork's GitHub Pages,
+// https://<owner>.github.io/<repo>/new-app.html, names the fork, as setup does with
+// SBR_UPSTREAM. file:// and any other host fall back to upstream's addresses.
+function source() {
+  const PAGE_URL = "https://surely-works-llc.github.io/sw-boat-runner/new-app.html";
+  const HOMEPAGE = "https://github.com/Surely-Works-LLC/sw-boat-runner";
+  const host = location.protocol === "https:" ? location.hostname : "";
+  const owner = host.endsWith(".github.io") ? host.slice(0, -".github.io".length) : "";
+  const path = /^\/([^/]+)\/new-app(?:\.html)?$/.exec(location.pathname);
+  if (!OWNER.test(owner) || !path || !REPO.test(path[1]) || path[1] === "." || path[1] === "..") {
+    return { PAGE_URL, HOMEPAGE };
+  }
+  const page = "https://" + host + "/" + path[1] + "/new-app.html";
+  // Upstream's own copy keeps the repository's spelling, as setup's manifest has it.
+  if (page === PAGE_URL) return { PAGE_URL, HOMEPAGE };
+  return { PAGE_URL: page, HOMEPAGE: "https://github.com/" + owner + "/" + path[1] };
+}
+
+const { PAGE_URL, HOMEPAGE } = source();
+
 const STATE = /^[0-9a-f]{32}$/;
 const APP_NAME = /^sbr-[A-Za-z0-9._-]{1,21}-[0-9a-f]{8}$/;
 // `setup --remote` listens here for the code; nothing else may replace PAGE_URL.

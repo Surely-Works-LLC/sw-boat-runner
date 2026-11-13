@@ -20,8 +20,9 @@ give jobs per persistent runner and persistent queue time per day.
 The one result so far, [example-2026-11.md](results/example-2026-11.md), measured four
 long-lived runners registered once on always-on machines, not this daemon. Their names
 are not `sbr-...`, and each ran many jobs where a daemon runner runs one. Its queue times
-(p50 5.6 min, p90 27.8 min) are those of too few fixed runners. The README's 17 s / 24 s
-come from the [bench](../bench/), a simulation of the daemon. Neither measures the other;
+(p50 5.6 min, p90 27.8 min) are those of too few fixed runners. The README's queue
+times (`warm` p50 17 s and 18 s) come from the [bench](../bench/), a simulation of the
+daemon. Neither measures the other;
 what the result shows about keeping machines up is the drop in boat starts.
 
 ## Reproduce

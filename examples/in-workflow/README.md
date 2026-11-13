@@ -86,11 +86,11 @@ What this costs compared with a daemon that stays up:
 - It makes only starts the plan includes. A job past them waits.
 
 [self-hosted.yml](../../.github/workflows/self-hosted.yml) in this repository is a
-working caller that runs `cargo test` on a machine the daemon forks. Its jobs are skipped
-unless the repository variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) is set,
-along with the variable `BOAT_APP_ID` and the secrets `BOAT_API_KEY` and
-`BOAT_APP_PRIVATE_KEY`, and they are not set here, so it does not run in this repository. A
-fork that sets them runs it.
+working caller that runs `cargo test` on a machine the daemon forks. It runs only when
+started by hand from the Actions tab, and its jobs are skipped unless the repository
+variable `BOAT_SNAPSHOT` (a snapshot with a Rust toolchain) is set, along with the
+variable `BOAT_APP_ID` and the secrets `BOAT_API_KEY` and `BOAT_APP_PRIVATE_KEY`. They
+are not set here. A fork that sets them can start it from its own Actions tab.
 
 ## Pull requests
 

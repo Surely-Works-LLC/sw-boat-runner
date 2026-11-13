@@ -8,37 +8,42 @@ can reuse machines across runs.
 
 `sw-boat-runner setup --remote` does all of the below from a macOS or Linux computer
 with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to
-(`boat api-key create` makes a key). First it lists your boat machines and stops if one
-already runs the daemon for the repository: one labelled `sw-boat-runner-host` for it,
-or called `sw-boat-runner <owner>/<name>`. Keep that one, delete it with
-`boat delete <id> --yes`, or pass `--replace`, which deletes it once `doctor` finds no
-FAIL on the new machine. Then:
+(`boat api-key create` makes a key). In this order:
 
-1. It asks for `BOAT_API_KEY` without echo, then the repository, labels and snapshot,
-   and offers to build the snapshot if it is missing.
-2. It creates the GitHub App. The browser opens [docs/new-app.html](../../docs/new-app.html)
+1. It checks that the boat CLI is signed in and asks for the repository.
+2. It lists your boat machines with `boat list --all --json` and stops if one already
+   runs the daemon for the repository: one labelled `sw-boat-runner-host` for it, or
+   called `sw-boat-runner <owner>/<name>`. It has asked for no secret yet. Keep that
+   machine, delete it with `boat delete <id> --yes`, or pass `--replace`, which deletes
+   it once `doctor` finds no FAIL on the new machine.
+3. It asks for `BOAT_API_KEY` without echo, then the runner labels, then the snapshot,
+   listing your saved snapshots with the key. If the snapshot is missing it offers to
+   build one with the same key.
+4. It creates the GitHub App (or, with `--pat`, asks for the token). The browser opens [docs/new-app.html](../../docs/new-app.html)
    with a `redirect` to `http://127.0.0.1:<random port>/callback`, which the page takes
    only in exactly that form and puts in the manifest as `redirect_url`. setup listens
    there for one request with the `state` it sent, answers "You can close this tab",
    and stops. While it waits you can paste the address the browser ends on (or just the
    code) instead, for a browser on another computer; after 15 minutes only a paste
-   works. `--paste` skips the listener, `--offline-link` uses a `data:` page. It exchanges the code
-   and waits for the installation on your computer. The App's key stays in
-   `~/.config/sw-boat-runner/github-app-<id>.pem` (mode 600) until the machine has it,
-   so a failed run can be repeated with `GITHUB_APP_ID=<id>
+   works. `--paste` skips the listener, `--offline-link` uses a `data:` page. It
+   exchanges the code and waits for the installation on your computer. The App's key
+   stays in `~/.config/sw-boat-runner/github-app-<id>.pem` (mode 600) until the
+   machine has it, so a failed run can be repeated with `GITHUB_APP_ID=<id>
    GITHUB_APP_PRIVATE_KEY_FILE=<that file> sw-boat-runner setup --remote`.
-3. It creates a `small` machine with no auto-stop (not `noEnv`: it runs no CI job).
-4. It writes the policy, the boat key and the App's key (or `GITHUB_TOKEN` with `--pat`)
+5. It creates a `small` machine with no auto-stop. It is not `noEnv`, since it runs no
+   CI job, so boat may give it your logins, such as a GitHub token, next to the keys
+   setup puts there.
+6. It writes the policy, the boat key and the App's key (or `GITHUB_TOKEN` with `--pat`)
    to `~/.sbr-setup` on the machine, each through the stdin of `boat ssh` into a
    `umask 077` file. boat keeps no history of `boat ssh` commands, and no command it
    runs holds a key.
-5. Over `boat ssh` it runs [install.sh](install.sh) at `SBR_REF` (default: the version
+7. Over `boat ssh` it runs [install.sh](install.sh) at `SBR_REF` (default: the version
    of the binary you run), which checks the release binary and runs `setup` there with
    those files, as in the next section. `doctor`'s output shows on your terminal, and
    `~/.sbr-setup` is deleted.
 
 It prints the machine's id; `boat ssh <id> journalctl -u sw-boat-runner -f` shows the
-logs. If step 4 fails the machine is deleted; if step 5 fails it is kept for a look, may
+logs. If step 6 fails the machine is deleted; if step 7 fails it is kept for a look, may
 still hold the keys in `~/.sbr-setup`, and `boat delete <id> --yes` removes it.
 `setup --remote --dry-run` prints the plan and asks no secret.
 
@@ -80,22 +85,25 @@ personal token instead of an App. Without it the script unsets `GITHUB_TOKEN` an
 broad for the daemon.
 
 Pin the same tag in the URL and in `SBR_REF`, so a reinstall gets what you tested. On
-Linux x86_64 or arm64 the script downloads that release's static binary and checks it
-against the release's `SHA256SUMS`; if `gh` is installed and logged in, it also checks
-the binary's build provenance attestation with `gh attestation verify`, and otherwise
-says the attestation was not checked (or warns, when `gh` is too old for
-`gh attestation`). With glibc older than 2.35 it builds that tag with cargo. Anything
-else stops the script, and it never falls back to another version: a network error, a
-server error, a failed check, another platform, or a release without the binary or
-`SHA256SUMS` (a 404). To build such a release from source, set `SBR_REF` to its commit. Without
-`SBR_REF` it installs the latest release, and stops if that release has no `setup`.
-`SBR_REF` can also be a commit hash or a branch name, which are built with cargo
-(installing rustup first if cargo is missing); `main` is built only when you ask for it. [Verifying a release](#verifying-a-release) shows the
-same checks by hand.
+Linux x86_64 or arm64 the script downloads that release's binary, which links glibc 2.35
+or newer, and checks it against the release's `SHA256SUMS`; if `gh` is installed and
+logged in, it also checks the binary's build provenance attestation with
+`gh attestation verify`. It prints `SHA-256 checked and attestation verified`, or
+`SHA-256 only:` and the reason (`gh` not installed, not signed in, or too old for
+`gh attestation`). The `--remote` install keeps the token on the machine for this check,
+so it verifies the attestation there. With glibc older than 2.35 it builds that
+tag with cargo. Anything else stops the script, and it never falls back to another
+version: a network error, a server error, a failed check, another platform, or a
+release without the binary or `SHA256SUMS` (a 404). To build such a release from
+source, set `SBR_REF` to its commit. Without `SBR_REF` it installs the latest release,
+and stops if that release has no `setup`. `SBR_REF` can also be a commit hash or a
+branch name, which are built with cargo (installing rustup first if cargo is missing);
+`main` is built only when you ask for it. [Verifying a release](#verifying-a-release)
+shows the same checks by hand.
 
-To use a GitHub App instead of a personal token, copy its private key to the machine
-(over `boat scp`, or paste it into a file over `boat ssh`) and set the App variables
-from [Any other host](#any-other-host) before running the script:
+To reuse a GitHub App you already have instead of creating one, copy its private key
+to the machine (over `boat scp`, or paste it into a file over `boat ssh`) and set the
+App variables from [Any other host](#any-other-host) before running the script:
 
 ```sh
 read -rp 'GITHUB_APP_ID: ' GITHUB_APP_ID && export GITHUB_APP_ID
@@ -211,8 +219,9 @@ Each release has `sw-boat-runner-<target>.tar.gz` for `x86_64-unknown-linux-gnu`
 provenance attestation signed by the `release` workflow. To check a download by hand:
 
 ```sh
-sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify sw-boat-runner-x86_64-unknown-linux-gnu.tar.gz --repo Surely-Works-LLC/sw-boat-runner
+T=sw-boat-runner-x86_64-unknown-linux-gnu.tar.gz
+grep " $T\$" SHA256SUMS | shasum -a 256 -c    # shasum is on macOS and Linux
+gh attestation verify "$T" --repo Surely-Works-LLC/sw-boat-runner
 ```
 
 `SHA256SUMS` is published on the same release as the tarballs, so the checksum only

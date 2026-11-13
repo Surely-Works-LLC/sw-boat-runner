@@ -4,6 +4,10 @@
 boat's machines, and the daemon as `src/decide.rs` and `src/run/` implement the rules
 in [docs/design.md](../docs/design.md). The spec does not read Rust code.
 
+The model follows the 0.2.0 loop. Later changes are not modelled yet: repository
+scoping (a daemon keeps only machines labelled with its repository), `drain`'s settle
+wait, and the 60 s retirement of a job fork whose job left the queue.
+
 ## What is modelled
 
 - GitHub. A bounded set of jobs arrives (a re-run is another job key), waits in the
