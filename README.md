@@ -64,9 +64,9 @@ tested; v0.3.0 below is an example.
 
 2. Run `./sw-boat-runner setup --remote`. `--dry-run` first prints the plan and asks no
    secret.
-3. Answer the prompts: repository, labels and snapshot, then the boat key without echo.
-   It stops before the key if a boat machine already runs the daemon for the repository
-   (`--replace` swaps it for the new one).
+3. Answer the prompts: the repository, then the boat key without echo, the labels and
+   the snapshot. Before it asks for any secret it stops if a boat machine already runs
+   the daemon for the repository (`--replace` swaps it for the new one).
 4. Create the GitHub App in the browser it opens and install it on the repository.
    GitHub sends the browser back to a one-shot listener on `127.0.0.1`, so there is
    nothing to paste unless the browser is on another computer.
@@ -94,7 +94,8 @@ On a boat machine, or any Ubuntu host with systemd and sudo:
    ```
 
    It checks the binary against the release's `SHA256SUMS`, and its attestation when `gh`
-   is signed in, says which checks ran, then runs `sw-boat-runner setup`.
+   is signed in, prints which checks ran (`SHA-256 checked and attestation verified`, or
+   `SHA-256 only:` and why), then runs `sw-boat-runner setup`.
 3. Answer the prompts: repository, labels and snapshot.
 4. Open the short link setup prints, in a browser on any computer. The page creates the
    App; paste the code it shows back into setup, then install the App on the repository.
@@ -222,10 +223,12 @@ owner's GitHub settings (Developer settings, GitHub Apps).
 Check a release against its `SHA256SUMS` and `gh attestation verify`
 ([how](examples/always-on/README.md#verifying-a-release)), and pin a tag or commit SHA.
 Or fork it, or build your own. A fork that installs itself must enable GitHub Pages from
-`main` and `/docs`, publish its own release, and set `SBR_REPO=<owner>/<repo>` for
-install.sh and setup. setup then links to `https://<owner>.github.io/<repo>/new-app.html`
-for the App, unless `SBR_NEW_APP_PAGE` names another page. These prompts hand either job
-to a coding agent.
+`main` and `/docs`, publish its own release, and set `SBR_UPSTREAM=<owner>/<name>` for
+install.sh and setup (`SBR_REPO` stays the repository the runners serve). setup then
+links to `https://<owner>.github.io/<name>/new-app.html` for the App, with the owner in
+lowercase, unless `SBR_NEW_APP_PAGE` names another https address without a query. The
+page names the fork as the App's homepage when it is served from such an address. These
+prompts hand either job to a coding agent.
 
 <details>
 <summary>Agent prompt: fork and run your own</summary>
@@ -270,7 +273,8 @@ root-only in `/etc/sw-boat-runner`.
 
 The App comes from [docs/new-app.html](docs/new-app.html), which GitHub Pages serves from
 `main` and `/docs`. The page builds the manifest that sets the App's permissions, so
-every release's `setup` uses the page as it is on `main` today, not as it was at its tag.
+every release's `setup` uses the page as it is on `main` today, not as it was at its tag:
+a change to the page reaches every released binary once it is on `main`.
 `setup --offline-link` prints a `data:` URL with the page built into the binary instead.
 
 The `--remote` host is not a `noEnv` machine, so boat may give it its creator's logins,

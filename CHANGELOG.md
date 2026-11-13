@@ -14,10 +14,17 @@ All notable changes to this project are documented here. The format follows
   first lists it online. Together they tell queueing for capacity from the daemon's own
   delay.
 - Local `setup` refuses a host without systemd before it asks anything.
-- `setup --remote` uses the signed-in boat CLI to look for a machine that already runs
-  the daemon for the repository before it asks for the boat API key.
-- `install.sh` verifies the release's build provenance attestation when `gh` is signed
-  in, and says which checks ran.
+- `setup --remote` asks for the repository, then looks for a machine that already runs
+  the daemon for it with `boat list --all --json`, and stops there without `--replace`,
+  before it asks for any secret. Then it asks for the boat API key, the labels and the
+  snapshot, which it lists with the key.
+- The `--remote` install now verifies the release attestation: it no longer unsets the
+  token before `install.sh`. `install.sh` prints `SHA-256 checked and attestation
+  verified` or `SHA-256 only: <reason>`.
+- `docs/new-app.html` takes its own address and the App's homepage from where it is
+  served, so a fork's GitHub Pages copy names the fork; `file://` and other hosts keep
+  upstream's. The manifest is otherwise unchanged. The live page serves every released
+  binary, so this applies to all of them once it is on `main`.
 - A missing argument names the argument and the command's usage.
 - The README lists what you need before the quick start, gives numbered steps for the
   laptop and on-machine paths with checksum and attestation checks, and gains an
@@ -27,9 +34,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `SBR_REPO=<owner>/<repo>` points `install.sh` and `setup` at a fork: its releases, and
-  its App page at `https://<owner>.github.io/<repo>/new-app.html` unless
-  `SBR_NEW_APP_PAGE` names another.
+- `SBR_UPSTREAM=<owner>/<name>` points `install.sh` and `setup` at a fork: its releases,
+  and its App page at `https://<owner>.github.io/<name>/new-app.html` (owner in
+  lowercase) unless `SBR_NEW_APP_PAGE` names another https address without a query.
+  `SBR_REPO` stays the repository the runners serve.
 - `tests/sim_scenarios.rs`: a seven-minute boat outage (every request answers 500) during
   a warm pool's long job. The daemon keeps running, touches no machine, leaves the busy
   runner alone and serves the job queued meanwhile within two ticks of boat coming back.

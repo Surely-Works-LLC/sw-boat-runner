@@ -10,15 +10,16 @@ can reuse machines across runs.
 with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs to
 (`boat api-key create` makes a key). In this order:
 
-1. It checks that the boat CLI is signed in, then asks for the repository, labels and
-   snapshot, and offers to build the snapshot if it is missing.
-2. With the signed-in boat CLI it lists your boat machines and stops if one already
+1. It checks that the boat CLI is signed in and asks for the repository.
+2. It lists your boat machines with `boat list --all --json` and stops if one already
    runs the daemon for the repository: one labelled `sw-boat-runner-host` for it, or
-   called `sw-boat-runner <owner>/<name>`. Keep that one, delete it with
-   `boat delete <id> --yes`, or pass `--replace`, which deletes it once `doctor` finds
-   no FAIL on the new machine. Only after this check does it ask for `BOAT_API_KEY`
-   without echo.
-3. It creates the GitHub App. The browser opens [docs/new-app.html](../../docs/new-app.html)
+   called `sw-boat-runner <owner>/<name>`. It has asked for no secret yet. Keep that
+   machine, delete it with `boat delete <id> --yes`, or pass `--replace`, which deletes
+   it once `doctor` finds no FAIL on the new machine.
+3. It asks for `BOAT_API_KEY` without echo, then the runner labels, then the snapshot,
+   listing your saved snapshots with the key. If the snapshot is missing it offers to
+   build one with the same key.
+4. It creates the GitHub App (or, with `--pat`, asks for the token). The browser opens [docs/new-app.html](../../docs/new-app.html)
    with a `redirect` to `http://127.0.0.1:<random port>/callback`, which the page takes
    only in exactly that form and puts in the manifest as `redirect_url`. setup listens
    there for one request with the `state` it sent, answers "You can close this tab",
@@ -29,20 +30,20 @@ with the boat CLI signed in (`boat login`) to the account `BOAT_API_KEY` belongs
    stays in `~/.config/sw-boat-runner/github-app-<id>.pem` (mode 600) until the
    machine has it, so a failed run can be repeated with `GITHUB_APP_ID=<id>
    GITHUB_APP_PRIVATE_KEY_FILE=<that file> sw-boat-runner setup --remote`.
-4. It creates a `small` machine with no auto-stop. It is not `noEnv`, since it runs no
+5. It creates a `small` machine with no auto-stop. It is not `noEnv`, since it runs no
    CI job, so boat may give it your logins, such as a GitHub token, next to the keys
    setup puts there.
-5. It writes the policy, the boat key and the App's key (or `GITHUB_TOKEN` with `--pat`)
+6. It writes the policy, the boat key and the App's key (or `GITHUB_TOKEN` with `--pat`)
    to `~/.sbr-setup` on the machine, each through the stdin of `boat ssh` into a
    `umask 077` file. boat keeps no history of `boat ssh` commands, and no command it
    runs holds a key.
-6. Over `boat ssh` it runs [install.sh](install.sh) at `SBR_REF` (default: the version
+7. Over `boat ssh` it runs [install.sh](install.sh) at `SBR_REF` (default: the version
    of the binary you run), which checks the release binary and runs `setup` there with
    those files, as in the next section. `doctor`'s output shows on your terminal, and
    `~/.sbr-setup` is deleted.
 
 It prints the machine's id; `boat ssh <id> journalctl -u sw-boat-runner -f` shows the
-logs. If step 5 fails the machine is deleted; if step 6 fails it is kept for a look, may
+logs. If step 6 fails the machine is deleted; if step 7 fails it is kept for a look, may
 still hold the keys in `~/.sbr-setup`, and `boat delete <id> --yes` removes it.
 `setup --remote --dry-run` prints the plan and asks no secret.
 
@@ -87,8 +88,10 @@ Pin the same tag in the URL and in `SBR_REF`, so a reinstall gets what you teste
 Linux x86_64 or arm64 the script downloads that release's binary, which links glibc 2.35
 or newer, and checks it against the release's `SHA256SUMS`; if `gh` is installed and
 logged in, it also checks the binary's build provenance attestation with
-`gh attestation verify`, and otherwise says the attestation was not checked (or warns,
-when `gh` is too old for `gh attestation`). With glibc older than 2.35 it builds that
+`gh attestation verify`. It prints `SHA-256 checked and attestation verified`, or
+`SHA-256 only:` and the reason (`gh` not installed, not signed in, or too old for
+`gh attestation`). The `--remote` install keeps the token on the machine for this check,
+so it verifies the attestation there. With glibc older than 2.35 it builds that
 tag with cargo. Anything else stops the script, and it never falls back to another
 version: a network error, a server error, a failed check, another platform, or a
 release without the binary or `SHA256SUMS` (a 404). To build such a release from
