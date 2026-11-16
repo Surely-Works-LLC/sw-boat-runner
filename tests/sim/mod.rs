@@ -118,6 +118,10 @@ pub struct Knobs {
     pub disk_keep_s: u64,
     /// A started runner is online this long after its start command.
     pub runner_online_s: u64,
+    /// A create or resume copies its snapshot in for this long after it is Up, and lists
+    /// `hydrated: false` meanwhile. A runner started before the copy ends never comes
+    /// online, as on boat, where the swap to the real disk breaks it.
+    pub hydrate_s: u64,
     /// boat's page size for `GET /sandboxes`, at most the `limit` asked for.
     pub page_size: usize,
     /// Every new machine reports `holdsCreatorLogins: true`.
@@ -147,6 +151,7 @@ impl Default for Knobs {
             keep_s: 600,
             disk_keep_s: 14 * DAY_S,
             runner_online_s: 10,
+            hydrate_s: 0,
             page_size: 200,
             logins: false,
             gh_rate_limit: 1_000_000_000,
@@ -335,6 +340,8 @@ pub struct Sandbox {
     pub created_at: UnixSecs,
     /// Boots into `error` instead of Up.
     pub boot_fails: bool,
+    /// When its snapshot copy ends (`Knobs::hydrate_s`).
+    pub hydrated_at: UnixSecs,
 }
 
 impl Sandbox {
@@ -513,6 +520,8 @@ pub struct Stats {
     pub paid_cents: u64,
     pub ttl_archives: u64,
     pub ttl_kills: u64,
+    /// Runners started on a machine still copying its snapshot in (`Knobs::hydrate_s`).
+    pub lost_starts: u64,
     pub requests: u64,
     pub faults: u64,
     pub exits: u64,
@@ -653,6 +662,7 @@ impl World {
             files: BTreeMap::new(),
             created_at: since,
             boot_fails: false,
+            hydrated_at: since,
         };
         sb.history.push((since, state.listed()));
         self.sandboxes.push(sb);
@@ -1208,7 +1218,10 @@ impl World {
                     .filter(|s| s.labels.get(key).is_some_and(|v| v == value))
                     .filter_map(|s| {
                         let state = s.listed_at(now, lag, gone)?;
-                        Some(json!({ "id": s.id, "state": state, "labels": s.labels }))
+                        let hydrated = now.saturating_sub(lag) >= s.hydrated_at;
+                        Some(json!({
+                            "id": s.id, "state": state, "labels": s.labels, "hydrated": hydrated,
+                        }))
                     })
                     .collect();
                 let end = (start + page).min(all.len());
@@ -1262,6 +1275,7 @@ impl World {
                     files: BTreeMap::new(),
                     created_at: now,
                     boot_fails,
+                    hydrated_at: now + self.knobs.boot_s + self.knobs.hydrate_s,
                 };
                 sb.history.push((now, "provisioning"));
                 let job = sb.job();
@@ -1279,7 +1293,7 @@ impl World {
                 Some(s) if !matches!(s.state, BoxState::Deleted { .. }) => ok(json!({
                     "sandbox": {
                         "id": s.id, "state": s.state.listed(), "labels": s.labels,
-                        "holdsCreatorLogins": s.holds_logins,
+                        "holdsCreatorLogins": s.holds_logins, "hydrated": now >= s.hydrated_at,
                     }
                 })),
                 _ => err(404, "not_found"),
@@ -1306,8 +1320,10 @@ impl World {
                 }
                 self.stats.resumes += 1;
                 let up_at = now + self.knobs.boot_s;
+                let hydrated_at = up_at + self.knobs.hydrate_s;
                 let sb = self.sandbox_mut(&id).expect("found above");
                 sb.set(now, BoxState::Creating { up_at });
+                sb.hydrated_at = hydrated_at;
                 // A noEnv resume scrubs the creator's logins.
                 sb.holds_logins = false;
                 self.check_boxes(owner, &pool);
@@ -1416,7 +1432,9 @@ impl World {
         else {
             return;
         };
-        let online_at = self.now + self.knobs.runner_online_s;
+        let now = self.now;
+        let hydrating = self.sandbox(machine).is_some_and(|s| now < s.hydrated_at);
+        let online_at = now + self.knobs.runner_online_s;
         let Some(r) = self
             .runners
             .iter_mut()
@@ -1428,6 +1446,11 @@ impl World {
             return;
         }
         r.started = true;
+        if hydrating {
+            // It stays `Registered`: started, never online.
+            self.stats.lost_starts += 1;
+            return;
+        }
         r.proc = RunnerProc::Starting { online_at };
     }
 

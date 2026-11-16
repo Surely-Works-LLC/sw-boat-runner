@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{Error, HTTP_TIMEOUT, Loop};
-use crate::boat::{self, Sandbox};
+use crate::boat::Sandbox;
 use crate::github::{self, GhRunner};
 use crate::model::{
     Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs,
@@ -267,7 +267,7 @@ impl Memory {
         let mut machines: Vec<Machine> = listed
             .into_iter()
             .map(|(pool, sb)| {
-                let state = boat::machine_state(&sb.state);
+                let state = sb.machine_state();
                 let job = sb.job();
                 // After a restart nothing records whether an Up fork already had a runner,
                 // so it counts as used (`FixCrashSeen`): deleted, never registered again. A

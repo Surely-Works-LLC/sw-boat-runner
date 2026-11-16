@@ -125,3 +125,39 @@ min_up_s = 0",
         assert!(w.stats.creates >= 2, "{other_repo}: {:?}", w.stats);
     }
 }
+
+/// A resumed machine is Up minutes before its snapshot copy ends, and a runner started
+/// meanwhile never comes online (boat swaps the real disk in under it). Two jobs queue on
+/// a warm pool with one machine up and one stopped: the daemon resumes the stopped one but
+/// registers on it only once boat lists it hydrated, so the second job takes the up
+/// machine's slot when the first job ends instead of waiting out `register_timeout_s`
+/// behind a runner that cannot start.
+#[test]
+fn a_resumed_machine_takes_no_runner_until_it_is_hydrated() {
+    let mut w = world(Knobs {
+        hydrate_s: 600,
+        ..Knobs::default()
+    });
+    w.seed_machine(0, "ci", None, BoxState::Up);
+    let stopped = BoxState::Stopped { since: T0 - DAY_S };
+    w.seed_machine(0, "ci", None, stopped);
+    let jobs = w.add_run("o/r", T0 + 60, &[(large(), 60), (large(), 60)]);
+    let cfg = one_pool("warm", "max_boxes = 2\nmin_up = 1\nidle_stop_s = 3600");
+    let mut s = Sim::warmed(w, vec![cfg]);
+    s.run_for(1_800);
+
+    s.assert_clean(&[]);
+    let w = s.world();
+    for &j in &jobs {
+        let job = &w.jobs[j];
+        let started = job.started_at.expect("every job ran");
+        assert!(
+            started <= job.created_at + 300,
+            "job {} waited {}s",
+            job.id,
+            started - job.created_at
+        );
+    }
+    assert_eq!(w.stats.resumes, 1, "{:?}", w.stats);
+    assert_eq!(w.stats.lost_starts, 0, "{:?}", w.stats);
+}
