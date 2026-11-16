@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `run` registers no runner on a machine boat lists with `hydrated: false`; it counts as
+  starting until boat says its snapshot copy is done. A runner registered on a resumed or
+  forked machine during the copy died when boat swapped the real disk in (`Transport
+  endpoint is not connected`), or gave up waiting when the copy took over 600 s. It stayed
+  `Registered` for `register_timeout_s` (900 s by default), covering a queued job, so that
+  job waited about 15 minutes even when another machine's slot was free. On a warm pool of
+  large machines every first runner on a machine resumed after boat's keep window hit
+  this.
+
 ## [0.3.1] - 2026-11-13
 
 ### Changed

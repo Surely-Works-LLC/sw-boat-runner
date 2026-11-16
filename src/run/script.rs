@@ -11,7 +11,10 @@ pub(super) fn jit_path(slot: u32) -> String {
 /// swap sees its files change identity, so the runner starts only after it. The wait
 /// gives up after 300 tries 2 s apart and deletes the jit config at `$f`; `decide` then
 /// unregisters the runner that never came online. Without `findmnt` it does not wait.
-/// `HOME_WAIT_S` is that bound.
+/// `HOME_WAIT_S` is that bound. A runner that starts the moment the swap happens still
+/// fails (`Transport endpoint is not connected`), so the daemon registers only on a
+/// machine boat lists as hydrated (`boat::Sandbox::machine_state`), and this wait is the
+/// fallback for a boat that does not say.
 const WAIT_FOR_HOME: &str = "n=0; \
      while findmnt -no FSTYPE -T /home/user 2>/dev/null | grep -q '^fuse'; do \
      n=$((n+1)); [ \"$n\" -lt 300 ] || { rm -f \"$f\"; exit 1; }; sleep 2; done";

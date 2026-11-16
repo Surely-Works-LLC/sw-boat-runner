@@ -361,6 +361,13 @@ Machine states, mapped from boat's states:
 | `Stopped` | `archived` |
 | `Gone` | `error`, `cancelled`, `deleted` |
 
+A machine boat lists `ready`, `idle` or `running` with `hydrated: false` is `Starting`. A
+resume or fork is up in seconds but copies its snapshot in for minutes, and boat swaps the
+real disk in under `/home/user` when the copy ends; a runner started before that never
+comes online. As `Starting` the machine takes no `Register`, holds its `max_boxes` box and
+covers its slots' share of the queue, so no other machine is started for those jobs, while
+a free slot on a hydrated machine still takes them.
+
 Runner states, mapped from GitHub's `status` and `busy`:
 
 | State | GitHub |

@@ -147,9 +147,25 @@ pub(crate) struct Sandbox {
     /// gives every fork these logins. `None` when boat did not say.
     #[serde(default, rename = "holdsCreatorLogins")]
     pub holds_creator_logins: Option<bool>,
+    /// False while a resumed or forked machine still copies its snapshot in; `None` when
+    /// boat did not say.
+    #[serde(default)]
+    pub hydrated: Option<bool>,
 }
 
 impl Sandbox {
+    /// Its model state: `machine_state`, except that an `Up` machine boat lists with
+    /// `hydrated: false` is `Starting`. boat swaps the real disk in under `/home/user` when
+    /// the copy ends, and a runner started before that never comes online: it would hold
+    /// its slot and cover a queued job until `register_timeout_s`. As `Starting` it takes
+    /// no runner and covers its slots' jobs, like a machine still booting.
+    pub(crate) fn machine_state(&self) -> MachineState {
+        match machine_state(&self.state) {
+            MachineState::Up if self.hydrated == Some(false) => MachineState::Starting,
+            state => state,
+        }
+    }
+
     /// The job a machine was forked for, from its `JOB_LABEL`; `None` for a kept machine.
     pub(crate) fn job(&self) -> Option<JobKey> {
         let (id, attempt) = self.labels.get(JOB_LABEL)?.split_once('-')?;
@@ -1083,6 +1099,24 @@ mod tests {
         assert_eq!(machine_state("something_new"), MachineState::Starting);
     }
 
+    /// A listed machine still copying its snapshot in is `Starting` until boat says the
+    /// copy is done; one boat says nothing about is `Up`.
+    #[test]
+    fn an_up_machine_that_is_not_hydrated_is_starting() {
+        let listed = |state: &str, hydrated: &str| {
+            let json = format!(r#"{{"id":"bx_22222222","state":"{state}"{hydrated}}}"#);
+            serde_json::from_str::<Sandbox>(&json)
+                .unwrap()
+                .machine_state()
+        };
+        let not_yet = r#","hydrated":false"#;
+        assert_eq!(listed("idle", not_yet), MachineState::Starting);
+        assert_eq!(listed("running", not_yet), MachineState::Starting);
+        assert_eq!(listed("idle", r#","hydrated":true"#), MachineState::Up);
+        assert_eq!(listed("idle", ""), MachineState::Up);
+        assert_eq!(listed("archived", not_yet), MachineState::Stopped);
+    }
+
     #[test]
     fn checks_ids() {
         assert!(is_sandbox_id("bx_23456789"));
@@ -1206,6 +1240,7 @@ mod tests {
                 state: "idle".into(),
                 labels,
                 holds_creator_logins: None,
+                hydrated: None,
             }
         };
         let severities = |all: &[Sandbox]| {
@@ -1277,6 +1312,7 @@ mod tests {
                 state: "idle".into(),
                 labels,
                 holds_creator_logins: None,
+                hydrated: None,
             }
         };
         let mut peers = Peers {
@@ -1464,6 +1500,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
             holds_creator_logins: None,
+            hydrated: None,
         };
         let job = JobKey { id: 9, attempt: 3 };
         assert_eq!(sandbox(Some(job)).job(), Some(job));
