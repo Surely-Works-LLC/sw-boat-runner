@@ -44,6 +44,8 @@ pub(super) struct Memory {
     abandoned: HashMap<String, (String, UnixSecs)>,
     /// Job forks already warned about for a `Busy` runner near their TTL.
     ttl_warned: HashSet<String>,
+    /// Machines whose stop boat refuses, already warned about while it does.
+    stop_refused: HashSet<String>,
     /// When each job a listed fork was made for was last seen queued (`decide`'s
     /// `orphaned` times its grace from it).
     queued_seen: HashMap<JobKey, UnixSecs>,
@@ -264,9 +266,20 @@ impl Memory {
             .filter(|r| matches!(r.state, RunnerState::Busy | RunnerState::Registered))
             .map(|r| r.machine.as_str())
             .collect();
+        let mut refused = HashSet::new();
         let mut machines: Vec<Machine> = listed
             .into_iter()
             .map(|(pool, sb)| {
+                if let Some(why) = sb.refused_stop() {
+                    if !self.stop_refused.contains(&sb.id) {
+                        eprintln!(
+                            "warn: boat refuses to stop {} (pool {pool}): {why}; it counts \
+                             as stopping, not capacity, until boat stops it",
+                            sb.id
+                        );
+                    }
+                    refused.insert(sb.id.clone());
+                }
                 let state = sb.machine_state();
                 let job = sb.job();
                 // After a restart nothing records whether an Up fork already had a runner,
@@ -300,6 +313,7 @@ impl Memory {
             })
             .collect();
         self.warm = true;
+        self.stop_refused = refused;
 
         let listing: HashMap<&str, MachineState> =
             machines.iter().map(|m| (m.id.as_str(), m.state)).collect();
@@ -679,6 +693,31 @@ mod tests {
         assert!(!warned(&tick_loop));
         observed(&mut tick_loop, NOW + 3_000);
         assert!(warned(&tick_loop));
+    }
+
+    /// boat refuses to stop a machine with no recent snapshot and keeps it up. It is
+    /// warned about once while boat refuses, gets no runner and holds no box: the queued
+    /// job goes to a fork of a new kept machine.
+    #[test]
+    fn a_machine_whose_stop_boat_refuses_is_not_capacity() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        cfg.pools[0].max_boxes = 1;
+        let fake = crate::transport::fake::Fake::new(|s| {
+            let kept = r#"{"id":"bx_77777777","state":"idle","hydrated":true,
+                "labels":{"sw-boat-runner":"ci"},
+                "stop":{"status":"failing","error":"Refusing archive/stop: no snapshot"}}"#;
+            lagging_reply(s, kept, JOB_70)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let refused = |l: &Loop| l.memory.stop_refused.contains("bx_77777777");
+        let seen = observed(&mut tick_loop, NOW);
+        assert_eq!(seen, [("bx_77777777".to_string(), MachineState::Stopping)]);
+        assert!(refused(&tick_loop));
+        tick_loop.tick(NOW + 15, decide).unwrap();
+        assert!(refused(&tick_loop));
+        assert_eq!(registers(&fake), 0);
+        assert_eq!(forks(&fake).len(), 1);
     }
 
     /// After a restart nothing is known of when the jobs were last queued. An up fork

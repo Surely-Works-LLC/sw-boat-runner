@@ -151,6 +151,20 @@ pub(crate) struct Sandbox {
     /// boat did not say.
     #[serde(default)]
     pub hydrated: Option<bool>,
+    /// The last stop boat was asked for; `None` when there was none or boat did not say.
+    #[serde(default)]
+    pub stop: Option<StopOp>,
+}
+
+/// A stop boat was asked for. boat carries a stop out on its own, and refuses one while
+/// the machine has no recent snapshot; it then keeps the machine up, lists the stop as
+/// `failing` and tries again.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct StopOp {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl Sandbox {
@@ -159,11 +173,25 @@ impl Sandbox {
     /// the copy ends, and a runner started before that never comes online: it would hold
     /// its slot and cover a queued job until `register_timeout_s`. As `Starting` it takes
     /// no runner and covers its slots' jobs, like a machine still booting.
+    ///
+    /// A machine up or starting whose stop boat refuses (`refused_stop`) is `Stopping`: no
+    /// runner goes on it, it covers no job and holds no `max_boxes` box, and the daemon
+    /// does not ask again, as boat retries the stop itself.
     pub(crate) fn machine_state(&self) -> MachineState {
         match machine_state(&self.state) {
+            MachineState::Up | MachineState::Starting if self.refused_stop().is_some() => {
+                MachineState::Stopping
+            }
             MachineState::Up if self.hydrated == Some(false) => MachineState::Starting,
             state => state,
         }
+    }
+
+    /// boat's reason, when it lists the machine's stop as `failing`.
+    pub(crate) fn refused_stop(&self) -> Option<&str> {
+        let stop = self.stop.as_ref()?;
+        (stop.status.as_deref() == Some("failing"))
+            .then(|| stop.error.as_deref().unwrap_or("no reason given"))
     }
 
     /// The job a machine was forked for, from its `JOB_LABEL`; `None` for a kept machine.
@@ -400,7 +428,7 @@ pub(crate) fn machine_state(state: &str) -> MachineState {
     match state {
         "init" | "provisioning" | "provisioned" | "cloning" => MachineState::Starting,
         "ready" | "idle" | "running" => MachineState::Up,
-        "archiving" => MachineState::Stopping,
+        "archiving" | "stopping" => MachineState::Stopping,
         "archived" => MachineState::Stopped,
         "error" | "cancelled" | "deleted" => MachineState::Gone,
         _ => MachineState::Starting,
@@ -1092,6 +1120,7 @@ mod tests {
         assert_eq!(machine_state("ready"), MachineState::Up);
         assert_eq!(machine_state("running"), MachineState::Up);
         assert_eq!(machine_state("archiving"), MachineState::Stopping);
+        assert_eq!(machine_state("stopping"), MachineState::Stopping);
         assert_eq!(machine_state("archived"), MachineState::Stopped);
         assert_eq!(machine_state("cancelled"), MachineState::Gone);
         assert_eq!(machine_state("deleted"), MachineState::Gone);
@@ -1115,6 +1144,31 @@ mod tests {
         assert_eq!(listed("idle", r#","hydrated":true"#), MachineState::Up);
         assert_eq!(listed("idle", ""), MachineState::Up);
         assert_eq!(listed("archived", not_yet), MachineState::Stopped);
+    }
+
+    /// boat refused the stop of `bx_z8tqk4ua` on 2026-11-19 (no recent snapshot) and kept
+    /// it up. It is `Stopping`, not capacity; a stop that went through is history only.
+    #[test]
+    fn a_machine_whose_stop_boat_refuses_is_stopping() {
+        let listed = |stop: &str| {
+            let json =
+                format!(r#"{{"id":"bx_22222222","state":"idle","hydrated":false,"stop":{stop}}}"#);
+            serde_json::from_str::<Sandbox>(&json).unwrap()
+        };
+        let refused = listed(
+            r#"{"status":"failing","error":"Refusing archive/stop: no successful snapshot"}"#,
+        );
+        assert_eq!(refused.machine_state(), MachineState::Stopping);
+        assert_eq!(
+            refused.refused_stop(),
+            Some("Refusing archive/stop: no successful snapshot")
+        );
+        let done = listed(r#"{"status":"completed","error":null}"#);
+        assert_eq!(done.machine_state(), MachineState::Starting);
+        assert_eq!(done.refused_stop(), None);
+        assert_eq!(listed("null").machine_state(), MachineState::Starting);
+        let no_reason = listed(r#"{"status":"failing"}"#);
+        assert_eq!(no_reason.refused_stop(), Some("no reason given"));
     }
 
     #[test]
@@ -1241,6 +1295,7 @@ mod tests {
                 labels,
                 holds_creator_logins: None,
                 hydrated: None,
+                stop: None,
             }
         };
         let severities = |all: &[Sandbox]| {
@@ -1313,6 +1368,7 @@ mod tests {
                 labels,
                 holds_creator_logins: None,
                 hydrated: None,
+                stop: None,
             }
         };
         let mut peers = Peers {
@@ -1501,6 +1557,7 @@ mod tests {
                 .collect(),
             holds_creator_logins: None,
             hydrated: None,
+            stop: None,
         };
         let job = JobKey { id: 9, attempt: 3 };
         assert_eq!(sandbox(Some(job)).job(), Some(job));

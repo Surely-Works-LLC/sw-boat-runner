@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format follows
   with `hydrated: false` counts as starting; one whose snapshot copy never finished stayed
   that way for good, held a `max_boxes` box, covered a queued job and a `min_up` place,
   and was never stopped. Two such machines in one pool ran for a day without a shell.
+- `run` counts a machine whose stop boat refuses (`stop.status` `failing`, as when it has
+  no recent snapshot) as stopping, not as capacity, and logs boat's reason once. Before,
+  the machine stayed `Up`: the daemon sent the stop again, logged `stop ... idle_stop`
+  each time and put new runners on it between tries. boat's `stopping` state also maps
+  to stopping now; as an unknown state it counted as starting and held a box.
 
 ## [0.3.2] - 2026-11-16
 

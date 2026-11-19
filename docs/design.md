@@ -357,9 +357,15 @@ Machine states, mapped from boat's states:
 | - | - |
 | `Starting` | `init`, `provisioning`, `provisioned`, `cloning`, and any state boat adds later |
 | `Up` | `ready`, `idle`, `running` |
-| `Stopping` | `archiving` |
+| `Stopping` | `archiving`, `stopping`, or any up or starting state while boat lists the machine's stop as `failing` |
 | `Stopped` | `archived` |
 | `Gone` | `error`, `cancelled`, `deleted` |
+
+boat refuses to stop a machine that has no recent snapshot. It keeps the machine up,
+lists its `stop` as `failing` with the reason, and tries again on its own. Such a machine
+is `Stopping`: it takes no runner, covers no job and holds no `max_boxes` box, and the
+daemon logs boat's reason once, while the refusal lasts, instead of asking for the stop
+again every tick.
 
 A machine boat lists `ready`, `idle` or `running` with `hydrated: false` is `Starting`. A
 resume or fork is up in seconds but copies its snapshot in for minutes, and boat swaps the
