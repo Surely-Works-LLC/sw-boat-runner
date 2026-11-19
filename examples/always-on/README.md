@@ -153,7 +153,8 @@ and runs.
 ## Any other host
 
 The daemon is one process for one repository. It keeps no database and can be restarted
-at any time. To run it on a host you keep up without `setup`:
+at any time. Set `STATE_DIRECTORY` to a writable directory (systemd's
+`StateDirectory=sw-boat-runner` does) so a restart keeps kept machines' idle clocks. To run it on a host you keep up without `setup`:
 
 ```sh
 cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.3.3

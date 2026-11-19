@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::idle_file::{self, Clock};
 use super::{Error, HTTP_TIMEOUT, Loop};
 use crate::boat::Sandbox;
 use crate::github::{self, GhRunner};
@@ -44,6 +45,11 @@ pub(super) struct Memory {
     abandoned: HashMap<String, (String, UnixSecs)>,
     /// Job forks already warned about for a `Busy` runner near their TTL.
     ttl_warned: HashSet<String>,
+    /// Machines whose stop boat refuses, already warned about while it does.
+    stop_refused: HashSet<String>,
+    /// Idle clocks of kept machines saved by a predecessor (`idle_file`), by id, until
+    /// each machine is first seen.
+    saved_clocks: HashMap<String, Clock>,
     /// When each job a listed fork was made for was last seen queued (`decide`'s
     /// `orphaned` times its grace from it).
     queued_seen: HashMap<JobKey, UnixSecs>,
@@ -60,6 +66,8 @@ pub(super) struct Memory {
 }
 
 struct Seen {
+    /// Not forked for a job.
+    kept: bool,
     state: MachineState,
     since: UnixSecs,
     last_busy: UnixSecs,
@@ -126,6 +134,26 @@ impl Memory {
         if let Some(seen) = self.machines.get_mut(machine) {
             seen.last_busy = now;
         }
+    }
+
+    /// Takes the idle clocks a predecessor saved; see `idle_file`.
+    pub(super) fn restore_clocks(&mut self, clocks: HashMap<String, Clock>) {
+        self.saved_clocks = clocks;
+    }
+
+    /// The idle clocks of the kept machines up now, for `idle_file`.
+    pub(super) fn idle_clocks(&self) -> String {
+        let up = self
+            .machines
+            .iter()
+            .filter(|(_, seen)| seen.kept && seen.state == MachineState::Up);
+        idle_file::format(up.map(|(id, seen)| {
+            let clock = Clock {
+                since: seen.since,
+                last_busy: seen.last_busy,
+            };
+            (id.as_str(), clock)
+        }))
     }
 
     /// Notes a runner whose start failed after GitHub issued its jit config. While GitHub
@@ -264,9 +292,20 @@ impl Memory {
             .filter(|r| matches!(r.state, RunnerState::Busy | RunnerState::Registered))
             .map(|r| r.machine.as_str())
             .collect();
+        let mut refused = HashSet::new();
         let mut machines: Vec<Machine> = listed
             .into_iter()
             .map(|(pool, sb)| {
+                if let Some(why) = sb.refused_stop() {
+                    if !self.stop_refused.contains(&sb.id) {
+                        eprintln!(
+                            "warn: boat refuses to stop {} (pool {pool}): {why}; it counts \
+                             as stopping, not capacity, until boat stops it",
+                            sb.id
+                        );
+                    }
+                    refused.insert(sb.id.clone());
+                }
                 let state = sb.machine_state();
                 let job = sb.job();
                 // After a restart nothing records whether an Up fork already had a runner,
@@ -274,10 +313,18 @@ impl Memory {
                 // fork that never had one wastes its start. Otherwise, just before first
                 // sight, so it has not.
                 let used = !self.warm && job.is_some() && state == MachineState::Up;
+                // A kept machine still up keeps the clocks a predecessor saved for it.
+                let saved = self.saved_clocks.remove(&sb.id);
+                let saved = saved.filter(|_| job.is_none() && state == MachineState::Up);
                 let seen = self.machines.entry(sb.id.clone()).or_insert(Seen {
+                    kept: job.is_none(),
                     state,
-                    since: now,
-                    last_busy: if used { now } else { now.saturating_sub(1) },
+                    since: saved.map_or(now, |c| c.since.min(now)),
+                    last_busy: match saved {
+                        Some(c) => c.last_busy.min(now.saturating_sub(1)),
+                        None if used => now,
+                        None => now.saturating_sub(1),
+                    },
                     holds_logins: false,
                 });
                 if seen.state != state {
@@ -300,6 +347,7 @@ impl Memory {
             })
             .collect();
         self.warm = true;
+        self.stop_refused = refused;
 
         let listing: HashMap<&str, MachineState> =
             machines.iter().map(|m| (m.id.as_str(), m.state)).collect();
@@ -424,6 +472,8 @@ impl Loop<'_> {
         }
         self.memory.saw_queued(self.cfg, now, &queued);
         let machines = self.memory.machines(now, lag_s, listed, &runners);
+        let clocks = self.memory.idle_clocks();
+        self.idle_file.save(&clocks);
         let limits = Limits {
             can_start: quote.allows && self.ledger.starts_open(now),
             next_start_cents: quote.cents,
@@ -464,7 +514,7 @@ mod tests {
     use super::super::testkit::*;
     use super::*;
     use crate::decide::decide;
-    use crate::model::Placement;
+    use crate::model::{Action, Placement};
 
     fn queued(ids: &[u64]) -> Vec<crate::model::QueuedJob> {
         ids.iter()
@@ -679,6 +729,76 @@ mod tests {
         assert!(!warned(&tick_loop));
         observed(&mut tick_loop, NOW + 3_000);
         assert!(warned(&tick_loop));
+    }
+
+    /// boat refuses to stop a machine with no recent snapshot and keeps it up. It is
+    /// warned about once while boat refuses, gets no runner and holds no box: the queued
+    /// job goes to a fork of a new kept machine.
+    #[test]
+    fn a_machine_whose_stop_boat_refuses_is_not_capacity() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        cfg.pools[0].max_boxes = 1;
+        let fake = crate::transport::fake::Fake::new(|s| {
+            let kept = r#"{"id":"bx_77777777","state":"idle","hydrated":true,
+                "labels":{"sw-boat-runner":"ci"},
+                "stop":{"status":"failing","error":"Refusing archive/stop: no snapshot"}}"#;
+            lagging_reply(s, kept, JOB_70)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let refused = |l: &Loop| l.memory.stop_refused.contains("bx_77777777");
+        let seen = observed(&mut tick_loop, NOW);
+        assert_eq!(seen, [("bx_77777777".to_string(), MachineState::Stopping)]);
+        assert!(refused(&tick_loop));
+        tick_loop.tick(NOW + 15, decide).unwrap();
+        assert!(refused(&tick_loop));
+        assert_eq!(registers(&fake), 0);
+        assert_eq!(forks(&fake).len(), 1);
+    }
+
+    /// A kept machine busy before a restart keeps its idle clock through the restart when
+    /// the clocks are saved, so it stops `idle_stop_s` after its last job, not after the
+    /// restart. Without the file the clock starts over.
+    #[test]
+    fn a_restart_keeps_saved_idle_clocks() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        let kept = r#"{"id":"bx_77777777","state":"idle","hydrated":true,
+            "labels":{"sw-boat-runner":"ci"}}"#;
+        let busy = crate::transport::fake::Fake::new(move |s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                let body = r#"{"total_count":1,"runners":[
+                    {"id":15,"name":"sbr-ci-bx_77777777-0-900","status":"online","busy":true}]}"#;
+                return crate::transport::fake::respond(200, &[], body);
+            }
+            lagging_reply(s, kept, "")
+        });
+        let idle = crate::transport::fake::Fake::new(move |s| lagging_reply(s, kept, ""));
+        let dir = std::env::temp_dir().join(format!("sbr-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idle-clocks.tsv");
+        let _ = std::fs::remove_file(&path);
+
+        let mut before = started(&cfg, &busy);
+        before.idle_file = idle_file::IdleFile::at(Some(path.clone()));
+        before.observe(NOW).unwrap();
+
+        let later = NOW + cfg.pools[0].idle_stop_s;
+        let stops_after_restart = |file: Option<std::path::PathBuf>| {
+            let mut after = started(&cfg, &idle);
+            after.idle_file = idle_file::IdleFile::at(file);
+            let clocks = after.idle_file.load();
+            after.memory.restore_clocks(clocks);
+            let snap = after.observe(later).unwrap().snapshot;
+            let busy_at: Vec<UnixSecs> = snap.machines.iter().map(|m| m.last_busy).collect();
+            let stops = decide(&snap, &cfg.pools[0]);
+            (
+                busy_at,
+                stops.iter().any(|a| matches!(a, Action::Stop { .. })),
+            )
+        };
+        assert_eq!(stops_after_restart(Some(path)), (vec![NOW], true));
+        assert_eq!(stops_after_restart(None), (vec![later - 1], false));
     }
 
     /// After a restart nothing is known of when the jobs were last queued. An up fork

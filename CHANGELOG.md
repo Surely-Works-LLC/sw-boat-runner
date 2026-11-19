@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `run` saves each kept up machine's idle clock to `idle-clocks.tsv` in
+  `STATE_DIRECTORY` and takes it back after a restart. Before, a restart counted every
+  machine as busy a moment ago, so each restart kept every idle machine up a further
+  `idle_stop_s`. `setup`'s unit sets `StateDirectory=sw-boat-runner`; an existing unit
+  needs that line added (`systemctl edit sw-boat-runner`), or the clocks start over as
+  before.
+
+### Fixed
+
+- `run` counts a machine whose stop boat refuses (`stop.status` `failing`, as when it has
+  no recent snapshot) as stopping, not as capacity, and logs boat's reason once. Before,
+  the machine stayed `Up`: the daemon sent the stop again, logged `stop ... idle_stop`
+  each time and put new runners on it between tries. boat's `stopping` state also maps
+  to stopping now; as an unknown state it counted as starting and held a box.
+
 ## [0.3.3] - 2026-11-19
 
 ### Fixed

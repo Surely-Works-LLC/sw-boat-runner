@@ -213,7 +213,14 @@ The daemon keeps a few facts in memory only: when each machine changed state and
 a busy or registered runner, which runners it has seen online, the forks boat has not
 listed yet, the cents spent on starts today, the time before which it makes no start, and
 the GitHub request budget with the last read of each in-progress run's jobs.
-A machine first seen counts as never busy, which can only delay a stop. The rules below
+A machine first seen counts as busy a moment ago, which can only delay a stop. One fact
+can outlive a restart: when `STATE_DIRECTORY` is set (systemd's `StateDirectory=`, which
+`setup`'s unit sets), the daemon saves each kept `Up` machine's `since` and `last_busy` to
+`idle-clocks.tsv` there after every observe that changes them, and a restarted daemon
+takes them back for a machine it first sees still `Up`. Without it every restart kept
+every idle machine up a further `idle_stop_s`. Only the stop timer reads these clocks,
+and `Stop` still needs GitHub to list no `Busy` or `Registered` runner, so a stale file
+can stop an idle machine early or late but never one that runs a job. The rules below
 keep the daemon safe on a stale snapshot and across a restart. Each is a `Fix*` flag in
 `spec/BoatRunner.tla`, and [spec/README.md](../spec/README.md#fix-flags) describes the
 counterexample TLC finds without it.
@@ -357,9 +364,15 @@ Machine states, mapped from boat's states:
 | - | - |
 | `Starting` | `init`, `provisioning`, `provisioned`, `cloning`, and any state boat adds later |
 | `Up` | `ready`, `idle`, `running` |
-| `Stopping` | `archiving` |
+| `Stopping` | `archiving`, `stopping`, or any up or starting state while boat lists the machine's stop as `failing` |
 | `Stopped` | `archived` |
 | `Gone` | `error`, `cancelled`, `deleted` |
+
+boat refuses to stop a machine that has no recent snapshot. It keeps the machine up,
+lists its `stop` as `failing` with the reason, and tries again on its own. Such a machine
+is `Stopping`: it takes no runner, covers no job and holds no `max_boxes` box, and the
+daemon logs boat's reason once, while the refusal lasts, instead of asking for the stop
+again every tick.
 
 A machine boat lists `ready`, `idle` or `running` with `hydrated: false` is `Starting`. A
 resume or fork is up in seconds but copies its snapshot in for minutes, and boat swaps the

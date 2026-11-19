@@ -1541,6 +1541,8 @@ RestartSec=30
 # default KillSignal).
 TimeoutStopSec=300
 DynamicUser=yes
+# Keeps kept machines' idle clocks across a restart ($STATE_DIRECTORY/idle-clocks.tsv).
+StateDirectory=sw-boat-runner
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 ProtectSystem=strict
@@ -2194,6 +2196,7 @@ mod tests {
             for line in [
                 "EnvironmentFile=/etc/sw-boat-runner/env",
                 "DynamicUser=yes",
+                "StateDirectory=sw-boat-runner",
                 "NoNewPrivileges=yes",
                 "CapabilityBoundingSet=",
                 "ProtectSystem=strict",

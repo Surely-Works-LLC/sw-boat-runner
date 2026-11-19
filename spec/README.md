@@ -68,6 +68,13 @@ wait, and the 60 s retirement of a job fork whose job left the queue.
   not modelled.
 - A stopped or deleted machine requeues its running job, where GitHub fails it. Either
   way the job leaves the runner.
+- Saved idle clocks. With `STATE_DIRECTORY` set, a kept `Up` machine's `since` and
+  `last_busy` survive a crash. The model's crash always loses them, which only delays
+  stops; `NoBusyStop` rests on the runner states, not on `last_busy`.
+- Machines that never boot and refused stops. `Boot` is weakly fair, so no machine stays
+  `Starting`, and boat carries out every stop. The daemon's rules for a kept machine
+  `Starting` past `STUCK_START_S` and for a stop boat lists as `failing` (the machine
+  counts as `Stopping`) handle faults the model does not have.
 - The daemon registers within a tick and GitHub assigns within seconds, so a machine
   that could serve a queued job does not age into `idle` or past `register_timeout_s`.
 
