@@ -1434,37 +1434,28 @@ mod attest_tests {
     use super::ATTEST_TOKEN;
     use std::process::Command;
 
-    /// `ATTEST_TOKEN` in bash with `env`: SBR_ATTEST_TOKEN, then whether GH_TOKEN and
-    /// GITHUB_TOKEN are left.
-    fn moved(env: &[(&str, &str)]) -> String {
+    fn check_moved(env: &[(&str, &str)], expected: &str) {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(format!(
-                "set -u\n{ATTEST_TOKEN}echo \"$SBR_ATTEST_TOKEN ${{GH_TOKEN-unset}} \
-                 ${{GITHUB_TOKEN-unset}}\"; bash -c 'echo \"child $SBR_ATTEST_TOKEN\"'"
+                r#"set -eu
+{ATTEST_TOKEN}test "$SBR_ATTEST_TOKEN" = "$1"
+test -z "${{GH_TOKEN+x}}${{GITHUB_TOKEN+x}}"
+bash -eu -c 'test "$SBR_ATTEST_TOKEN" = "$1"' bash "$1""#
             ))
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("SBR_ATTEST_TOKEN");
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let out = cmd.output().unwrap();
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap()
+            .arg("bash")
+            .arg(expected)
+            .env_clear()
+            .envs(env.iter().copied());
+        // A failed token comparison must not print the value or child output.
+        assert!(cmd.output().unwrap().status.success());
     }
 
     #[test]
     fn the_machines_token_is_kept_only_for_the_attestation() {
-        assert_eq!(
-            moved(&[("GH_TOKEN", "gh"), ("GITHUB_TOKEN", "github")]),
-            "gh unset unset\nchild gh\n"
-        );
-        assert_eq!(
-            moved(&[("GITHUB_TOKEN", "github")]),
-            "github unset unset\nchild github\n"
-        );
-        assert_eq!(moved(&[("GH_TOKEN", "gh")]), "gh unset unset\nchild gh\n");
-        assert_eq!(moved(&[]), " unset unset\nchild \n");
+        check_moved(&[("GH_TOKEN", "gh"), ("GITHUB_TOKEN", "github")], "gh");
+        check_moved(&[("GITHUB_TOKEN", "github")], "github");
+        check_moved(&[("GH_TOKEN", "gh")], "gh");
+        check_moved(&[], "");
     }
 }
