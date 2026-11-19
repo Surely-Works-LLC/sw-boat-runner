@@ -69,7 +69,7 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     let slots = pool.slots_per_box as usize;
     let mut short = v.short();
     let mut starts = 0;
-    for m in v.kept(Stopped) {
+    for m in v.kept(Stopped).filter(|m| !deleted.contains(m.id.as_str())) {
         if !v.resume(want, short) || !v.start(&mut starts) {
             break;
         }
@@ -132,15 +132,18 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
 
 /// Why `decide` deletes each machine of `pool` it deletes, for the log: `finished`,
 /// `ttl` or `orphaned` for a job's fork; `no_resume` for a stopped kept machine of a pool
-/// without `resume`, and `no_slot` for a kept machine up or starting in a pool without
-/// `slot`. Reads the same guard as `decide`, so the two cannot disagree.
+/// without `resume`, `surplus` for one above `max_boxes` in a pool with `resume`, and
+/// `no_slot` for a kept machine up or starting in a pool without `slot`. Reads the same
+/// guard as `decide`, so the two cannot disagree.
 pub fn delete_reasons<'a>(snap: &'a Snapshot, pool: &'a Pool) -> Vec<(&'a str, &'static str)> {
     let v = View::new(snap, pool);
     let deleted = v.machines.iter().filter(|m| v.delete(m));
     deleted
         .map(|m| {
             let why = if !m.is_ephemeral() {
-                if m.state == Stopped {
+                if m.state == Stopped && pool.has(Resume) {
+                    "surplus"
+                } else if m.state == Stopped {
                     "no_resume"
                 } else if v.stuck(m) && pool.has(Slot) {
                     "stuck_start"
@@ -174,6 +177,8 @@ struct View<'a> {
     boxes: usize,
     /// The pool's job forks deleted as `orphaned`, by id.
     orphans: Vec<&'a str>,
+    /// The pool's stopped kept machines deleted as `surplus`, by id.
+    surplus: Vec<&'a str>,
 }
 
 impl<'a> View<'a> {
@@ -193,6 +198,7 @@ impl<'a> View<'a> {
         let boxes = machines.iter().filter(|m| matches!(m.state, Up | Starting));
         let mut v = View {
             orphans: Vec::new(),
+            surplus: Vec::new(),
             boxes: boxes.count(),
             snap,
             pool,
@@ -202,6 +208,7 @@ impl<'a> View<'a> {
             jobs,
         };
         v.orphans = v.orphans();
+        v.surplus = v.surplus();
         v
     }
 
@@ -272,7 +279,10 @@ impl<'a> View<'a> {
                 && (self.finished(m) || expired || self.orphaned(m))
         } else {
             match m.state {
-                Stopped => !self.pool.has(Resume) && !holds(on, &[Busy]),
+                Stopped => {
+                    let unused = !self.pool.has(Resume) || self.surplus.contains(&m.id.as_str());
+                    unused && !holds(on, &[Busy])
+                }
                 Up | Starting => {
                     let stuck = self.stuck(m) && !self.pool.has(Resume);
                     (!self.pool.has(Slot) && !holds(on, &[Busy, Registered])) || stuck
@@ -348,6 +358,36 @@ impl<'a> View<'a> {
             .count();
         let spare = free.saturating_sub(self.jobs.len());
         candidates.map(|m| m.id.as_str()).take(spare).collect()
+    }
+
+    /// Stopped kept machines above `max_boxes` in a pool with `resume`, while the pool
+    /// has no demand: the highest ids first, as `Resume` takes the lowest first. A warm
+    /// pool keeps every machine it forks, so without this its kept set stays at the
+    /// largest it ever reached: above a lowered `max_boxes`, and one above it when a
+    /// machine whose stop boat refused, which holds no box, made room for another. The
+    /// count leaves out kept `Stopping` machines, which may come back `Stopped`, so the
+    /// stopped machines left are at least the resumes `max_boxes` allows. With no demand,
+    /// no tick deletes a machine and forks a new one for the same job.
+    fn surplus(&self) -> Vec<&'a str> {
+        if !self.pool.has(Resume) {
+            return Vec::new();
+        }
+        let unregistered = self.runners.iter().filter(|r| self.unregister(r));
+        let unregistered = unregistered.map(|r| r.name.as_str()).collect();
+        if self.demand(&unregistered) > 0 {
+            return Vec::new();
+        }
+        let held: usize = [Up, Starting, Stopped]
+            .into_iter()
+            .map(|s| self.kept(s).count())
+            .sum();
+        let over = held.saturating_sub(self.pool.max_boxes as usize);
+        let stopped: Vec<&'a Machine> = self.kept(Stopped).collect();
+        let idle = stopped
+            .into_iter()
+            .rev()
+            .filter(|m| !holds(self.on(m), &[Busy]));
+        idle.take(over).map(|m| m.id.as_str()).collect()
     }
 
     fn orphaned(&self, m: &Machine) -> bool {
@@ -632,6 +672,56 @@ mod tests {
             decide(&busy, &pool("pool", "min_up = 0")),
             std::slice::from_ref(&unregister)
         );
+    }
+
+    /// A warm pool kept every machine it forked, so a burst, or a lowered `max_boxes`, left
+    /// stopped machines above `max_boxes` that nothing deleted.
+    #[test]
+    fn a_pool_with_resume_deletes_stopped_kept_machines_above_max_boxes() {
+        let stopped = |ids: &[&str]| ids.iter().map(|id| machine(id, Ms::Stopped)).collect();
+        // max_boxes is 3: the two highest ids go, as resume takes the lowest first.
+        let p = pool("warm", "");
+        let s = snap(stopped(&["m1", "m2", "m3", "m4", "m5"]), vec![], &[]);
+        assert_eq!(decide(&s, &p), [delete("m4"), delete("m5")]);
+        assert_eq!(
+            delete_reasons(&s, &p),
+            [("m4", "surplus"), ("m5", "surplus")]
+        );
+        assert_eq!(
+            decide(&s, &pool("hybrid", "")),
+            [delete("m4"), delete("m5")]
+        );
+
+        // Up and starting kept machines count; the deletes come from the stopped ones.
+        let mut machines = stopped(&["m2", "m3", "m4"]);
+        machines.extend([starting("m1"), starting("m5")]);
+        let s = snap(machines, vec![], &[]);
+        assert_eq!(decide(&s, &p), [delete("m3"), delete("m4")]);
+
+        // At max_boxes nothing goes.
+        let s = snap(stopped(&["m1", "m2", "m3"]), vec![], &[]);
+        assert_eq!(decide(&s, &p), NOTHING);
+
+        // A stopping machine may come back stopped, so it does not count yet.
+        let mut machines = stopped(&["m2", "m3", "m4", "m5"]);
+        machines.push(machine("m1", Ms::Stopping));
+        assert_eq!(decide(&snap(machines, vec![], &[]), &p), [delete("m5")]);
+    }
+
+    /// While a job waits, a surplus machine may be the one its resume takes, so nothing goes.
+    #[test]
+    fn a_pool_with_demand_keeps_its_surplus_stopped_machines() {
+        let p = pool("warm", "");
+        let machines = ["m1", "m2", "m3", "m4"].map(|id| machine(id, Ms::Stopped));
+        let s = snap(machines.to_vec(), vec![], &[1]);
+        assert_eq!(decide(&s, &p), [resume("m1")]);
+
+        // A busy runner on a stopped machine keeps it.
+        let s = snap(machines.to_vec(), vec![runner("m4", 0, Rs::Busy)], &[]);
+        let unregister = Action::Unregister {
+            runner: s.runners[0].name.clone(),
+        };
+        assert_eq!(decide(&s, &p), [unregister, delete("m3")]);
     }
 
     /// A pool switched to `fork` keeps kept machines that no step would use again.

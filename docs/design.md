@@ -200,6 +200,12 @@ carries the label `sw-boat-runner-job=<job id>-<attempt>`, which `decide` matche
 at most one fork per job. A kept machine is forked with no job label to bring the pool up
 to `min_up`, or, in a pool with `resume` and no `fork`, for demand that no stopped machine
 covers. A kept machine gets boat's longest TTL, 30 days, after which boat archives it.
+A pool with `resume` deletes its stopped kept machines above `max_boxes` once no job
+waits, highest ids first, as `Resume` takes the lowest first. Without this the kept set
+stayed at the largest it ever reached: a burst, a lowered `max_boxes`, or a machine whose
+stop boat refused (it holds no box, so another took its place) left stopped machines that
+no tick resumed or deleted. Kept `Stopping` machines are not counted, since they may come
+back `Stopped`.
 boat may delete the disk of a machine that has been stopped for 14 days. A `Resume` of one
 fails with `409 snapshot_data_expired`; the daemon then deletes the machine, and the pool
 forks a new one if it still needs it.
@@ -403,7 +409,7 @@ process saw it online is `Registered` until that timeout.
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops; or a kept machine stuck `Starting` (below) in a pool with `resume`, whatever the demand |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use; or a kept machine stuck `Starting` in a pool without `resume` |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or, in a pool with `resume` and no demand, a `Stopped` kept machine with no `Busy` runner while kept `Up`, `Starting` and `Stopped` machines number more than `max_boxes`, highest ids first (`surplus`); or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use; or a kept machine stuck `Starting` in a pool without `resume` |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that the pool's listing does not show `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, each id and
