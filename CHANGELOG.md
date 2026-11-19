@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-19
+
 ### Fixed
 
 - `run` stops a kept machine that has been starting for an hour, or deletes it in a pool
@@ -330,7 +332,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...v0.3.0
