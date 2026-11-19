@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `run` saves each kept up machine's idle clock to `idle-clocks.tsv` in
+  `STATE_DIRECTORY` and takes it back after a restart. Before, a restart counted every
+  machine as busy a moment ago, so each restart kept every idle machine up a further
+  `idle_stop_s`. `setup`'s unit sets `StateDirectory=sw-boat-runner`; an existing unit
+  needs that line added (`systemctl edit sw-boat-runner`), or the clocks start over as
+  before.
+
 ### Fixed
 
 - `run` stops a kept machine that has been starting for an hour, or deletes it in a pool

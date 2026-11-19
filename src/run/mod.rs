@@ -10,6 +10,7 @@
 //! (docs/design.md#start-budget).
 
 mod act;
+mod idle_file;
 mod observe;
 mod script;
 #[cfg(test)]
@@ -489,6 +490,8 @@ pub struct Loop<'a> {
     log: Box<dyn Write>,
     /// When the summary line was last logged; see `SUMMARY_LOG_S`.
     summary_logged: Option<UnixSecs>,
+    /// Where kept machines' idle clocks outlive a restart; see `idle_file`.
+    idle_file: idle_file::IdleFile,
 }
 
 #[derive(Clone)]
@@ -516,11 +519,14 @@ impl<'a> Loop<'a> {
     ) -> Self {
         // A predecessor's forks may show up for `list_lag_s` after this start.
         let grace = Duration::from_secs(list_lag_s(cfg));
+        let mut idle_file = idle_file::IdleFile::from_env();
+        let mut memory = observe::Memory::new(now);
+        memory.restore_clocks(idle_file.load());
         Loop {
             cfg,
             boat: boat::Client::new(t, boat_key).for_repo(&cfg.repo, daemon_id(now), grace),
             gh: github::Client::new(t, github, cfg.repo.clone()),
-            memory: observe::Memory::new(now),
+            memory,
             ledger: act::Ledger::new(cfg, now),
             read_jobs: true,
             paced_logged: None,
@@ -533,6 +539,7 @@ impl<'a> Loop<'a> {
             last_observe: None,
             log: Box::new(Stderr),
             summary_logged: None,
+            idle_file,
         }
     }
 
