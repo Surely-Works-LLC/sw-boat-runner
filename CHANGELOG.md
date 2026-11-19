@@ -17,16 +17,21 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- `run` stops a kept machine that has been starting for an hour, or deletes it in a pool
-  without `resume`, and no longer counts it as capacity. Since 0.3.2 a machine boat lists
-  with `hydrated: false` counts as starting; one whose snapshot copy never finished stayed
-  that way for good, held a `max_boxes` box, covered a queued job and a `min_up` place,
-  and was never stopped. Two such machines in one pool ran for a day without a shell.
 - `run` counts a machine whose stop boat refuses (`stop.status` `failing`, as when it has
   no recent snapshot) as stopping, not as capacity, and logs boat's reason once. Before,
   the machine stayed `Up`: the daemon sent the stop again, logged `stop ... idle_stop`
   each time and put new runners on it between tries. boat's `stopping` state also maps
   to stopping now; as an unknown state it counted as starting and held a box.
+
+## [0.3.3] - 2026-11-19
+
+### Fixed
+
+- `run` stops a kept machine that has been starting for an hour, or deletes it in a pool
+  without `resume`, and no longer counts it as capacity. Since 0.3.2 a machine boat lists
+  with `hydrated: false` counts as starting; one whose snapshot copy never finished stayed
+  that way for good, held a `max_boxes` box, covered a queued job and a `min_up` place,
+  and was never stopped. Two such machines in one pool ran for a day without a shell.
 
 ## [0.3.2] - 2026-11-16
 
@@ -344,7 +349,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.2.0...v0.3.0
