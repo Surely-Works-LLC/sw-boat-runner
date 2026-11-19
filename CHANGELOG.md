@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `run` stops a kept machine that has been starting for an hour, or deletes it in a pool
+  without `resume`, and no longer counts it as capacity. Since 0.3.2 a machine boat lists
+  with `hydrated: false` counts as starting; one whose snapshot copy never finished stayed
+  that way for good, held a `max_boxes` box, covered a queued job and a `min_up` place,
+  and was never stopped. Two such machines in one pool ran for a day without a shell.
+
 ## [0.3.2] - 2026-11-16
 
 ### Fixed
