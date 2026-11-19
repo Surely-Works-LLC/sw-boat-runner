@@ -106,7 +106,9 @@ pub(super) fn reply(s: &Sent) -> Response {
         ("GET", u) if u.contains("status=queued") => {
             r#"{"workflow_runs":[{"id":5,"run_attempt":1}]}"#
         }
-        ("GET", u) if u.contains("status=in_progress") => r#"{"workflow_runs":[]}"#,
+        ("GET", u) if u.contains("status=in_progress") || u.contains("status=pending") => {
+            r#"{"workflow_runs":[]}"#
+        }
         ("GET", u) if u.contains("/runs/5/jobs") => {
             r#"{"jobs":[{"id":70,"run_attempt":1,"status":"queued","labels":["self-hosted","large"]}]}"#
         }
@@ -139,6 +141,19 @@ pub(super) fn requests(fake: &Fake) -> Vec<String> {
         .iter()
         .map(|s| format!("{} {}", s.method, s.url))
         .collect()
+}
+
+/// The reads that start an observation of one pool with one queued run.
+pub(super) fn observe_requests() -> [String; 7] {
+    [
+        format!("GET {BOAT}/sandboxes?label=sw-boat-runner%3Dci&limit=200"),
+        format!("GET {GH}/runners?per_page=100&page=1"),
+        format!("GET {GH}/runs?status=pending&per_page=100"),
+        format!("GET {GH}/runs?status=queued&per_page=100"),
+        format!("GET {GH}/runs/5/jobs?per_page=100"),
+        format!("GET {GH}/runs?status=in_progress&per_page=100"),
+        format!("GET {BOAT}/limits"),
+    ]
 }
 
 pub(super) fn forks(fake: &Fake) -> Vec<Sent> {

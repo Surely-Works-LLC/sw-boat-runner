@@ -37,6 +37,8 @@ const BURST_MIN: f64 = 50.0;
 /// While the budget allows, an in-progress run's jobs are read at least this often, even
 /// when the run looks unchanged.
 pub(crate) const RUN_MAX_AGE_S: u64 = 60;
+/// Back off discovery of pending runs while none have a job a pool can serve.
+const PENDING_RECHECK_S: u64 = 120;
 /// However low the budget, the daemon observes at least this often while GitHub still
 /// answers, so cleanup goes on.
 pub(crate) const PACE_MAX_S: u64 = 300;
@@ -338,6 +340,7 @@ pub(crate) struct Client<'t> {
     budget: Budget,
     /// In-progress runs by id.
     runs: HashMap<u64, RunJobs>,
+    next_pending_read: UnixSecs,
     /// The cache was aged since `begin_tick`. Aging waits for the tick's first request, so
     /// a tick that sends nothing, such as one the budget skips, keeps every ETag.
     aged: bool,
@@ -369,6 +372,7 @@ impl<'t> Client<'t> {
                 observed: None,
             },
             runs: HashMap::new(),
+            next_pending_read: 0,
             aged: true,
             elapsed: {
                 let origin = std::time::Instant::now();
@@ -699,13 +703,13 @@ impl<'t> Client<'t> {
             .collect())
     }
 
-    /// Queued jobs of the queued and the in-progress runs, up to `MAX_PAGES` pages of
-    /// each list; an in-progress run still queues its later jobs. `wanted` tells whether a
-    /// pool serves a job's labels.
+    /// Queued jobs of pending, queued, and in-progress runs, up to `MAX_PAGES` pages
+    /// per list. `wanted` tells whether a pool serves a job's labels.
     ///
-    /// A queued run's jobs are read every call; they rarely change, so most reads are
-    /// free 304s. A run in both lists, because it started between them, is read once. An in-progress run's jobs change with every step, so they are read when
-    /// they can matter:
+    /// Queued runs are read every call. Pending runs are read as often while there is
+    /// work for a pool, then at the first observation after `PENDING_RECHECK_S`.
+    /// A run that moves between lists is read once. In-progress runs can queue later
+    /// jobs, so their jobs are read when they can matter:
     /// - every call, while the run is new or re-run, or its last read found a queued job
     ///   a pool serves, so a job another runner took drops out at once;
     /// - with a budget token, when the run's `updated_at` changed since its last read, or
@@ -727,11 +731,23 @@ impl<'t> Client<'t> {
             updated_at: String,
         }
         let mut out = BTreeMap::new();
+        let mut read = HashSet::new();
+        // GitHub can report the parent as pending while its jobs already wait for runners.
+        if self.now >= self.next_pending_read {
+            let first = format!("/actions/runs?status=pending&per_page={PER_PAGE}");
+            let pending: Vec<Run> = self.list(&first, "workflow_runs")?;
+            for run in pending {
+                if read.insert(run.id) {
+                    out.extend(self.run_jobs(run.id)?);
+                }
+            }
+            if !out.values().any(|labels| wanted(labels)) {
+                self.next_pending_read = self.now.saturating_add(PENDING_RECHECK_S);
+            }
+        }
         let first = format!("/actions/runs?status=queued&per_page={PER_PAGE}");
         let queued: Vec<Run> = self.list(&first, "workflow_runs")?;
-        let mut read = HashSet::new();
         for run in queued {
-            // A run that moved up a page while the list was read shows up twice.
             if read.insert(run.id) {
                 out.extend(self.run_jobs(run.id)?);
             }
@@ -739,7 +755,7 @@ impl<'t> Client<'t> {
 
         let first = format!("/actions/runs?status=in_progress&per_page={PER_PAGE}");
         let mut runs: Vec<Run> = self.list(&first, "workflow_runs")?;
-        // A run that started between the two lists was just read as queued.
+        // A run that started between reads may already have been observed.
         runs.retain(|r| read.insert(r.id));
         let listed: HashSet<u64> = runs.iter().map(|r| r.id).collect();
         self.runs.retain(|id, _| listed.contains(id));
@@ -979,7 +995,9 @@ mod tests {
     #[test]
     fn queued_jobs_from_runs() {
         let fake = Fake::new(|s| {
-            let body = if s.url.contains("status=queued") {
+            let body = if s.url.contains("status=pending") {
+                json!({"workflow_runs": []})
+            } else if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5, "run_attempt": 2}]})
             } else if s.url.contains("status=in_progress") {
                 // Run 5 started between the two lists, so both have it.
@@ -1018,6 +1036,64 @@ mod tests {
             .filter(|s| s.url.contains("/runs/5/jobs"))
             .count();
         assert_eq!(run_5, 1);
+    }
+
+    #[test]
+    fn pending_runs_can_have_queued_jobs() {
+        let arrived = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ready = arrived.clone();
+        let moved = std::cell::Cell::new(false);
+        let fake = Fake::new(move |s| {
+            let body = if s.url.contains("status=pending") {
+                if ready.get() {
+                    moved.set(true);
+                    json!({"workflow_runs": [{"id": 7}, {"id": 8}, {"id": 9}]})
+                } else {
+                    moved.set(false);
+                    json!({"workflow_runs": []})
+                }
+            } else if s.url.contains("status=queued") {
+                json!({"workflow_runs": []})
+            } else if s.url.contains("status=in_progress") {
+                // Run 9 moved after the pending list was read.
+                json!({"workflow_runs": moved.get().then_some(json!({"id": 9})).as_slice()})
+            } else if s.url.contains("/runs/8/jobs") {
+                json!({"jobs": []})
+            } else {
+                let id = if s.url.contains("/runs/7/jobs") {
+                    70
+                } else {
+                    90
+                };
+                json!({"jobs": [{"id": id, "run_attempt": 1, "status": "queued", "labels": ["self-hosted", "large"]}]})
+            };
+            respond(200, &[], &body.to_string())
+        });
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        gh.begin_tick(T0);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+        arrived.set(true);
+        gh.begin_tick(T0 + PENDING_RECHECK_S - 1);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+
+        gh.begin_tick(T0 + PENDING_RECHECK_S);
+        let jobs = gh.queued_jobs(&|_| true).unwrap();
+        assert_eq!(
+            jobs,
+            [70, 90].map(|id| QueuedJob {
+                key: JobKey { id, attempt: 1 },
+                labels: vec!["self-hosted".into(), "large".into()],
+            })
+        );
+        let sent = fake.sent();
+        for run in [7, 8, 9] {
+            let path = jobs_path(run);
+            assert_eq!(sent.iter().filter(|s| s.url.contains(&path)).count(), 1);
+        }
+
+        arrived.set(false);
+        gh.begin_tick(T0 + PENDING_RECHECK_S + 1);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
     }
 
     #[test]
@@ -1162,7 +1238,7 @@ mod tests {
                     return respond(201, &[], body);
                 }
                 let mut st = st.borrow_mut();
-                let body = if s.url.contains("status=queued") {
+                let body = if s.url.contains("status=queued") || s.url.contains("status=pending") {
                     json!({"workflow_runs": []})
                 } else if s.url.contains("status=in_progress") {
                     let list: Vec<Value> = (1..=runs)
@@ -1415,8 +1491,8 @@ mod tests {
             assert!(!reads.is_empty());
             assert!(reads.iter().all(|&etag| etag), "{reads:?}");
         }
-        // The first observe's 32 reads count; the 304s after it do not.
-        assert_eq!(busy.state.borrow().left, 450 - 32);
+        // The first observe reads 30 jobs and all three run lists. The 304s after it are free.
+        assert_eq!(busy.state.borrow().left, 450 - 33);
     }
 
     /// A run left unread keeps its ETag, so its next read is a free 304 when nothing changed.
@@ -1428,7 +1504,7 @@ mod tests {
             }
             let body = if s.url.contains("status=in_progress") {
                 json!({"workflow_runs": [{"id": 1, "run_attempt": 1, "updated_at": "t1"}]})
-            } else if s.url.contains("status=queued") {
+            } else if s.url.contains("status=queued") || s.url.contains("status=pending") {
                 json!({"workflow_runs": []})
             } else {
                 json!({"jobs": [{"id": 10, "run_attempt": 1, "status": "in_progress", "labels": []}]})
@@ -1468,7 +1544,7 @@ mod tests {
             }
             let body = if s.url.contains("status=queued") {
                 json!({"total_count": 1, "workflow_runs": [{"id": 5, "run_attempt": 1}]})
-            } else if s.url.contains("status=in_progress") {
+            } else if s.url.contains("status=in_progress") || s.url.contains("status=pending") {
                 json!({"total_count": 0, "workflow_runs": []})
             } else {
                 let from = (page - 1) * PER_PAGE as u64;
@@ -1533,7 +1609,9 @@ mod tests {
     fn run_lists_are_paged() {
         let fake = Fake::new(|s| {
             let page = s.url.split("&page=").nth(1).unwrap_or("1");
-            let body = if s.url.contains("status=queued") {
+            let body = if s.url.contains("status=pending") {
+                json!({"workflow_runs": []})
+            } else if s.url.contains("status=queued") {
                 let ids: Vec<u64> = match page {
                     "1" => (1..=100).collect(),
                     // Run 100 moved down a page while the list was read.
@@ -1567,6 +1645,7 @@ mod tests {
         assert_eq!(
             lists,
             [
+                "/repos/o/r/actions/runs?status=pending&per_page=100",
                 "/repos/o/r/actions/runs?status=queued&per_page=100",
                 "/repos/o/r/actions/runs?status=queued&per_page=100&page=2",
                 "/repos/o/r/actions/runs?status=in_progress&per_page=100",
@@ -1586,7 +1665,7 @@ mod tests {
         let fake = Fake::new(|s| {
             let body = if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5}]})
-            } else if s.url.contains("status=in_progress") {
+            } else if s.url.contains("status=in_progress") || s.url.contains("status=pending") {
                 json!({"workflow_runs": []})
             } else {
                 let jobs: Vec<Value> = (0..PER_PAGE as u64)

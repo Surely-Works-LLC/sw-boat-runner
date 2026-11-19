@@ -688,8 +688,7 @@ mod tests {
         );
     }
 
-    /// The tick began at `NOW`, but each request took 30 s, so boat answered the fork at
-    /// `NOW + 210`. The fork waits for its listing from then, not from `NOW`.
+    /// The fork waits for its listing from the time boat answered, not the tick start.
     #[test]
     fn a_fork_is_timed_from_its_answer_not_from_the_tick() {
         let cfg = config();
@@ -703,8 +702,8 @@ mod tests {
         let e = elapsed.clone();
         tick_loop.clock = Box::new(move || std::time::Duration::from_secs(e.get()));
         tick_loop.tick(NOW, |_, _| vec![fork(Some(70))]).unwrap();
-        // Six reads, then the fork, whose answer came 7 × 30 s after the tick began.
-        assert_eq!(pending_forks(&tick_loop), [NOW + 210]);
+        let fork_answer = NOW + 30 * (observe_requests().len() as u64 + 1);
+        assert_eq!(pending_forks(&tick_loop), [fork_answer]);
     }
 
     /// A job fork whose runner is still `Busy` 10 minutes before `fork_ttl_s` is warned
