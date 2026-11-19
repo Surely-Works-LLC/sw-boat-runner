@@ -57,9 +57,9 @@ boat ssh <id>
 Inside the machine:
 
 ```sh
-# v0.3.3 is an example: use the release you tested, here and in SBR_REF.
-curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.3/examples/always-on/install.sh
-SBR_REF=v0.3.3 bash install.sh    # gets the daemon, then runs `sw-boat-runner setup`
+# v0.3.4 is an example: use the release you tested, here and in SBR_REF.
+curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.4/examples/always-on/install.sh
+SBR_REF=v0.3.4 bash install.sh    # gets the daemon, then runs `sw-boat-runner setup`
 ```
 
 `setup` asks for the repository, labels (default `self-hosted, boat`) and snapshot,
@@ -157,8 +157,8 @@ at any time. Set `STATE_DIRECTORY` to a writable directory (systemd's
 `StateDirectory=sw-boat-runner` does) so a restart keeps kept machines' idle clocks. To run it on a host you keep up without `setup`:
 
 ```sh
-cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.3.3
-# v0.3.3 is an example: pin the tag, or --rev <commit>, that you tested.
+cargo install --locked --git https://github.com/Surely-Works-LLC/sw-boat-runner --tag v0.3.4
+# v0.3.4 is an example: pin the tag, or --rev <commit>, that you tested.
 ```
 
 Set `BOAT_API_KEY` to a boat key for the account that owns the snapshot, and give the
