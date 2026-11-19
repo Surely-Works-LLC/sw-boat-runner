@@ -389,8 +389,8 @@ process saw it online is `Registered` until that timeout.
 | `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand or kept `Up + Starting < min_up` |
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
-| `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops |
-| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use |
+| `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops; or a kept machine stuck `Starting` (below) in a pool with `resume`, whatever the demand |
+| `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use; or a kept machine stuck `Starting` in a pool without `resume` |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that the pool's listing does not show `Up` |
 
 Demand for a pool is the number of queued jobs whose labels it matches, each id and
@@ -400,6 +400,15 @@ ephemeral machine, `slots_per_box` for any other). A job matches a pool when the
 labels, compared without case, are a subset of the pool's. A JIT runner carries only the
 pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects a pool
 without it. A job that matches several pools counts only for the first one in the file.
+
+A kept machine is stuck when it has been `Starting` for `STUCK_START_S` (an hour) with no
+`Busy` or `Registered` runner. boat lists a machine whose snapshot copy broke, such as one
+whose lazy mount died, with `hydrated: false` for good, and some such machines cannot even
+start a shell. Before this rule it held a `max_boxes` box, covered its slots' share of the
+queue and a `min_up` place forever, so jobs waited and the pool never replaced it. A stuck
+machine covers no job and no `min_up` place, and is stopped, or deleted in a pool without
+`resume`. boat may refuse to stop a machine that has no recent snapshot; the daemon then
+asks again each tick and logs boat's error.
 
 Stop needs `resume` in placement because without it a stopped machine never comes back.
 A pool without `slot` keeps no kept machine: one is left only when the pool's placement

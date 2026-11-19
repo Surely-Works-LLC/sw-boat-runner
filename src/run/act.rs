@@ -560,8 +560,15 @@ impl Loop<'_> {
                     r => r?,
                 }
                 self.boat.stop(machine)?;
+                let starting = t
+                    .snapshot
+                    .machines
+                    .iter()
+                    .any(|m| m.id == *machine && m.state == MachineState::Starting);
                 let why = if self.winding_down {
                     "exit"
+                } else if starting {
+                    "stuck_start"
                 } else {
                     "idle_stop"
                 };

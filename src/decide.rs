@@ -21,6 +21,13 @@ use RunnerState::{Busy, Idle, Offline, Registered};
 /// busy yet, keeps its fork.
 pub const ORPHAN_GRACE_S: u64 = 60;
 
+/// How long a kept machine may stay `Starting` before it counts as stuck. boat lists a
+/// resumed or forked machine `hydrated: false` while it copies the snapshot in, which
+/// takes minutes; a machine whose copy broke (a dead lazy mount) stays that way for good.
+/// A stuck machine covers no queued job and no `min_up` place, and is stopped, or deleted
+/// in a pool without `resume`. An hour is well above any copy boat finishes.
+pub const STUCK_START_S: u64 = 3600;
+
 /// The actions for `pool`, in this order: unregisters, deletes, registers, resumes, kept
 /// forks, job forks, stops. Inputs are sorted first, so their order in `snap` does not
 /// matter. `snap.queued` holds only the jobs routed to this pool (see `run::route`).
@@ -98,6 +105,14 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
         }
     }
 
+    // A stuck machine takes no job whatever the demand, so it is stopped regardless.
+    if pool.has(Resume) {
+        for m in v.kept(Starting).filter(|m| v.stuck(m)) {
+            actions.push(Action::Stop {
+                machine: m.id.clone(),
+            });
+        }
+    }
     if pool.has(Resume) && want == 0 {
         let mut up = v.kept(Up).count();
         for m in v.kept(Up) {
@@ -127,6 +142,8 @@ pub fn delete_reasons<'a>(snap: &'a Snapshot, pool: &'a Pool) -> Vec<(&'a str, &
             let why = if !m.is_ephemeral() {
                 if m.state == Stopped {
                     "no_resume"
+                } else if v.stuck(m) && pool.has(Slot) {
+                    "stuck_start"
                 } else {
                     "no_slot"
                 }
@@ -228,6 +245,15 @@ impl<'a> View<'a> {
         short > 0 || (self.pool.has(Resume) && !self.pool.has(Fork) && want > 0)
     }
 
+    /// A kept machine `Starting` for `STUCK_START_S` with no `Busy` or `Registered`
+    /// runner: its snapshot copy will not finish, so no runner can start on it.
+    fn stuck(&self, m: &Machine) -> bool {
+        !m.is_ephemeral()
+            && m.state == Starting
+            && self.age(m) >= STUCK_START_S
+            && !holds(self.on(m), &[Busy, Registered])
+    }
+
     /// Stop, for each kept `Up` machine while more than `min_up` stay up; the caller
     /// checks `resume` and that no demand is unmet.
     fn stop(&self, m: &Machine, registered_on: &BTreeSet<&str>) -> bool {
@@ -247,7 +273,10 @@ impl<'a> View<'a> {
         } else {
             match m.state {
                 Stopped => !self.pool.has(Resume) && !holds(on, &[Busy]),
-                Up | Starting => !self.pool.has(Slot) && !holds(on, &[Busy, Registered]),
+                Up | Starting => {
+                    let stuck = self.stuck(m) && !self.pool.has(Resume);
+                    (!self.pool.has(Slot) && !holds(on, &[Busy, Registered])) || stuck
+                }
                 Stopping | Gone => false,
             }
         }
@@ -341,17 +370,23 @@ impl<'a> View<'a> {
         self.jobs.len().saturating_sub(supply.count())
     }
 
-    /// Jobs the pool's `Starting` machines not deleted this tick take once up.
+    /// Jobs the pool's `Starting` machines not deleted this tick take once up. A stuck
+    /// machine never comes up, so it takes none.
     fn pending(&self, deleted: &BTreeSet<&str>) -> usize {
-        let starting = self.machines.iter().filter(|m| m.state == Starting);
+        let starting = self
+            .machines
+            .iter()
+            .filter(|m| m.state == Starting && !self.stuck(m));
         let left = starting.filter(|m| !deleted.contains(m.id.as_str()));
         let slots = self.pool.slots_per_box as usize;
         left.map(|m| if m.is_ephemeral() { 1 } else { slots }).sum()
     }
 
-    /// Kept machines short of `min_up`, which counts kept machines up or starting.
+    /// Kept machines short of `min_up`, which counts kept machines up or starting but not
+    /// stuck.
     fn short(&self) -> usize {
-        let held = self.kept(Up).count() + self.kept(Starting).count();
+        let starting = self.kept(Starting).filter(|m| !self.stuck(m));
+        let held = self.kept(Up).count() + starting.count();
         (self.pool.min_up as usize).saturating_sub(held)
     }
 
@@ -439,6 +474,14 @@ mod tests {
         }
     }
 
+    /// A kept machine resumed or forked a minute ago and still copying its snapshot.
+    fn starting(id: &str) -> Machine {
+        Machine {
+            since: NOW - 60,
+            ..machine(id, Ms::Starting)
+        }
+    }
+
     /// Forked for `job` a minute ago; `last_busy` is from before it came up.
     fn forked(id: &str, job: u64, state: MachineState) -> Machine {
         Machine {
@@ -509,6 +552,12 @@ mod tests {
         }
     }
 
+    fn stop(machine: &str) -> Action {
+        Action::Stop {
+            machine: machine.into(),
+        }
+    }
+
     fn fork_kept() -> Action {
         Action::Fork {
             pool: "ci".into(),
@@ -549,7 +598,7 @@ mod tests {
 
         // A starting kept machine counts; an ephemeral one does not.
         let s = snap(
-            vec![machine("m1", Ms::Starting), forked("f1", 1, Ms::Up)],
+            vec![starting("m1"), forked("f1", 1, Ms::Up)],
             vec![runner("f1", 0, Rs::Busy)],
             &[],
         );
@@ -592,7 +641,7 @@ mod tests {
         let s = snap(
             vec![
                 machine("m1", Ms::Up),
-                machine("m2", Ms::Starting),
+                starting("m2"),
                 machine("m3", Ms::Stopping),
                 machine("m4", Ms::Up),
                 machine("m5", Ms::Up),
@@ -673,6 +722,55 @@ mod tests {
         );
     }
 
+    /// A kept machine whose snapshot copy never finishes stays `Starting` (boat lists it
+    /// `hydrated: false`). Past `STUCK_START_S` it covers no job and no `min_up` place,
+    /// and it is stopped even while jobs wait.
+    #[test]
+    fn warm_stops_a_machine_stuck_starting_and_replaces_it() {
+        let p = pool("warm", "min_up = 1");
+        let stuck = Machine {
+            since: NOW - STUCK_START_S,
+            ..machine("m1", Ms::Starting)
+        };
+        let s = snap(
+            vec![stuck.clone(), machine("m2", Ms::Stopped)],
+            vec![],
+            &[1],
+        );
+        assert_eq!(decide(&s, &p), [resume("m2"), stop("m1")]);
+
+        // Just under the bound it is still copying: it covers the job and `min_up`.
+        let copying = Machine {
+            since: NOW - STUCK_START_S + 1,
+            ..stuck.clone()
+        };
+        let s = snap(vec![copying, machine("m2", Ms::Stopped)], vec![], &[1]);
+        assert_eq!(decide(&s, &p), NOTHING);
+
+        // A runner on it keeps it this tick, as on an `Up` machine; the runner is
+        // unregistered, as on any machine that is not up, and the next tick stops it.
+        let s = snap(vec![stuck], vec![runner("m1", 0, Rs::Registered)], &[]);
+        let stops = decide(&s, &p);
+        assert!(
+            !stops.iter().any(|a| matches!(a, Action::Stop { .. })),
+            "{stops:?}"
+        );
+    }
+
+    /// A pool without `resume` could not bring a stopped machine back, so it deletes a
+    /// stuck one and forks a new one for `min_up`.
+    #[test]
+    fn pool_deletes_a_machine_stuck_starting() {
+        let p = pool("pool", "min_up = 1");
+        let stuck = Machine {
+            since: NOW - STUCK_START_S,
+            ..machine("m1", Ms::Starting)
+        };
+        let s = snap(vec![stuck], vec![], &[]);
+        assert_eq!(decide(&s, &p), [delete("m1"), fork_kept()]);
+        assert_eq!(delete_reasons(&s, &p), [("m1", "stuck_start")]);
+    }
+
     #[test]
     fn warm_resumes_up_to_min_up_without_jobs() {
         let p = pool("warm", "min_up = 2");
@@ -684,9 +782,9 @@ mod tests {
         let s = snap(stopped.clone(), vec![], &[]);
         assert_eq!(decide(&s, &p), [resume("m1"), resume("m2")]);
 
-        let mut starting = stopped;
-        starting[0].state = Ms::Starting;
-        let s = snap(starting, vec![], &[]);
+        let mut resuming = stopped;
+        resuming[0] = starting("m1");
+        let s = snap(resuming, vec![], &[]);
         assert_eq!(decide(&s, &p), [resume("m2")]);
 
         // An ephemeral machine is not one of the `min_up` kept machines.
