@@ -1,6 +1,6 @@
 [package]
 name = "sw-boat-runner"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Self-hosted GitHub Actions runners on boat machines, reused across jobs"

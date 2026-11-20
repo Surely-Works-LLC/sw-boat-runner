@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-20
+
 ### Fixed
 
 - `run` deletes a pool's stopped kept machines above `max_boxes` when the pool has `resume`
@@ -359,7 +361,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.1...v0.3.2
