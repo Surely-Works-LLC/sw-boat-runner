@@ -164,7 +164,7 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | Preset | Placement | Idle machines |
 | - | - | - |
 | `pool` | `slot` | `min_up` stay up |
-| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job; new ones forked up to `max_boxes` |
+| `warm` | `slot, resume` | stopped after `idle_stop_s`, resumed for the next job; new ones forked up to `max_boxes`; stopped ones above `max_boxes` deleted when no job waits |
 | `fork` | `fork` | none; each job gets a new machine, deleted afterwards |
 | `hybrid` | `slot, resume, fork` | `min_up` stay up; overflow jobs get a new machine each |
 

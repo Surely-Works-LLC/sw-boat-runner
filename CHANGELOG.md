@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `run` deletes a pool's stopped kept machines above `max_boxes` when the pool has `resume`
+  and no job waits, highest ids first, and logs `delete ... surplus`. Before, a warm pool
+  kept every machine it ever forked: after a burst, a lowered `max_boxes` or a refused
+  stop, the stopped machines above `max_boxes` stayed on the account until someone
+  deleted them by hand.
+
 ## [0.3.4] - 2026-11-19
 
 ### Changed
