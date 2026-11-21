@@ -34,6 +34,13 @@ jobs:
             edit: 's/^Placement = .*/Placement = {"slot", "resume"}/'
           - name: fork
             cfg: spec/BoatRunnerFork.cfg
+          # A standby runner must break no property: no busy stop, and idle machines stop.
+          - name: warm-standby
+            cfg: spec/BoatRunner.cfg
+            edit: 's/^Placement = .*/Placement = {"slot", "resume"}/;s/^Standby = 0/Standby = 1/'
+          - name: hybrid-minup-standby
+            cfg: spec/BoatRunner.cfg
+            edit: 's/^MinUp = 0/MinUp = 1/;s/^InitStopped = {m1}/InitStopped = {}/;s/^Standby = 0/Standby = 1/'
           # Each fix off must still produce its counterexample (spec/README.md#fix-flags).
           - name: crash-spend
             cfg: spec/BoatRunner.cfg

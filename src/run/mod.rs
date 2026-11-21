@@ -1087,6 +1087,37 @@ mod tests {
         );
     }
 
+    /// Runner 11 took a job after drain listed it idle, as a standby runner can with no
+    /// daemon running. GitHub refuses its delete, and its machine must stay.
+    #[test]
+    fn drain_leaves_a_machine_whose_runner_took_a_job() {
+        let cfg = config();
+        let fake = Fake::new(|s| {
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") {
+                respond(422, &[], r#"{"message":"Runner is still running a job"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        Loop::new(&cfg, &fake, BOAT_KEY.into(), gh_auth(), NOW)
+            .drain(NOW)
+            .unwrap();
+        let writes: Vec<String> = requests(&fake)
+            .into_iter()
+            .filter(|r| !r.starts_with("GET"))
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                format!("DELETE {GH}/runners/11"),
+                format!("DELETE {GH}/runners/12"),
+                format!("DELETE {GH}/runners/11"),
+                format!("DELETE {BOAT}/sandboxes/bx_33333333"),
+                format!("DELETE {BOAT}/sandboxes/bx_44444444"),
+            ]
+        );
+    }
+
     /// `drain_settled` on a clock that only its sleeps move, from `NOW`. Returns the result
     /// and the time it returned.
     fn drain_at(fake: &Fake, opts: DrainOpts) -> (usize, UnixSecs) {

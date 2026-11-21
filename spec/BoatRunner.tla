@@ -18,6 +18,7 @@ CONSTANTS
     Placement,      \* subset of {"slot", "resume", "fork"}
     BoxCap,         \* max_boxes
     MinUp,          \* min_up
+    Standby,        \* standby: runners kept registered ahead of demand
     Included,       \* included starts left today
     PaidBudget,     \* paid_start_cents_per_day, in units of one start's price
     MaxFaults,      \* faults per behaviour, shared by every fault kind
@@ -42,6 +43,8 @@ ASSUME
     /\ MinUp > 0 => "slot" \in Placement
     /\ "resume" \in Placement => "slot" \in Placement
     /\ BoxCap \in Nat /\ MinUp \in Nat /\ Included \in Nat
+    /\ Standby \in Nat
+    /\ Standby > 0 => "slot" \in Placement
     /\ PaidBudget \in Nat /\ MaxFaults \in Nat
     /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct,
         FixKeptInflight, FixListLag, FixLostCreate, FixLostSpend} \subseteq BOOLEAN
@@ -163,8 +166,20 @@ DeleteGuard(m) ==
     /\ \/ IsEph(m) /\ (Finished(m) \/ PastTtl(m))
        \/ Kept(m) /\ mstate[m] = "Stopped" /\ ~Has("resume")
 
+\* A standby runner goes on a free kept slot when no job waits and fewer than
+\* Standby runners are ready. The code asks that the machine's last busy time is
+\* at most STANDBY_FRESH_S old; ~idle[m] is the model's wider form of that. A
+\* machine no Stop can take may get one whatever its clock.
+StandbyPick(m) ==
+    /\ Want0 <= 0
+    /\ -Want0 < Standby
+    /\ m \in FreeKept
+    /\ ~idle[m] \/ ~Has("resume") \/ UpKept <= MinUp
+
 \* A fresh forked machine is filled before any free kept slot.
-RegisterPick(m) == Want0 > 0 /\ (m \in Fresh \/ (m \in FreeKept /\ Fresh = {}))
+RegisterPick(m) ==
+    \/ Want0 > 0 /\ (m \in Fresh \/ (m \in FreeKept /\ Fresh = {}))
+    \/ StandbyPick(m)
 RegisterGuard(m) == Observed /\ NoPlan /\ RegisterPick(m)
 
 ResumeGuard(m) ==

@@ -33,6 +33,7 @@ pub struct PoolCase {
     min_up_s: u64,
     register_timeout_s: u64,
     cap: u32,
+    standby: u32,
     second_pool: bool,
 }
 
@@ -117,10 +118,22 @@ fn pool_case() -> impl Strategy<Value = PoolCase> {
         prop::sample::select(vec![0u64, 60]),
         prop::sample::select(vec![120u64, 900]),
         prop::sample::select(vec![0u32, 3, 20, 1_000]),
+        prop::sample::select(vec![0u32, 0, 1, 2]),
         any::<bool>(),
     )
         .prop_map(
-            |(preset, max_boxes, slots, min_up, idle_stop_s, min_up_s, rt, cap, second)| {
+            |(
+                preset,
+                max_boxes,
+                slots,
+                min_up,
+                idle_stop_s,
+                min_up_s,
+                rt,
+                cap,
+                standby,
+                second,
+            )| {
                 let min_up = match preset {
                     "fork" => 0,
                     "pool" => min_up.clamp(1, max_boxes),
@@ -135,6 +148,8 @@ fn pool_case() -> impl Strategy<Value = PoolCase> {
                     min_up_s,
                     register_timeout_s: rt,
                     cap,
+                    // A pool without `slot` has no kept machine to put one on.
+                    standby: if preset == "fork" { 0 } else { standby },
                     second_pool: second,
                 }
             },
@@ -239,11 +254,12 @@ fn policy_of(p: &PoolCase) -> String {
     let mut text = format!(
         "repo = \"o/r\"\ntick_s = 15\n[[pool]]\nname = \"ci\"\n\
          labels = [\"self-hosted\", \"large\"]\nmachine_type = \"large\"\nsnapshot = \"snap\"\n\
-         preset = \"{}\"\nmax_boxes = {}\nslots_per_box = {}\nmin_up = {}\nidle_stop_s = {}\n\
+         preset = \"{}\"\nmax_boxes = {}\nslots_per_box = {}\nstandby = {}\nmin_up = {}\nidle_stop_s = {}\n\
          min_up_s = {}\nregister_timeout_s = {}\nfork_ttl_s = 3600\npaid_start_cents_per_day = {}\n",
         p.preset,
         p.max_boxes,
         p.slots,
+        p.standby,
         p.min_up,
         p.idle_stop_s,
         p.min_up_s,

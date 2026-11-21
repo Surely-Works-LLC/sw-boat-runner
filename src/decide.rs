@@ -28,6 +28,13 @@ pub const ORPHAN_GRACE_S: u64 = 60;
 /// in a pool without `resume`. An hour is well above any copy boat finishes.
 pub const STUCK_START_S: u64 = 3600;
 
+/// How long after a kept machine last had a `Busy` or `Registered` runner it may still
+/// get a standby runner. A registration restarts the machine's idle clock, so a standby
+/// runner on a machine that is long idle would keep it up up to a further `idle_stop_s`.
+/// Inside this window the restart costs at most the window. Two minutes covers the tick
+/// after a job ends even when a pass is slow.
+pub const STANDBY_FRESH_S: u64 = 120;
+
 /// The actions for `pool`, in this order: unregisters, deletes, registers, resumes, kept
 /// forks, job forks, stops. Inputs are sorted first, so their order in `snap` does not
 /// matter. `snap.queued` holds only the jobs routed to this pool (see `run::route`).
@@ -54,7 +61,8 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
 
     let mut want = v.demand(&unregistered);
     let mut registered_on = BTreeSet::new();
-    for (m, slot) in v.register(&unregistered).take(want) {
+    let mut free = v.register(&unregistered);
+    for (m, slot) in free.by_ref().take(want) {
         registered_on.insert(m.id.as_str());
         actions.push(Action::Register {
             pool: pool.name.clone(),
@@ -62,6 +70,16 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
             slot,
         });
         want -= 1;
+    }
+    // Demand left means no slot is free, so this takes none.
+    let ahead = v.standby_short(&unregistered);
+    for (m, slot) in free.filter(|(m, _)| v.standby(m)).take(ahead) {
+        registered_on.insert(m.id.as_str());
+        actions.push(Action::Register {
+            pool: pool.name.clone(),
+            machine: m.id.clone(),
+            slot,
+        });
     }
 
     // Without this, every tick until a machine is up would start more for the same jobs.
@@ -226,6 +244,26 @@ impl<'a> View<'a> {
             !self.on(m).iter().any(taken)
         });
         fresh.chain(free)
+    }
+
+    /// Runners the pool is short of `standby`: `standby` minus its `Registered` and `Idle`
+    /// runners that keep their slot and that no queued job will take.
+    fn standby_short(&self, unregistered: &BTreeSet<&str>) -> usize {
+        let kept = |r: &&&Runner| !unregistered.contains(r.name.as_str());
+        let ready = self.runners.iter().filter(kept);
+        let supply = ready.filter(|r| matches!(r.state, Registered | Idle));
+        let spare = supply.count().saturating_sub(self.jobs.len());
+        (self.pool.standby as usize).saturating_sub(spare)
+    }
+
+    /// Register ahead of demand (spec `StandbyPick`): a kept machine whose idle clock the
+    /// registration does not set back by more than `STANDBY_FRESH_S`, or one no `Stop`
+    /// could take anyway. The next job then finds a runner online instead of waiting for
+    /// a tick, a registration and the runner's start.
+    fn standby(&self, m: &Machine) -> bool {
+        let fresh = self.snap.now.saturating_sub(m.last_busy) <= STANDBY_FRESH_S;
+        let stays = !self.pool.has(Resume) || self.kept(Up).count() <= self.pool.min_up as usize;
+        !m.is_ephemeral() && (fresh || stays)
     }
 
     /// No runner was ever seen on it since it came up, and it is not deleted this tick
@@ -626,6 +664,97 @@ mod tests {
 
         let queued = snap(vec![machine("m1", Ms::Up)], offline, &[1]);
         assert_eq!(decide(&queued, &p), [unregister, register("m1", 0)]);
+    }
+
+    /// A machine whose job ended a moment ago, with no runner left on it.
+    fn just_used(id: &str) -> Machine {
+        Machine {
+            last_busy: NOW - 20,
+            ..machine(id, Ms::Up)
+        }
+    }
+
+    #[test]
+    fn standby_registers_a_runner_when_a_job_ends_and_no_job_waits() {
+        let p = pool("warm", "standby = 1");
+        let ended = snap(vec![just_used("m1"), just_used("m2")], vec![], &[]);
+        assert_eq!(decide(&ended, &p), [register("m1", 0)]);
+        // Without the option nothing is registered ahead of a job.
+        assert_eq!(decide(&ended, &pool("warm", "")), NOTHING);
+
+        // One runner ready and no job for it: the pool has its standby.
+        for state in [Rs::Registered, Rs::Idle] {
+            let ready = vec![runner("m1", 0, state)];
+            let s = snap(vec![just_used("m1"), just_used("m2")], ready, &[]);
+            assert_eq!(decide(&s, &p), NOTHING, "{state:?}");
+        }
+
+        // A queued job takes the ready runner, so the next free slot gets one.
+        let taken = vec![runner("m1", 0, Rs::Idle)];
+        let s = snap(vec![just_used("m1"), just_used("m2")], taken, &[1]);
+        assert_eq!(decide(&s, &p), [register("m2", 0)]);
+
+        // Demand fills its slots first, and standby takes what is left.
+        let s = snap(vec![just_used("m1"), just_used("m2")], vec![], &[1]);
+        assert_eq!(decide(&s, &p), [register("m1", 0), register("m2", 0)]);
+        let s = snap(vec![just_used("m1"), just_used("m2")], vec![], &[1, 2]);
+        assert_eq!(decide(&s, &p), [register("m1", 0), register("m2", 0)]);
+    }
+
+    /// A registration restarts a machine's idle clock, so standby must not go on a
+    /// machine that has sat idle: it would stay up a further `idle_stop_s`.
+    #[test]
+    fn standby_does_not_keep_an_idle_machine_up() {
+        let p = pool("warm", "standby = 1\nidle_stop_s = 600\nmin_up_s = 0");
+        let idle = Machine {
+            last_busy: NOW - STANDBY_FRESH_S - 1,
+            ..machine("m1", Ms::Up)
+        };
+        assert_eq!(decide(&snap(vec![idle.clone()], vec![], &[]), &p), NOTHING);
+        let edge = Machine {
+            last_busy: NOW - STANDBY_FRESH_S,
+            ..idle
+        };
+        assert_eq!(
+            decide(&snap(vec![edge], vec![], &[]), &p),
+            [register("m1", 0)]
+        );
+
+        // An idle standby runner does not hold its machine: it stops on time, and the
+        // long-idle machine left gets no standby.
+        let since_job = |id: &str| Machine {
+            last_busy: NOW - 600,
+            ..machine(id, Ms::Up)
+        };
+        let waiting = vec![runner("m1", 0, Rs::Idle)];
+        let s = snap(vec![since_job("m1"), since_job("m2")], waiting, &[]);
+        assert_eq!(decide(&s, &p), [stop("m1"), stop("m2")]);
+        let s = snap(vec![since_job("m1"), since_job("m2")], vec![], &[]);
+        assert_eq!(decide(&s, &p), [stop("m1"), stop("m2")]);
+    }
+
+    /// Where no `Stop` can take the machine, a standby runner costs no machine time.
+    #[test]
+    fn standby_stays_on_machines_that_never_stop() {
+        let long_idle = || vec![machine("m1", Ms::Up)];
+        let p = pool("warm", "standby = 1\nmin_up = 1");
+        assert_eq!(
+            decide(&snap(long_idle(), vec![], &[]), &p),
+            [register("m1", 0)]
+        );
+        let p = pool("pool", "standby = 2\nslots_per_box = 2");
+        assert_eq!(
+            decide(&snap(long_idle(), vec![], &[]), &p),
+            [register("m1", 0), register("m1", 1)]
+        );
+        // A job's fork runs one job and is deleted, so it never gets a standby runner.
+        let p = pool("hybrid", "standby = 1");
+        let fresh = Machine {
+            last_busy: NOW - 20,
+            ..forked("m1", 1, Ms::Up)
+        };
+        let used = decide(&snap(vec![fresh], vec![], &[]), &p);
+        assert!(!used.contains(&register("m1", 0)), "{used:?}");
     }
 
     #[test]
@@ -1107,26 +1236,31 @@ mod tests {
                 Just(vec![Slot, Resume, Fork]),
             ];
             let times = (0u64..200, 0u64..200, 0u64..200, 1u64..400);
-            (shape, 1u32..5, 0u32..5, 1u32..3, times, 0u32..30).prop_map(
-                |(placement, max_boxes, min_up, slots, times, cap)| Pool {
-                    name: "p".into(),
-                    labels: vec!["a".into(), "b".into()],
-                    machine_type: "large".into(),
-                    snapshot: "s".into(),
-                    // As policy requires: a kept machine needs slots to run jobs.
-                    min_up: if placement.contains(&Slot) {
-                        min_up.min(max_boxes)
-                    } else {
-                        0
-                    },
-                    placement,
-                    max_boxes,
-                    slots_per_box: slots,
-                    idle_stop_s: times.0,
-                    min_up_s: times.1,
-                    register_timeout_s: times.2,
-                    fork_ttl_s: times.3,
-                    paid_start_cents_per_day: cap,
+            let boxes = (1u32..5, 0u32..5, 1u32..3, 0u32..3);
+            (shape, boxes, times, 0u32..30).prop_map(
+                |(placement, (max_boxes, min_up, slots, standby), times, cap)| {
+                    let has_slot = placement.contains(&Slot);
+                    Pool {
+                        name: "p".into(),
+                        labels: vec!["a".into(), "b".into()],
+                        machine_type: "large".into(),
+                        snapshot: "s".into(),
+                        // As policy requires: a kept machine needs slots to run jobs.
+                        min_up: if placement.contains(&Slot) {
+                            min_up.min(max_boxes)
+                        } else {
+                            0
+                        },
+                        placement,
+                        max_boxes,
+                        slots_per_box: slots,
+                        standby: if has_slot { standby } else { 0 },
+                        idle_stop_s: times.0,
+                        min_up_s: times.1,
+                        register_timeout_s: times.2,
+                        fork_ttl_s: times.3,
+                        paid_start_cents_per_day: cap,
+                    }
                 },
             )
         }
@@ -1280,9 +1414,9 @@ mod tests {
                 }
             }
 
-            /// Spec `Settles`, first half: with nothing queued, nothing is registered or
-            /// forked for a job, and a resume or kept fork only brings the pool's kept
-            /// machines up to `min_up`.
+            /// Spec `Settles`, first half: with nothing queued, nothing is forked for a job,
+            /// at most `standby` runners are registered, each on a kept machine, and a
+            /// resume or kept fork only brings the pool's kept machines up to `min_up`.
             #[test]
             fn settles_with_nothing_queued(mut snap in arb_snapshot(), pool in arb_pool()) {
                 snap.queued.clear();
@@ -1292,10 +1426,15 @@ mod tests {
                     .filter(|m| m.pool == pool.name && m.job.is_none())
                     .filter(|m| matches!(m.state, Ms::Up | Ms::Starting))
                     .count();
+                let mut ahead = 0;
                 for a in decide(&snap, &pool) {
-                    let starts_work =
-                        matches!(a, Action::Register { .. } | Action::Fork { job: Some(_), .. });
-                    prop_assert!(!starts_work, "{a:?}");
+                    prop_assert!(!matches!(a, Action::Fork { job: Some(_), .. }), "{a:?}");
+                    if let Action::Register { machine, .. } = &a {
+                        ahead += 1;
+                        prop_assert!(ahead <= pool.standby, "{a:?}");
+                        let on = snap.machines.iter().find(|m| m.id == *machine);
+                        prop_assert!(on.is_some_and(|m| m.job.is_none()), "{a:?}");
+                    }
                     if matches!(a, Action::Resume { .. } | Action::Fork { job: None, .. }) {
                         held += 1;
                         prop_assert!(held <= pool.min_up as usize, "{a:?}");
@@ -1339,7 +1478,9 @@ mod tests {
             }
 
             /// Spec `Settles`, second half: a settled pool, every action of the last tick
-            /// applied, gets no more actions.
+            /// applied, gets no more actions. Its standby runners are the one thing a
+            /// settled pool may still lack, so they are registered, come online, and
+            /// then nothing is left.
             #[test]
             fn settles_once_applied(pool in arb_pool(), up in 0u32..5, idle in 0u64..200) {
                 // Machines above min_up are settled only while they have been busy recently,
@@ -1362,7 +1503,7 @@ mod tests {
                         job_queued_at: None,
                     })
                     .collect();
-                let snap = Snapshot {
+                let mut snap = Snapshot {
                     now: 1000,
                     machines,
                     runners: vec![],
@@ -1370,6 +1511,21 @@ mod tests {
                     limits: Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None },
                     queued_at: Default::default(),
                 };
+                let standby = decide(&snap, &pool);
+                prop_assert!(standby.len() <= pool.standby as usize, "{standby:?}");
+                for a in standby {
+                    let Action::Register { machine, slot, .. } = a else {
+                        return Err(TestCaseError::fail(format!("{a:?}")));
+                    };
+                    snap.runners.push(Runner {
+                        name: format!("sbr-p-{machine}-{slot}-1000"),
+                        pool: pool.name.clone(),
+                        machine,
+                        slot,
+                        registered_at: 1000,
+                        state: Rs::Idle,
+                    });
+                }
                 let actions = decide(&snap, &pool);
                 prop_assert!(actions.is_empty(), "{actions:?}");
             }

@@ -155,6 +155,7 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | `placement` | from the preset | Overrides the preset's steps. |
 | `min_up` | 1 for `pool`, else 0 | Kept machines that stay up without jobs. |
 | `slots_per_box` | 1 | Runners per kept machine. |
+| `standby` | 0 | Runners kept registered with no job queued, so the next job starts at once. Each goes on a kept machine whose job just ended, or on one that never stops; no machine stays up longer for it. |
 | `idle_stop_s` | 1800 | Idle time before a kept machine stops. |
 | `min_up_s` | 600 | Shortest time a machine stays up before it may stop. |
 | `register_timeout_s` | 900 | Time a runner may take to come online. Keep it above 600, the runner's wait for the snapshot copy. |

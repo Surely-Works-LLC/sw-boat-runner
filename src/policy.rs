@@ -178,6 +178,7 @@ struct RawPool {
     placement: Option<Vec<Placement>>,
     min_up: Option<u32>,
     slots_per_box: Option<u32>,
+    standby: Option<u32>,
     idle_stop_s: Option<u64>,
     min_up_s: Option<u64>,
     register_timeout_s: Option<u64>,
@@ -222,6 +223,7 @@ impl RawPool {
             min_up: self.min_up.unwrap_or(min_up),
             max_boxes: self.max_boxes.unwrap_or(2),
             slots_per_box: self.slots_per_box.unwrap_or(1),
+            standby: self.standby.unwrap_or(0),
             // Above the 58 min break-even of a large machine at a $0.07 start would be
             // safer, but most starts are included; see docs/design.md#start-budget.
             idle_stop_s: self.idle_stop_s.unwrap_or(1800),
@@ -300,6 +302,9 @@ fn validate(p: &Pool) -> Result<(), String> {
     if p.slots_per_box == 0 {
         return Err("slots_per_box must be at least 1".into());
     }
+    if p.standby > 0 && !p.placement.contains(&Placement::Slot) {
+        return Err("standby needs slot, which registers runners on kept machines".into());
+    }
     // A runner is still booting when the tick after its registration checks it, so a
     // timeout of 0 unregisters every runner before it can take a job.
     if p.register_timeout_s == 0 {
@@ -364,6 +369,7 @@ max_boxes = 4
                 min_up: 0,
                 max_boxes: 4,
                 slots_per_box: 1,
+                standby: 0,
                 idle_stop_s: 1800,
                 min_up_s: 600,
                 register_timeout_s: 900,
@@ -388,6 +394,7 @@ max_boxes = 4
                 min_up: 0,
                 max_boxes: 2,
                 slots_per_box: 1,
+                standby: 0,
                 idle_stop_s: 1800,
                 min_up_s: 600,
                 register_timeout_s: 900,
@@ -638,6 +645,10 @@ max_boxes = 4
             (policy("fork_ttl_s = 2592001"), "fork_ttl_s"),
             (policy("min_up = 5"), "above max_boxes"),
             (policy("slots_per_box = 0"), "slots_per_box"),
+            (
+                policy("preset = \"fork\"\nstandby = 1"),
+                "standby needs slot",
+            ),
             (
                 policy("").replace("max_boxes = 4", "max_boxes = 0"),
                 "max_boxes",

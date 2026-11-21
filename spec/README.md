@@ -20,7 +20,10 @@ wait, and the 60 s retirement of a job fork whose job left the queue.
 - The daemon (`ToolStep`), one action at a time in `run::rank` order: Unregister,
   Delete, Stop, Register (fresh job forks before free kept slots), Resume, Fork without a
   job (for the `min_up` shortfall, or for demand in a pool with `resume` and no `fork`),
-  Fork for a job. `Observe` is `run::observe` updating `last_busy`.
+  Fork for a job. `Observe` is `run::observe` updating `last_busy`. With `Standby` above
+  0, Register also puts a runner on a free kept slot while no job waits and fewer than
+  `Standby` runners are ready (`StandbyPick`); the `warm-standby` and
+  `hybrid-minup-standby` models run with `Standby = 1`.
 - The snapshot-to-act gap. Stop and Delete are decided from one snapshot (`plan`) and
   carried out by a later `Execute`, because `run::execute` does not look at the runner
   again. GitHub may assign a job in between. No new decision is made while a plan is
@@ -75,6 +78,10 @@ wait, and the 60 s retirement of a job fork whose job left the queue.
   `Starting`, and boat carries out every stop. The daemon's rules for a kept machine
   `Starting` past `STUCK_START_S` and for a stop boat lists as `failing` (the machine
   counts as `Stopping`) handle faults the model does not have.
+- `STANDBY_FRESH_S`. The code puts a standby runner on a machine that can stop only
+  while its last busy time is at most two minutes old. The model has no clock that
+  fine, so it allows one on any machine that is not yet `idle`, which is every state
+  the code allows and more.
 - The daemon registers within a tick and GitHub assigns within seconds, so a machine
   that could serve a queued job does not age into `idle` or past `register_timeout_s`.
 
@@ -178,6 +185,8 @@ models:
 | hybrid | `BoatRunner.cfg` | none | 18827 |
 | hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | 40676 |
 | warm | `BoatRunner.cfg` | placement `slot, resume` | 4131 |
+| warm-standby | `BoatRunner.cfg` | placement `slot, resume`, `Standby = 1` | 6773 |
+| hybrid-minup-standby | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start, `Standby = 1` | 58643 |
 | fork | `BoatRunnerFork.cfg` | none | 148353 |
 
 The counterexample models stop at the first violation, and the number of states they

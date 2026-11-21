@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Pool option `standby` (default 0): the number of runners `run` keeps registered with
+  no job queued. A job that arrives then starts on a runner that is already online; before,
+  it waited for the next tick, a registration and the runner's start, about 25 s at the
+  median on a busy pool. A standby runner goes on a kept machine whose job just ended, or
+  on one that never stops (`min_up`, or a pool without `resume`), so no machine stays up
+  longer for it.
+
+### Fixed
+
+- `drain` leaves a machine whose runner took a job after the listing showed it idle.
+  Before, GitHub's refusal to delete the busy runner was forgotten by the time `drain`
+  reached the machine, which it deleted with the job running. With no daemon up, only a
+  runner that was online and idle could take a job then, and until `standby` few were.
+
 ## [0.3.5] - 2026-11-20
 
 ### Fixed

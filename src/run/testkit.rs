@@ -31,6 +31,7 @@ pub(super) fn config() -> Config {
             min_up: 0,
             max_boxes: 4,
             slots_per_box: 2,
+            standby: 0,
             idle_stop_s: 600,
             min_up_s: 0,
             register_timeout_s: 300,
