@@ -185,6 +185,8 @@ models:
 | hybrid | `BoatRunner.cfg` | none | 18827 |
 | hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | 40676 |
 | warm | `BoatRunner.cfg` | placement `slot, resume` | 4131 |
+| warm-standby | `BoatRunner.cfg` | placement `slot, resume`, `Standby = 1` | 6773 |
+| hybrid-minup-standby | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start, `Standby = 1` | 58643 |
 | fork | `BoatRunnerFork.cfg` | none | 148353 |
 
 The counterexample models stop at the first violation, and the number of states they
