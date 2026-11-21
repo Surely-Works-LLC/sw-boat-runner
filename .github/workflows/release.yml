@@ -58,6 +58,8 @@ jobs:
           name: sw-boat-runner-${{ matrix.target }}
           path: dist/sw-boat-runner-${{ matrix.target }}.tar.gz
           if-no-files-found: error
+          # Keep the handoff through GitHub's 30-day rerun window.
+          retention-days: 31
 
   publish:
     needs: build
