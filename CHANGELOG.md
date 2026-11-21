@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-11-21
+
 ### Added
 
 - Pool option `standby` (default 0): the number of runners `run` keeps registered with
@@ -377,7 +379,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.2...v0.3.3
