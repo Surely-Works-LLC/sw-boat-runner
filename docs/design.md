@@ -427,7 +427,8 @@ first. So a job that arrives finds a runner online and starts within seconds, wh
 otherwise waits for the next tick, a registration and the runner's start. A standby
 runner must not cost machine time. A registration restarts its machine's idle clock, so
 it goes only on a machine that had a `Busy` or `Registered` runner in the last
-`STANDBY_FRESH_S` (two minutes), which in practice is the tick after a job ends there, or
+`STANDBY_FRESH_S` (two minutes) and is not yet idle for `idle_stop_s`, which in practice
+is the tick after a job ends there, or
 on a machine no `Stop` can take: one in a pool without `resume`, or any while no more
 than `min_up` kept machines are `Up`. An `Idle` runner does not hold its machine: `Stop`
 removes it with the machine once `idle_stop_s` has passed, and the pool then has no

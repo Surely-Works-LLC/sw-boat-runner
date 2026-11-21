@@ -79,9 +79,9 @@ wait, and the 60 s retirement of a job fork whose job left the queue.
   `Starting` past `STUCK_START_S` and for a stop boat lists as `failing` (the machine
   counts as `Stopping`) handle faults the model does not have.
 - `STANDBY_FRESH_S`. The code puts a standby runner on a machine that can stop only
-  while its last busy time is at most two minutes old. The model has no clock that
-  fine, so it allows one on any machine that is not yet `idle`, which is every state
-  the code allows and more.
+  while it is not yet idle for `idle_stop_s` and its last busy time is at most two
+  minutes old. The model has no clock that fine, so it allows one on any machine that
+  is not yet `idle`, which is every state the code allows and more.
 - The daemon registers within a tick and GitHub assigns within seconds, so a machine
   that could serve a queued job does not age into `idle` or past `register_timeout_s`.
 
