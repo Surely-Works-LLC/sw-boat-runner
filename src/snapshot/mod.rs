@@ -1510,6 +1510,7 @@ mod tests {
             min_up: 0,
             max_boxes: 1,
             slots_per_box: 1,
+            standby: 0,
             idle_stop_s: 0,
             min_up_s: 0,
             register_timeout_s: 0,

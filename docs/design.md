@@ -404,7 +404,7 @@ process saw it online is `Registered` until that timeout.
 
 | Action | Guard |
 | - | - |
-| `Register(machine, slot)` | demand above 0, machine `Up`, and either an ephemeral machine with no runner seen since it came up (slot 0, filled first), or `slot` in placement and a free slot on a kept machine (a slot whose runner gets `Unregister` this tick counts as free) |
+| `Register(machine, slot)` | machine `Up`, and either demand above 0 and an ephemeral machine with no runner seen since it came up (slot 0, filled first), or demand above 0, `slot` in placement and a free slot on a kept machine (a slot whose runner gets `Unregister` this tick counts as free), or a standby runner (below) on such a free slot |
 | `Resume(machine)` | machine `Stopped`, `resume` in placement, start budget allows, `Up + Starting < max_boxes`, and either unmet demand or kept `Up + Starting < min_up` |
 | `Fork(job)` | unmet demand left after resumes and kept forks, `fork` in placement, start budget allows, `Up + Starting < max_boxes`, no machine in any pool that is not `Gone` carries this job's label |
 | `Fork(none)` | kept `Up + Starting`, plus resumes this tick, plus kept `Stopping` machines in a pool with `resume`, below `min_up`; or, in a pool with `resume` and no `fork`, unmet demand left after every `Stopped` kept machine is resumed; start budget allows, `Up + Starting < max_boxes` |
@@ -419,6 +419,19 @@ ephemeral machine, `slots_per_box` for any other). A job matches a pool when the
 labels, compared without case, are a subset of the pool's. A JIT runner carries only the
 pool's labels and self-hosted jobs ask for `self-hosted`, so the policy rejects a pool
 without it. A job that matches several pools counts only for the first one in the file.
+
+A pool with `standby` above 0 keeps that many runners registered that no queued job will
+take: its `Registered` and `Idle` runners minus its queued jobs. While it has fewer, and
+after demand took its slots, `Register` fills free slots on kept `Up` machines, lowest id
+first. So a job that arrives finds a runner online and starts within seconds, where it
+otherwise waits for the next tick, a registration and the runner's start. A standby
+runner must not cost machine time. A registration restarts its machine's idle clock, so
+it goes only on a machine that had a `Busy` or `Registered` runner in the last
+`STANDBY_FRESH_S` (two minutes), which in practice is the tick after a job ends there, or
+on a machine no `Stop` can take: one in a pool without `resume`, or any while no more
+than `min_up` kept machines are `Up`. An `Idle` runner does not hold its machine: `Stop`
+removes it with the machine once `idle_stop_s` has passed, and the pool then has no
+standby runner until a job ends on another machine. A job's fork never gets one.
 
 A kept machine is stuck when it has been `Starting` for `STUCK_START_S` (an hour) with no
 `Busy` or `Registered` runner. boat lists a machine whose snapshot copy broke, such as one

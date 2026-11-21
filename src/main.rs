@@ -138,7 +138,7 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
             .collect();
         println!(
             "pool {} labels {} machine {} snapshot {} placement {} \
-             min_up {} max_boxes {} slots {} idle_stop {}s paid_cap {}c",
+             min_up {} max_boxes {} slots {} standby {} idle_stop {}s paid_cap {}c",
             p.name,
             p.labels.join(","),
             p.machine_type,
@@ -147,6 +147,7 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
             p.min_up,
             p.max_boxes,
             p.slots_per_box,
+            p.standby,
             p.idle_stop_s,
             p.paid_start_cents_per_day,
         );

@@ -521,9 +521,13 @@ impl Loop<'_> {
 
     fn execute(&mut self, t: &mut Tick, action: &Action) -> Result<(), Error> {
         match action {
-            Action::Unregister { runner } => match t.runner_ids.remove(runner) {
+            Action::Unregister { runner } => match t.runner_ids.get(runner).copied() {
                 Some(id) => {
+                    // The id stays until GitHub has deleted the runner: a refusal means
+                    // it runs a job, and `remove_runners` must still find it there, or a
+                    // `Delete` of its machine later this tick would go through.
                     self.delete_runner(id)?;
+                    t.runner_ids.remove(runner);
                     let why = if self.draining() {
                         Some("drain")
                     } else {

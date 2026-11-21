@@ -1,0 +1,11 @@
+# Pins: Register: with standby, a kept machine whose job just ended gets a runner with no job queued; a long-idle machine does not.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "Linux", "pool-a"]
+machine_type = "large"
+snapshot = "snap-1"
+preset = "warm"
+standby = 2
+max_boxes = 4

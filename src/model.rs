@@ -45,6 +45,9 @@ pub struct Pool {
     pub min_up: u32,
     pub max_boxes: u32,
     pub slots_per_box: u32,
+    /// Runners kept registered ahead of demand; see `decide`'s `standby` guard.
+    #[serde(default)]
+    pub standby: u32,
     pub idle_stop_s: u64,
     pub min_up_s: u64,
     pub register_timeout_s: u64,
