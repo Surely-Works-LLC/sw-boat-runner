@@ -943,18 +943,6 @@ mod tests {
         ]
     }
 
-    /// The reads every tick makes for the one pool of `config`, with one queued run.
-    fn observe_requests() -> [String; 6] {
-        [
-            format!("GET {BOAT}/sandboxes?label=sw-boat-runner%3Dci&limit=200"),
-            format!("GET {GH}/runners?per_page=100&page=1"),
-            format!("GET {GH}/runs?status=queued&per_page=100"),
-            format!("GET {GH}/runs/5/jobs?per_page=100"),
-            format!("GET {GH}/runs?status=in_progress&per_page=100"),
-            format!("GET {BOAT}/limits"),
-        ]
-    }
-
     #[test]
     fn tick_executes_in_order() {
         let cfg = config();
@@ -983,28 +971,33 @@ mod tests {
         assert_eq!(requests(&fake), expected);
 
         let sent = fake.sent();
-        let fork = &sent[16];
+        let fork = forks(&fake).pop().unwrap();
         assert!(fork.body_text().contains(r#""sw-boat-runner-job":"70-1""#));
         assert!(fork.body_text().contains(r#""sw-boat-runner-repo":"o/r""#));
         assert!(fork.body_text().contains(r#""sw-boat-runner-daemon":""#));
         assert!(fork.body_text().contains(r#""ttlSeconds":3600"#));
-        let jit = &sent[11];
+        let jit = sent
+            .iter()
+            .find(|s| s.url.ends_with("/generate-jitconfig"))
+            .unwrap();
         assert!(
             jit.body_text()
                 .contains(r#""name":"sbr-ci-bx_22222222-1-1000""#)
         );
+        let file = sent.iter().position(|s| s.url.ends_with("/files")).unwrap();
         assert!(
-            sent[12]
+            sent[file]
                 .body_text()
                 .contains(r#""path":"/home/user/.sbr-jit-1""#)
         );
-        assert!(sent[13].body_text().contains("/home/user/.sbr-jit-1"));
+        let command = sent.iter().find(|s| s.url.ends_with("/commands")).unwrap();
+        assert!(command.body_text().contains("/home/user/.sbr-jit-1"));
         // The jit config goes into the file write only: never a URL, a command or a header.
         for (i, s) in sent.iter().enumerate() {
             let leaks = s.url.contains("JITSECRET")
                 || s.headers.iter().any(|(_, v)| v.contains("JITSECRET"))
                 || s.body_text().contains("JITSECRET");
-            assert_eq!(leaks, i == 12, "request {i}: {}", s.url);
+            assert_eq!(leaks, i == file, "request {i}: {}", s.url);
         }
         // Two accepted starts at the 25-cent quote, on top of the assumed 100.
         assert_eq!(tick_loop.ledger.spent_cents(), 150);
@@ -1051,8 +1044,8 @@ mod tests {
         tick_loop.tick(NOW, decide).unwrap();
         tick_loop.tick(NOW + 15, decide).unwrap();
         let sent = fake.sent();
-        assert_eq!(sent.len(), 10, "{:?}", requests(&fake));
-        let conditional: Vec<bool> = sent[5..]
+        assert_eq!(sent.len(), 11, "{:?}", requests(&fake));
+        let conditional: Vec<bool> = sent[6..]
             .iter()
             .map(|s| s.header("if-none-match").is_some())
             .collect();

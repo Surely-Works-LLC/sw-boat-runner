@@ -331,7 +331,11 @@ token bucket in `src/github.rs`:
   then cuts it short as before: a fork it sent may be listed only after the next start,
   which the restart wait (`FixKeptInflight`) covers.
 
-The runner list and the queued runs' jobs rarely change, so most of those reads are 304s.
+The runner list and the jobs of pending and queued runs rarely change, so most of those
+reads are 304s. A pending run can already have jobs waiting for runners. A run that has
+yet to start under a workflow concurrency rule has no jobs to dispatch.
+When no pending run has jobs a pool serves, the daemon waits two minutes before reading
+that status again so it can spend more of the request budget on active runs.
 An in-progress run's jobs change with every step, and such a run can still queue a later
 job (`needs`), so the daemon keeps its last read of each and reads it again:
 
