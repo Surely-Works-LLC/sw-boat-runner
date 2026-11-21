@@ -256,12 +256,14 @@ impl<'a> View<'a> {
         (self.pool.standby as usize).saturating_sub(spare)
     }
 
-    /// Register ahead of demand (spec `StandbyPick`): a kept machine whose idle clock the
-    /// registration does not set back by more than `STANDBY_FRESH_S`, or one no `Stop`
-    /// could take anyway. The next job then finds a runner online instead of waiting for
+    /// Register ahead of demand (spec `StandbyPick`): a kept machine not yet idle for
+    /// `idle_stop_s`, whose idle clock the registration does not set back by more than
+    /// `STANDBY_FRESH_S`, or one no `Stop` could take anyway. A machine already due to
+    /// stop gets none, or the registration would hold it up in place of the stop. The next job then finds a runner online instead of waiting for
     /// a tick, a registration and the runner's start.
     fn standby(&self, m: &Machine) -> bool {
-        let fresh = self.snap.now.saturating_sub(m.last_busy) <= STANDBY_FRESH_S;
+        let idle_for = self.snap.now.saturating_sub(m.last_busy);
+        let fresh = idle_for <= STANDBY_FRESH_S && idle_for < self.pool.idle_stop_s;
         let stays = !self.pool.has(Resume) || self.kept(Up).count() <= self.pool.min_up as usize;
         !m.is_ephemeral() && (fresh || stays)
     }
@@ -719,6 +721,14 @@ mod tests {
             decide(&snap(vec![edge], vec![], &[]), &p),
             [register("m1", 0)]
         );
+
+        // A machine due to stop stops, however recently it was busy.
+        let short = pool("warm", "standby = 1\nidle_stop_s = 60\nmin_up_s = 0");
+        let due = Machine {
+            last_busy: NOW - 60,
+            ..machine("m1", Ms::Up)
+        };
+        assert_eq!(decide(&snap(vec![due], vec![], &[]), &short), [stop("m1")]);
 
         // An idle standby runner does not hold its machine: it stops on time, and the
         // long-idle machine left gets no standby.
