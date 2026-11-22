@@ -233,7 +233,10 @@ counterexample TLC finds without it.
 
 - Stale act (`FixStaleAct`): `Stop` and `Delete` first delete the machine's GitHub
   runners. GitHub refuses while a runner runs a job, which it may have taken since the
-  snapshot. On that or any other error the daemon skips the machine this tick.
+  snapshot. On that or any other error the daemon skips the machine this tick. A failed
+  `Unregister` leaves its runner's slot taken for the tick, though `decide` counted it as
+  free: a `Register` there would kill the job. As a last guard the start command exits
+  without starting while the slot's `Runner.Worker` runs.
 - Register marks used (`FixRegSeen`): a `Register` counts the machine as busy at once, so
   a requeued job cannot put a second runner on a used ephemeral machine.
 - Up fork after a restart is used (`FixCrashSeen`): an `Up` job fork first seen after a
@@ -398,7 +401,7 @@ Runner states, mapped from GitHub's `status` and `busy`:
 | - | - |
 | `Busy` | `busy` |
 | `Idle` | `online`, not busy |
-| `Offline` | `offline`, after this process saw it `online` |
+| `Offline` | `offline`, after this process saw it `online`; one listed `busy` at the last observe stays `Busy` for this one |
 | `Registered` | `offline` and never seen `online`: JIT config issued, not started yet |
 
 A `Registered` runner that never comes online times out `register_timeout_s` after the

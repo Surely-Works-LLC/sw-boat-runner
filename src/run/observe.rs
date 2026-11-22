@@ -37,6 +37,8 @@ pub(super) struct Memory {
     machines: HashMap<String, Seen>,
     /// Runner names this process has seen online; see `github::runner_state`.
     online: HashSet<String>,
+    /// Runners GitHub listed `busy` at the last observe; see `Memory::runners`.
+    busy: HashSet<String>,
     /// Starts boat accepted that its listing may not show yet.
     inflight: Vec<Inflight>,
     /// Whether an observe has succeeded since this process started.
@@ -192,6 +194,11 @@ impl Memory {
     }
 
     /// GitHub's runners of the policy's pools, with the state only this process can tell.
+    /// A runner listed busy at the last observe and offline now stays `Busy` for this
+    /// observe, as a listing that lags or blips can show a runner offline while it still
+    /// runs its job. `decide` unregisters an `Offline` runner and gives its slot a new one,
+    /// whose start would kill that job. Offline twice in a row, it is `Offline`; a runner
+    /// that really died keeps its slot one tick longer.
     fn runners(
         &mut self,
         cfg: &Config,
@@ -203,6 +210,7 @@ impl Memory {
         let mut runners = Vec::new();
         let mut abandoned = Vec::new();
         let mut listed_names = HashSet::new();
+        let mut busy = HashSet::new();
         for r in listed {
             listed_names.insert(r.name.clone());
             let Some(n) = github::parse_runner_name(&r.name) else {
@@ -216,7 +224,12 @@ impl Memory {
                 let took = now.saturating_sub(n.registered_at);
                 self.came_online.push((r.name.clone(), took));
             }
-            let state = github::runner_state(online, r.busy, self.online.contains(&r.name));
+            let mut state = github::runner_state(online, r.busy, self.online.contains(&r.name));
+            if state == RunnerState::Busy {
+                busy.insert(r.name.clone());
+            } else if state == RunnerState::Offline && self.busy.contains(&r.name) {
+                state = RunnerState::Busy;
+            }
             if let Some((machine, _)) = self.abandoned.get(&r.name) {
                 if state == RunnerState::Registered {
                     abandoned.push(Abandoned {
@@ -240,6 +253,7 @@ impl Memory {
             });
         }
         self.online.retain(|name| ids.contains_key(name));
+        self.busy = busy;
         // One GitHub has not listed within a request timeout and a tick is gone.
         self.abandoned.retain(|name, (_, noted)| {
             listed_names.contains(name) || now.saturating_sub(*noted) <= lag_s
@@ -590,6 +604,43 @@ mod tests {
             .into_iter()
             .map(|m| (m.id, m.state))
             .collect()
+    }
+
+    /// GitHub lists runner 11 busy, then offline twice; runner 12 idle, then offline
+    /// twice. Runner 11 may still run its job after the first offline listing, so it
+    /// stays `Busy` and `decide` neither unregisters it nor gives its slot a new runner;
+    /// the second makes it `Offline`. Runner 12 had no job and is `Offline` at once.
+    #[test]
+    fn a_busy_runner_listed_offline_once_stays_busy() {
+        let cfg = config();
+        let listings = std::cell::Cell::new(0);
+        let fake = crate::transport::fake::Fake::new(move |s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                listings.set(listings.get() + 1);
+                let (status, busy) = if listings.get() == 1 {
+                    ("online", true)
+                } else {
+                    ("offline", false)
+                };
+                let body = format!(
+                    r#"{{"total_count":2,"runners":[
+                    {{"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"{status}","busy":{busy}}},
+                    {{"id":12,"name":"sbr-ci-bx_22222222-1-900","status":"{status}","busy":false}}]}}"#
+                );
+                return crate::transport::fake::respond(200, &[], &body);
+            }
+            reply(s)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let states: Vec<Vec<RunnerState>> = [NOW, NOW + 15, NOW + 30]
+            .into_iter()
+            .map(|now| {
+                let snapshot = tick_loop.observe(now).unwrap().snapshot;
+                snapshot.runners.iter().map(|r| r.state).collect()
+            })
+            .collect();
+        use RunnerState::{Busy, Idle, Offline};
+        assert_eq!(states, [[Busy, Idle], [Busy, Offline], [Offline, Offline]]);
     }
 
     /// When the forks `Memory` waits for were sent.
