@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `run` no longer kills a job when GitHub refuses to unregister its runner. `decide`
+  unregisters a runner GitHub lists offline, or one on a machine not `Up`, and gives its
+  slot a new runner in the same tick. When the runner in fact ran a job, GitHub refused
+  the delete with a 422, the register went ahead, and the slot's start command killed the
+  job with `pkill` ("The runner has received a shutdown signal"). A failed unregister now
+  leaves its runner's slot taken until GitHub deletes the runner; the machine's other
+  slots still take runners.
+- The slot start command exits with an error, and kills nothing, while the slot's
+  `Runner.Worker` runs a job.
+- A runner GitHub listed busy at the last observe and lists offline now stays `Busy` for
+  one more observe before `run` unregisters it.
+
+### Changed
+
+- `run` logs `unregister <runner>: <reason>` before it asks GitHub, so a refused unregister
+  shows what triggered it. Before, the line came only after GitHub deleted the runner.
+
 ## [0.3.6] - 2026-11-21
 
 ### Added
