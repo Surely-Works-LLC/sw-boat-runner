@@ -37,6 +37,7 @@ pub(super) fn config() -> Config {
             register_timeout_s: 300,
             fork_ttl_s: 3_600,
             paid_start_cents_per_day: 100,
+            idle_warm: None,
         }],
     }
 }

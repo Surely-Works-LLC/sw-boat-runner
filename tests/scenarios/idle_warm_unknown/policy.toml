@@ -1,0 +1,8 @@
+# Pins: CancelWarm: a warm this process lost track of is cancelled once its machine is up, and no other warm starts meanwhile.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+idle_warm = { argv = ["./warm-cache"], cwd = "/home/user/work", interval_s = 600, timeout_s = 90 }

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `idle_warm`, a pool's command to keep caches warm on a kept machine that is up with no
+  runner. A job cancels it, and the runner goes on only once the machine confirms every
+  process of the warm ended; a warm never starts a machine or delays an idle stop. It
+  needs `STATE_DIRECTORY`. See [Idle warm](README.md#idle-warm).
+
 ## [0.3.6] - 2026-11-21
 
 ### Added

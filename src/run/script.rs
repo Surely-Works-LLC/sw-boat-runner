@@ -1,4 +1,7 @@
-//! The shell command that starts a JIT runner on a machine, and where its config waits.
+//! The shell commands that start a JIT runner on a machine and run or cancel an idle
+//! warm, and where a runner's config waits.
+
+use crate::model::IdleWarm;
 
 /// Where the jit config of `slot` waits for the start command; deleted once read.
 pub(super) fn jit_path(slot: u32) -> String {
@@ -40,6 +43,69 @@ pub(super) fn start_command(slot: u32) -> String {
          ACTIONS_RUNNER_INPUT_JITCONFIG=\"$(cat \"$f\")\"; rm -f \"$f\"; \
          export ACTIONS_RUNNER_INPUT_JITCONFIG; exec ./run.sh"
     )
+}
+
+/// Ends every process that carries `SBR_WARM` in its environment, except the process id
+/// in `$1`: TERM, up to 2 s for them to exit, then KILL every 0.1 s for up to 1 s more.
+/// Exits 1 if one is left. Every process a warm starts inherits the variable wherever it
+/// moves in process groups and sessions (`setsid`, a double fork), so this finds what
+/// a kill of the process group would miss. It must run without the variable itself.
+const END_WARM: &str = "s=$1; m() { grep -lzs '^SBR_WARM=' /proc/[0-9]*/environ | cut -d/ -f3 | grep -vx \"$s\"; }; \
+     p=$(m); [ -z \"$p\" ] || kill -TERM $p 2>/dev/null; i=0; \
+     while p=$(m); [ -n \"$p\" ]; do [ $i -lt 30 ] || exit 1; \
+     [ $i -lt 20 ] || kill -KILL $p 2>/dev/null; i=$((i+1)); sleep 0.1; done";
+
+/// Runs a warm, unless `cancel_command` ran for its token first: `cd` to its working
+/// directory and run it under `timeout` (TERM, then KILL 2 s later) with its output in
+/// `/tmp/sbr-idle-warm.log`, end whatever it left running, and print `finish <status>
+/// <seconds>` or `timeout <seconds>`. Arguments: `END_WARM`, the token, cwd, timeout_s,
+/// argv. It checks the token with the marker already set, so a cancel either finds this
+/// shell or keeps it from starting anything.
+const SUPERVISE: &str = "k=$1 t=$2 d=$3 s=$4; shift 4; [ ! -e /tmp/sbr-warm-$t ] || exit 0; \
+     umask 077; b=$(date +%s); { cd \"$d\" && timeout -k 2 \"$s\" \"$@\"; } </dev/null >/tmp/sbr-idle-warm.log 2>&1; \
+     r=$?; e=$(($(date +%s) - b)); env -u SBR_WARM sh -c \"$k\" sh $$ || exit 1; \
+     if [ $e -lt $s ]; then echo \"finish $r $e\"; else echo \"timeout $e\"; fi";
+
+fn quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+/// Starts `warm` for pool `pool` under `token`, a UUID, with only `HOME`, `PATH`,
+/// `SBR_POOL` and the `SBR_WARM` marker in its environment. Kept in boat's command
+/// history like every command, so the policy's arguments must hold no secret.
+pub(super) fn warm_command(token: &str, pool: &str, warm: &IdleWarm) -> String {
+    let argv: Vec<String> = warm.argv.iter().map(|a| quote(a)).collect();
+    format!(
+        "exec /usr/bin/env -i SBR_WARM={token} HOME=/home/user PATH=/usr/local/bin:/usr/bin:/bin \
+         SBR_POOL={} /bin/sh -c {} sh {} {token} {} {} {}",
+        quote(pool),
+        quote(SUPERVISE),
+        quote(END_WARM),
+        quote(&warm.cwd),
+        warm.timeout_s,
+        argv.join(" ")
+    )
+}
+
+/// Marks `token` cancelled, so a launch boat runs late does nothing, then ends every
+/// warm process on the machine. Prints `clear` once none is left.
+pub(super) fn cancel_command(token: &str) -> String {
+    format!(
+        ": > /tmp/sbr-warm-{token} && sh -c {} sh 0 && echo clear",
+        quote(END_WARM)
+    )
+}
+
+/// What `SUPERVISE` printed, as its log line's event and detail; `None` for anything else.
+pub(super) fn warm_result(stdout: &str) -> Option<(&'static str, String)> {
+    let mut words = stdout.split_whitespace();
+    let event = words.next()?;
+    let numbers: Vec<u64> = words.map(str::parse).collect::<Result<_, _>>().ok()?;
+    match (event, numbers.as_slice()) {
+        ("finish", &[status, secs]) => Some(("finish", format!("status {status}, {secs}s"))),
+        ("timeout", &[secs]) => Some(("timeout", format!("{secs}s"))),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +155,108 @@ mod tests {
             looked,
             kept,
         )
+    }
+
+    /// The warm and cancel commands run here as boat runs them, with `sh -c`. One test,
+    /// as a cancel ends every warm process on the machine.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn warms_end_whole_and_on_time() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let marked = || {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg("grep -lzs '^SBR_WARM=' /proc/[0-9]*/environ | wc -l")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+        };
+        let dir = std::env::temp_dir();
+        let warm = |timeout_s: u64, script: &str| IdleWarm {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            cwd: dir.display().to_string(),
+            interval_s: 600,
+            timeout_s,
+        };
+        let launch = |token: &str, w: &IdleWarm| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(warm_command(token, "ci", w))
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let cancel = |token: &str| {
+            let out = Command::new("sh")
+                .arg("-c")
+                .arg(cancel_command(token))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let token = |n: u32| format!("test-{}-{n}", std::process::id());
+        // Ignores TERM, and one child leaves the session and the process group.
+        let stubborn = "trap '' TERM; setsid sh -c 'sleep 60' & sleep 60 & wait";
+
+        let t = token(1);
+        let mut child = launch(&t, &warm(600, stubborn));
+        let began = Instant::now();
+        while marked() < 4 {
+            assert!(
+                began.elapsed() < Duration::from_secs(5),
+                "the warm did not start"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let began = Instant::now();
+        assert_eq!(cancel(&t), "clear\n");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(marked(), 0);
+        child.wait().unwrap();
+
+        // The time limit ends the same tree, and what the command left behind.
+        let began = Instant::now();
+        let out = launch(&token(2), &warm(1, stubborn))
+            .wait_with_output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.starts_with("timeout "), "{out:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(marked(), 0);
+        assert_eq!(warm_result(&out).unwrap().0, "timeout");
+
+        // A command that exits early has its background processes ended too.
+        let out = launch(&token(3), &warm(600, "sleep 60 & exit 3"))
+            .wait_with_output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert_eq!(warm_result(&out), Some(("finish", "status 3, 0s".into())));
+        assert_eq!(marked(), 0);
+
+        // A launch boat carries out after its cancel starts nothing.
+        let t = token(4);
+        assert_eq!(cancel(&t), "clear\n");
+        let out = launch(&t, &warm(600, "sleep 60"))
+            .wait_with_output()
+            .unwrap();
+        assert!(out.stdout.is_empty() && out.status.success());
+        assert_eq!(marked(), 0);
+        for n in 1..=4 {
+            let _ = std::fs::remove_file(format!("/tmp/sbr-warm-{}", token(n)));
+        }
     }
 
     #[test]

@@ -1,0 +1,28 @@
+{
+  "now": 1000000,
+  "machines": [
+    {
+      "id": "bx_22222222",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 999940,
+      "job": null
+    },
+    {
+      "id": "bx_33333333",
+      "pool": "ci",
+      "state": "up",
+      "since": 990000,
+      "last_busy": 998500,
+      "job": null
+    }
+  ],
+  "runners": [],
+  "queued": [],
+  "limits": {
+    "can_start": true,
+    "next_start_cents": 0,
+    "spent_today_cents": 0
+  }
+}

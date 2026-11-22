@@ -68,6 +68,8 @@ fn scenarios_plan_the_expected_actions() {
         "Stop",
         "Delete",
         "Unregister",
+        "Warm",
+        "CancelWarm",
     ];
     for guard in guards {
         if !pins.contains(&format!("{guard}:")) && !pins.contains(&format!("{guard} ")) {

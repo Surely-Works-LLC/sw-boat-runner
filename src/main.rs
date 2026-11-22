@@ -151,6 +151,12 @@ fn cmd_check(cfg: &model::Config) -> ExitCode {
             p.idle_stop_s,
             p.paid_start_cents_per_day,
         );
+        if let Some(w) = &p.idle_warm {
+            println!(
+                "pool {} idle_warm every {}s timeout {}s cwd {} argv {:?}",
+                p.name, w.interval_s, w.timeout_s, w.cwd, w.argv
+            );
+        }
     }
     for warning in policy::warnings(cfg) {
         eprintln!("warning: {warning}");

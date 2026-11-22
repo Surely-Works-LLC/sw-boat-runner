@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use crate::model::{
-    Action, JobKey, Machine, MachineState, Placement, Pool, Runner, RunnerState, Snapshot,
+    Action, JobKey, Machine, MachineState, Placement, Pool, Runner, RunnerState, Snapshot, Warming,
 };
 use MachineState::{Gone, Starting, Stopped, Stopping, Up};
 use Placement::{Fork, Resume, Slot};
@@ -35,8 +35,9 @@ pub const STUCK_START_S: u64 = 3600;
 /// after a job ends even when a pass is slow.
 pub const STANDBY_FRESH_S: u64 = 120;
 
-/// The actions for `pool`, in this order: unregisters, deletes, registers, resumes, kept
-/// forks, job forks, stops. Inputs are sorted first, so their order in `snap` does not
+/// The actions for `pool`, in this order: unregisters, deletes, registers (each machine's
+/// first after a `CancelWarm` when its warm may run), resumes, kept forks, job forks,
+/// stops, warm cancels, a warm. Inputs are sorted first, so their order in `snap` does not
 /// matter. `snap.queued` holds only the jobs routed to this pool (see `run::route`).
 pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     let v = View::new(snap, pool);
@@ -63,23 +64,13 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
     let mut registered_on = BTreeSet::new();
     let mut free = v.register(&unregistered);
     for (m, slot) in free.by_ref().take(want) {
-        registered_on.insert(m.id.as_str());
-        actions.push(Action::Register {
-            pool: pool.name.clone(),
-            machine: m.id.clone(),
-            slot,
-        });
+        v.register_on(&mut actions, &mut registered_on, m, slot);
         want -= 1;
     }
     // Demand left means no slot is free, so this takes none.
     let ahead = v.standby_short(&unregistered);
     for (m, slot) in free.filter(|(m, _)| v.standby(m)).take(ahead) {
-        registered_on.insert(m.id.as_str());
-        actions.push(Action::Register {
-            pool: pool.name.clone(),
-            machine: m.id.clone(),
-            slot,
-        });
+        v.register_on(&mut actions, &mut registered_on, m, slot);
     }
 
     // Without this, every tick until a machine is up would start more for the same jobs.
@@ -138,12 +129,29 @@ pub fn decide(snap: &Snapshot, pool: &Pool) -> Vec<Action> {
                 break;
             }
             if v.stop(m, &registered_on) {
+                deleted.insert(m.id.as_str());
                 actions.push(Action::Stop {
                     machine: m.id.clone(),
                 });
                 up -= 1;
             }
         }
+    }
+
+    // From here `deleted` holds the stopped machines too.
+    let busy =
+        |m: &&Machine| registered_on.contains(m.id.as_str()) || deleted.contains(m.id.as_str());
+    for m in v.kept(Up).filter(|m| !busy(m)) {
+        if snap.warming.get(&m.id) == Some(&Warming::Unknown) {
+            actions.push(Action::CancelWarm {
+                machine: m.id.clone(),
+            });
+        }
+    }
+    if let Some(m) = v.warm(busy) {
+        actions.push(Action::Warm {
+            machine: m.id.clone(),
+        });
     }
     actions
 }
@@ -244,6 +252,52 @@ impl<'a> View<'a> {
             !self.on(m).iter().any(taken)
         });
         fresh.chain(free)
+    }
+
+    /// Register `slot` of `m`, after a `CancelWarm` the first time it picks a machine whose
+    /// warm may still run (spec `CancelWarm`, `RegisterGuard`).
+    fn register_on(
+        &self,
+        actions: &mut Vec<Action>,
+        registered_on: &mut BTreeSet<&'a str>,
+        m: &'a Machine,
+        slot: u32,
+    ) {
+        if registered_on.insert(m.id.as_str()) && self.snap.warming.contains_key(&m.id) {
+            actions.push(Action::CancelWarm {
+                machine: m.id.clone(),
+            });
+        }
+        actions.push(Action::Register {
+            pool: self.pool.name.clone(),
+            machine: m.id.clone(),
+            slot,
+        });
+    }
+
+    /// Warm (spec `WarmGuard`), in a pool with `idle_warm` and no machine up whose warm
+    /// may run: a kept `Up` machine with no runner, not `busy` (registered on or stopped
+    /// this tick), and idle since its last job and its last warm for `interval_s`; the one
+    /// idle longest. A machine with no runner left after the registers means no queued
+    /// job and no standby runner wants it. The idle clock is left alone, so a warm never
+    /// delays a stop.
+    fn warm(&self, busy: impl Fn(&&Machine) -> bool) -> Option<&'a Machine> {
+        let w = self.pool.idle_warm.as_ref()?;
+        if self.kept(Up).any(|m| self.snap.warming.contains_key(&m.id)) {
+            return None;
+        }
+        let idle_from = |m: &Machine| {
+            let warmed = self.snap.warmed_at.get(&m.id).copied().unwrap_or(0);
+            m.last_busy.max(warmed)
+        };
+        let due = |m: &&'a Machine| {
+            self.on(m).is_empty()
+                && !busy(m)
+                && self.snap.now >= idle_from(m).saturating_add(w.interval_s)
+        };
+        self.kept(Up)
+            .filter(due)
+            .min_by_key(|m| (idle_from(m), m.id.as_str()))
     }
 
     /// Runners the pool is short of `standby`: `standby` minus its `Registered` and `Idle`
@@ -524,7 +578,7 @@ fn run_of<'s, T>(sorted: &'s [T], key: &str, key_of: impl Fn(&T) -> &String) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Limits, MachineState as Ms, QueuedJob, RunnerState as Rs};
+    use crate::model::{IdleWarm, Limits, MachineState as Ms, QueuedJob, RunnerState as Rs};
 
     const NOW: u64 = 10_000;
 
@@ -602,6 +656,8 @@ mod tests {
                 free_starts_left: None,
             },
             queued_at: Default::default(),
+            warming: Default::default(),
+            warmed_at: Default::default(),
         }
     }
 
@@ -1247,8 +1303,9 @@ mod tests {
             ];
             let times = (0u64..200, 0u64..200, 0u64..200, 1u64..400);
             let boxes = (1u32..5, 0u32..5, 1u32..3, 0u32..3);
-            (shape, boxes, times, 0u32..30).prop_map(
-                |(placement, (max_boxes, min_up, slots, standby), times, cap)| {
+            let warm = proptest::option::of(0u64..300);
+            (shape, boxes, times, 0u32..30, warm).prop_map(
+                |(placement, (max_boxes, min_up, slots, standby), times, cap, warm)| {
                     let has_slot = placement.contains(&Slot);
                     Pool {
                         name: "p".into(),
@@ -1270,6 +1327,12 @@ mod tests {
                         register_timeout_s: times.2,
                         fork_ttl_s: times.3,
                         paid_start_cents_per_day: cap,
+                        idle_warm: warm.filter(|_| has_slot).map(|interval_s| IdleWarm {
+                            argv: vec!["w".into()],
+                            cwd: "/".into(),
+                            interval_s,
+                            timeout_s: 1,
+                        }),
                     }
                 },
             )
@@ -1284,7 +1347,18 @@ mod tests {
                 Just(Ms::Gone),
             ];
             let job = proptest::option::of((0u64..4, 0u32..2));
-            let machine = (any::<bool>(), machine_state, 0u64..=1000, 0u64..=1000, job);
+            let warm = (
+                proptest::option::of(prop_oneof![Just(Warming::Running), Just(Warming::Unknown)]),
+                proptest::option::of(0u64..=1200),
+            );
+            let machine = (
+                any::<bool>(),
+                machine_state,
+                0u64..=1000,
+                0u64..=1000,
+                job,
+                warm,
+            );
             let runner_state = prop_oneof![
                 Just(Rs::Registered),
                 Just(Rs::Idle),
@@ -1307,10 +1381,22 @@ mod tests {
             )
                 .prop_map(|(machines, runners, queued, limits, now)| Snapshot {
                     now,
+                    warming: machines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, m)| {
+                            Some((format!("m{i}"), m.5.0.filter(|_| m.4.is_none())?))
+                        })
+                        .collect(),
+                    warmed_at: machines
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, m)| Some((format!("m{i}"), m.5.1?)))
+                        .collect(),
                     machines: machines
                         .into_iter()
                         .enumerate()
-                        .map(|(i, (own, state, since, last_busy, job))| Machine {
+                        .map(|(i, (own, state, since, last_busy, job, _))| Machine {
                             id: format!("m{i}"),
                             pool: pool_name(own),
                             state,
@@ -1493,6 +1579,8 @@ mod tests {
             /// then nothing is left.
             #[test]
             fn settles_once_applied(pool in arb_pool(), up in 0u32..5, idle in 0u64..200) {
+                // A warm recurs in a settled pool, so `Settles` leaves it out.
+                let pool = Pool { idle_warm: None, ..pool };
                 // Machines above min_up are settled only while they have been busy recently,
                 // and a pool without slot keeps no kept machine at all.
                 let up = if !pool.placement.contains(&Placement::Slot) {
@@ -1520,6 +1608,8 @@ mod tests {
                     queued: vec![],
                     limits: Limits { can_start: true, next_start_cents: 0, spent_today_cents: 0, free_starts_left: None },
                     queued_at: Default::default(),
+                    warming: Default::default(),
+                    warmed_at: Default::default(),
                 };
                 let standby = decide(&snap, &pool);
                 prop_assert!(standby.len() <= pool.standby as usize, "{standby:?}");
@@ -1586,6 +1676,8 @@ mod tests {
                         Action::Fork { pool: name, .. } => *name == pool.name,
                         Action::Resume { machine }
                         | Action::Stop { machine }
+                        | Action::Warm { machine }
+                        | Action::CancelWarm { machine }
                         | Action::Delete { machine } => pool_machine(&snap, &pool, machine).is_some(),
                         Action::Unregister { runner } => snap
                             .runners
@@ -1707,6 +1799,62 @@ mod tests {
                 reversed.runners.reverse();
                 reversed.queued.reverse();
                 prop_assert_eq!(decide(&snap, &pool), decide(&reversed, &pool));
+            }
+
+            /// Spec `NoJobDuringWarm`: a machine whose warm may run gets a `CancelWarm`
+            /// before its first `Register`, and act skips the machine if that fails.
+            #[test]
+            fn no_job_during_warm(snap in arb_snapshot(), pool in arb_pool()) {
+                let actions = decide(&snap, &pool);
+                for (i, a) in actions.iter().enumerate() {
+                    if let Action::Register { machine, .. } = a {
+                        let cancel = Action::CancelWarm { machine: machine.clone() };
+                        let warming = snap.warming.contains_key(machine);
+                        prop_assert!(!warming || actions[..i].contains(&cancel), "{actions:?}");
+                    }
+                }
+            }
+
+            /// Spec `WarmRetainsCapacity` and `WarmingNeverIncreasesBoxes`, for one tick: a
+            /// warm, running or not, or `idle_warm` itself, changes no other action; it only
+            /// adds `CancelWarm` and `Warm`.
+            #[test]
+            fn warming_changes_no_other_action(snap in arb_snapshot(), pool in arb_pool()) {
+                let mut actions = decide(&snap, &pool);
+                actions.retain(|a| !matches!(a, Action::Warm { .. } | Action::CancelWarm { .. }));
+                let mut cleared = snap.clone();
+                cleared.warming.clear();
+                let no_hook = Pool { idle_warm: None, ..pool.clone() };
+                prop_assert_eq!(actions, decide(&cleared, &no_hook));
+            }
+
+            /// `Warm` (spec `WarmGuard`): at most one, while no machine of the pool that is
+            /// up may still run one, on a kept `Up` machine with no runner and no other
+            /// action, idle since its last job and warm for `interval_s`.
+            #[test]
+            fn warm_only_on_a_spare_machine(snap in arb_snapshot(), pool in arb_pool()) {
+                let actions = decide(&snap, &pool);
+                let warms: Vec<&String> = actions.iter().filter_map(|a| match a {
+                    Action::Warm { machine } => Some(machine),
+                    _ => None,
+                }).collect();
+                prop_assert!(warms.len() <= 1);
+                let Some(&id) = warms.first() else { return Ok(()) };
+                let m = pool_machine(&snap, &pool, id).unwrap();
+                let interval = pool.idle_warm.as_ref().unwrap().interval_s;
+                let warmed = snap.warmed_at.get(id).copied().unwrap_or(0);
+                prop_assert!(!m.is_ephemeral() && m.state == Ms::Up);
+                prop_assert!(snap.now >= m.last_busy.max(warmed) + interval);
+                prop_assert!(!snap.runners.iter().any(|r| r.machine == *id));
+                prop_assert!(!snap.machines.iter().any(|n| n.pool == pool.name
+                    && n.state == Ms::Up && snap.warming.contains_key(&n.id)));
+                let named = actions.iter().filter(|a| match a {
+                    Action::Register { machine, .. } | Action::Stop { machine }
+                    | Action::Delete { machine } | Action::CancelWarm { machine }
+                    | Action::Warm { machine } => machine == id,
+                    _ => false,
+                });
+                prop_assert_eq!(named.count(), 1, "{:?}", actions);
             }
         }
     }

@@ -38,6 +38,9 @@ jobs:
           - name: warm-standby
             cfg: spec/BoatRunner.cfg
             edit: 's/^Placement = .*/Placement = {"slot", "resume"}/;s/^Standby = 0/Standby = 1/'
+          - name: idle-warm
+            cfg: spec/BoatRunner.cfg
+            edit: 's/^Placement = .*/Placement = {"slot", "resume"}/;s/^WarmEnabled = FALSE/WarmEnabled = TRUE/'
           - name: hybrid-minup-standby
             cfg: spec/BoatRunner.cfg
             edit: 's/^MinUp = 0/MinUp = 1/;s/^InitStopped = {m1}/InitStopped = {}/;s/^Standby = 0/Standby = 1/'

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::boat::MAX_TTL_S;
-use crate::model::{Cents, Config, Placement, Pool};
+use crate::model::{Cents, Config, IdleWarm, Placement, Pool};
 use crate::run::HOME_WAIT_S;
 
 const MACHINE_TYPES: [&str; 4] = ["small", "default", "large", "xlarge"];
@@ -68,11 +68,23 @@ pub fn parse(text: &str) -> Result<Config, Error> {
         }
         pools.push(pool);
     }
-    Ok(Config {
+    let cfg = Config {
         repo: raw.repo,
         tick_s: raw.tick_s,
         pools,
-    })
+    };
+    // A runner registered within this long may be missing from GitHub's list, and a
+    // warm goes only on a machine the list shows without one; see `decide`.
+    let lag = crate::run::list_lag_s(&cfg);
+    for p in &cfg.pools {
+        if p.idle_warm.as_ref().is_some_and(|w| w.interval_s <= lag) {
+            return Err(Error::Invalid(format!(
+                "pool {:?}: idle_warm.interval_s must be above {lag} (90 plus tick_s)",
+                p.name
+            )));
+        }
+    }
+    Ok(cfg)
 }
 
 /// The keys of the policy itself; every other top-level key belongs to a pool.
@@ -184,6 +196,7 @@ struct RawPool {
     register_timeout_s: Option<u64>,
     fork_ttl_s: Option<u64>,
     paid_start_cents_per_day: Option<Cents>,
+    idle_warm: Option<IdleWarm>,
 }
 
 /// The preset tables in docs/design.md#strategies and README.md#policy; the test
@@ -232,6 +245,7 @@ impl RawPool {
             register_timeout_s: self.register_timeout_s.unwrap_or(HOME_WAIT_S + 300),
             fork_ttl_s: self.fork_ttl_s.unwrap_or(3600),
             paid_start_cents_per_day: self.paid_start_cents_per_day.unwrap_or(0),
+            idle_warm: self.idle_warm,
         }
     }
 }
@@ -313,6 +327,20 @@ fn validate(p: &Pool) -> Result<(), String> {
     if !(1..=MAX_TTL_S).contains(&p.fork_ttl_s) {
         return Err(format!("fork_ttl_s must be 1 to {MAX_TTL_S}"));
     }
+    if let Some(warm) = &p.idle_warm {
+        if !p.has(Placement::Slot) {
+            return Err("idle_warm needs slot, as it runs on kept machines".into());
+        }
+        if warm.argv.first().is_none_or(String::is_empty) {
+            return Err("idle_warm.argv must name a command".into());
+        }
+        if !warm.cwd.starts_with('/') {
+            return Err("idle_warm.cwd must be an absolute path".into());
+        }
+        if warm.timeout_s == 0 {
+            return Err("idle_warm.timeout_s must be at least 1".into());
+        }
+    }
     Ok(())
 }
 
@@ -354,6 +382,37 @@ max_boxes = 4
     }
 
     #[test]
+    fn idle_warm_is_an_optional_pool_table() {
+        let table = "idle_warm = { argv = ['./warm', ''], cwd = '/home/user/work', interval_s = 600, timeout_s = 90 }";
+        assert!(parse(&policy("")).unwrap().pools[0].idle_warm.is_none());
+        let cfg = parse(&policy(table)).unwrap();
+        assert_eq!(
+            cfg.pools[0].idle_warm,
+            Some(IdleWarm {
+                argv: vec!["./warm".into(), String::new()],
+                cwd: "/home/user/work".into(),
+                interval_s: 600,
+                timeout_s: 90,
+            })
+        );
+        assert!(error(&policy(&format!("preset = 'fork'\n{table}"))).contains("needs slot"));
+        for (from, to, field) in [
+            ("['./warm', '']", "[]", "argv"),
+            ("['./warm', '']", "['']", "argv"),
+            ("'/home/user/work'", "'work'", "cwd"),
+            (
+                "interval_s = 600",
+                "interval_s = 105",
+                "interval_s must be above 105",
+            ),
+            ("timeout_s = 90", "timeout_s = 0", "timeout_s"),
+        ] {
+            assert!(error(&policy(&table.replace(from, to))).contains(field));
+        }
+        assert!(parse(&policy(&table.replace("600", "106"))).is_ok());
+    }
+
+    #[test]
     fn warm_is_the_default_preset() {
         let cfg = parse(&policy("")).unwrap();
         assert_eq!(cfg.repo, "acme/app");
@@ -375,6 +434,7 @@ max_boxes = 4
                 register_timeout_s: 900,
                 fork_ttl_s: 3600,
                 paid_start_cents_per_day: 0,
+                idle_warm: None,
             }]
         );
     }
@@ -400,6 +460,7 @@ max_boxes = 4
                 register_timeout_s: 900,
                 fork_ttl_s: 3600,
                 paid_start_cents_per_day: 0,
+                idle_warm: None,
             }
         );
     }

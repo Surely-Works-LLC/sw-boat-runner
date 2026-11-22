@@ -53,6 +53,20 @@ pub struct Pool {
     pub register_timeout_s: u64,
     pub fork_ttl_s: u64,
     pub paid_start_cents_per_day: Cents,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_warm: Option<IdleWarm>,
+}
+
+/// A command run on a kept machine no job or standby runner needs
+/// (docs/design.md#idle-warm).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleWarm {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    /// Least time between a machine's last job or warm and its next warm.
+    pub interval_s: u64,
+    pub timeout_s: u64,
 }
 
 impl Pool {
@@ -158,6 +172,24 @@ pub struct Snapshot {
     /// memory only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub queued_at: BTreeMap<String, UnixSecs>,
+    /// Machines whose warm may still run, by id. A job goes on one only after a
+    /// `CancelWarm`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub warming: BTreeMap<String, Warming>,
+    /// When each kept machine of a pool with `idle_warm` last started a warm, or this
+    /// process started; in memory only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub warmed_at: BTreeMap<String, UnixSecs>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warming {
+    /// This process watches its command.
+    Running,
+    /// Its launch went unanswered, the machine stopped, or this process restarted: the
+    /// daemon cancels it as soon as the machine is up.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,5 +216,11 @@ pub enum Action {
     },
     Unregister {
         runner: String,
+    },
+    Warm {
+        machine: String,
+    },
+    CancelWarm {
+        machine: String,
     },
 }

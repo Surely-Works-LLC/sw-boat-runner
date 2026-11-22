@@ -1,0 +1,9 @@
+# Pins: Warm: the standby runner takes the machine whose job just ended, and the warm goes on another.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+standby = 1
+idle_warm = { argv = ["./warm-cache"], cwd = "/home/user/work", interval_s = 600, timeout_s = 90 }
