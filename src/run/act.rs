@@ -1064,7 +1064,7 @@ mod tests {
             |_: &Snapshot, _: &Pool| vec![stop("bx_22222222"), delete("bx_44444444")];
         tick_loop.tick(NOW, stop_and_delete).unwrap();
         assert_eq!(
-            requests(&fake)[6..],
+            requests(&fake)[observe_requests().len()..],
             [
                 format!("DELETE {GH}/runners/12"),
                 format!("DELETE {BOAT}/sandboxes/bx_44444444"),
@@ -1087,7 +1087,7 @@ mod tests {
             .tick(NOW, |_, _| vec![resume("bx_33333333")])
             .unwrap();
         assert_eq!(
-            requests(&fake)[6..],
+            requests(&fake)[observe_requests().len()..],
             [
                 format!("POST {BOAT}/sandboxes/bx_33333333/resume"),
                 format!("DELETE {BOAT}/sandboxes/bx_33333333"),
