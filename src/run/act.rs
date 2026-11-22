@@ -585,6 +585,13 @@ impl Loop<'_> {
                 machine,
                 slot,
             } => {
+                // The plan may have freed this slot, but a refused unregister leaves
+                // its runner in place. Starting a replacement would terminate it.
+                if t.snapshot.runners.iter().any(|r| {
+                    r.machine == *machine && r.slot == *slot && t.runner_ids.contains_key(&r.name)
+                }) {
+                    return Ok(());
+                }
                 if self.free_of_logins(t, pool, machine)? {
                     self.register(t, pool, machine, *slot)
                 } else {
@@ -1074,6 +1081,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_unregister_protects_its_slot_until_the_runner_is_removed() {
+        let cfg = config();
+        let refuse = std::cell::Cell::new(true);
+        let fake = Fake::new(move |s| {
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") && refuse.replace(false)
+            {
+                respond(422, &[], r#"{"message":"Runner is still running a job"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let replace = |_: &Snapshot, _: &Pool| {
+            vec![
+                unregister("sbr-ci-bx_22222222-0-900"),
+                register("bx_22222222", 0),
+                register("bx_22222222", 1),
+            ]
+        };
+        let registered_slots = || {
+            fake.sent()
+                .into_iter()
+                .filter(|s| s.url.ends_with("/generate-jitconfig"))
+                .map(|s| s.body_text())
+                .collect::<Vec<_>>()
+        };
+        tick_loop.tick(NOW, replace).unwrap();
+        let names = registered_slots();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].contains("sbr-ci-bx_22222222-1-"), "{names:?}");
+
+        tick_loop.tick(NOW + 15, replace).unwrap();
+        let names = registered_slots();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[1].contains("sbr-ci-bx_22222222-0-"), "{names:?}");
+    }
+
+    #[test]
     fn a_stopped_machine_whose_disk_boat_deleted_is_deleted() {
         let cfg = config();
         let fake = Fake::new(|s| {
@@ -1442,7 +1487,8 @@ mod tests {
                     return respond(500, &[], r#"{"code":"internal"}"#);
                 }
             }
-            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+            if writes.get() > 0 && s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?"))
+            {
                 // GitHub lists the runner the failed start registered, never online.
                 let body = format!(
                     r#"{{"total_count":2,"runners":[
