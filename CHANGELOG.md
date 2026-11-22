@@ -6,8 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-11-22
+
 ### Fixed
 
+- `run` finds queued jobs in workflow runs GitHub lists as `pending`, `requested` or
+  `waiting`, as well as `queued` and `in_progress`. Before, a job queued in such a run got
+  no runner until its run's status changed. Each run is read once whatever lists it, and a
+  status that showed no job for a pool is checked again after two minutes, so the request
+  budget holds.
 - `run` no longer kills a job when GitHub refuses to unregister its runner. `decide`
   unregisters a runner GitHub lists offline, or one on a machine not `Up`, and gives its
   slot a new runner in the same tick. When the runner in fact ran a job, GitHub refused
@@ -398,7 +405,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...v0.3.4
