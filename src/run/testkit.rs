@@ -107,7 +107,12 @@ pub(super) fn reply(s: &Sent) -> Response {
         ("GET", u) if u.contains("status=queued") => {
             r#"{"workflow_runs":[{"id":5,"run_attempt":1}]}"#
         }
-        ("GET", u) if u.contains("status=in_progress") || u.contains("status=pending") => {
+        ("GET", u)
+            if u.contains("status=in_progress")
+                || u.contains("status=pending")
+                || u.contains("status=requested")
+                || u.contains("status=waiting") =>
+        {
             r#"{"workflow_runs":[]}"#
         }
         ("GET", u) if u.contains("/runs/5/jobs") => {
@@ -145,7 +150,7 @@ pub(super) fn requests(fake: &Fake) -> Vec<String> {
 }
 
 /// The reads that start an observation of one pool with one queued run.
-pub(super) fn observe_requests() -> [String; 7] {
+pub(super) fn observe_requests() -> [String; 9] {
     [
         format!("GET {BOAT}/sandboxes?label=sw-boat-runner%3Dci&limit=200"),
         format!("GET {GH}/runners?per_page=100&page=1"),
@@ -153,6 +158,8 @@ pub(super) fn observe_requests() -> [String; 7] {
         format!("GET {GH}/runs?status=queued&per_page=100"),
         format!("GET {GH}/runs/5/jobs?per_page=100"),
         format!("GET {GH}/runs?status=in_progress&per_page=100"),
+        format!("GET {GH}/runs?status=requested&per_page=100"),
+        format!("GET {GH}/runs?status=waiting&per_page=100"),
         format!("GET {BOAT}/limits"),
     ]
 }

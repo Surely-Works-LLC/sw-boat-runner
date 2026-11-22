@@ -37,8 +37,12 @@ const BURST_MIN: f64 = 50.0;
 /// While the budget allows, an in-progress run's jobs are read at least this often, even
 /// when the run looks unchanged.
 pub(crate) const RUN_MAX_AGE_S: u64 = 60;
-/// Back off discovery of pending runs while none have a job a pool can serve.
+/// Back off discovery of deferred run statuses (`pending`, `requested`, `waiting`) while none
+/// have a job a pool can serve.
 const PENDING_RECHECK_S: u64 = 120;
+/// Additional deferred run statuses besides `pending` that can still carry queued jobs
+/// waiting for self-hosted runners, checked with spare budget after active runs.
+const EXTRA_DEFERRED_STATUSES: [&str; 2] = ["requested", "waiting"];
 /// However low the budget, the daemon observes at least this often while GitHub still
 /// answers, so cleanup goes on.
 pub(crate) const PACE_MAX_S: u64 = 300;
@@ -341,6 +345,8 @@ pub(crate) struct Client<'t> {
     /// In-progress runs by id.
     runs: HashMap<u64, RunJobs>,
     next_pending_read: UnixSecs,
+    next_extra_read: [UnixSecs; EXTRA_DEFERRED_STATUSES.len()],
+    extra_active: [bool; EXTRA_DEFERRED_STATUSES.len()],
     /// The cache was aged since `begin_tick`. Aging waits for the tick's first request, so
     /// a tick that sends nothing, such as one the budget skips, keeps every ETag.
     aged: bool,
@@ -373,6 +379,8 @@ impl<'t> Client<'t> {
             },
             runs: HashMap::new(),
             next_pending_read: 0,
+            next_extra_read: [0; EXTRA_DEFERRED_STATUSES.len()],
+            extra_active: [false; EXTRA_DEFERRED_STATUSES.len()],
             aged: true,
             elapsed: {
                 let origin = std::time::Instant::now();
@@ -703,11 +711,23 @@ impl<'t> Client<'t> {
             .collect())
     }
 
-    /// Queued jobs of pending, queued, and in-progress runs, up to `MAX_PAGES` pages
-    /// per list. `wanted` tells whether a pool serves a job's labels.
+    /// Keeps cached ETags for `status`'s run-list pages alive while a backoff skips them.
+    fn retain_status_etags(&mut self, status: &str) {
+        let prefix = format!("{API}/repos/{}/actions/runs?status={status}&", self.repo);
+        for (url, c) in &mut self.cache {
+            if url.starts_with(&prefix) {
+                c.used = true;
+            }
+        }
+    }
+
+    /// Queued jobs of pending, queued, in-progress, requested, and waiting runs, up to
+    /// `MAX_PAGES` pages per list. `wanted` tells whether a pool serves a job's labels.
     ///
     /// Queued runs are read every call. Pending runs are read as often while there is
     /// work for a pool, then at the first observation after `PENDING_RECHECK_S`.
+    /// Requested and waiting runs follow the same backoff after active runs are served,
+    /// using spare budget when in-progress runs are active and retaining ETags while skipped.
     /// A run that moves between lists is read once. In-progress runs can queue later
     /// jobs, so their jobs are read when they can matter:
     /// - every call, while the run is new or re-run, or its last read found a queued job
@@ -733,7 +753,8 @@ impl<'t> Client<'t> {
         let mut out = BTreeMap::new();
         let mut read = HashSet::new();
         // GitHub can report the parent as pending while its jobs already wait for runners.
-        if self.now >= self.next_pending_read {
+        let pending_skipped = self.now < self.next_pending_read;
+        if !pending_skipped {
             let first = format!("/actions/runs?status=pending&per_page={PER_PAGE}");
             let pending: Vec<Run> = self.list(&first, "workflow_runs")?;
             for run in pending {
@@ -747,6 +768,9 @@ impl<'t> Client<'t> {
         }
         let first = format!("/actions/runs?status=queued&per_page={PER_PAGE}");
         let queued: Vec<Run> = self.list(&first, "workflow_runs")?;
+        if pending_skipped {
+            self.retain_status_etags("pending");
+        }
         for run in queued {
             if read.insert(run.id) {
                 out.extend(self.run_jobs(run.id)?);
@@ -797,6 +821,35 @@ impl<'t> Client<'t> {
         }
         for read in self.runs.values() {
             out.extend(read.queued.iter().cloned());
+        }
+        // GitHub can also report runs as requested or waiting while jobs wait for runners.
+        // Check them after active runs so idle rechecks never starve saturated in-progress pools.
+        for (idx, status) in EXTRA_DEFERRED_STATUSES.iter().enumerate() {
+            let due = self.now >= self.next_extra_read[idx];
+            let may_read = self.next_extra_read[idx] == 0
+                || self.extra_active[idx]
+                || self.runs.is_empty()
+                || self.budget.has_token();
+            if !due || !may_read {
+                self.retain_status_etags(status);
+                continue;
+            }
+            let first = format!("/actions/runs?status={status}&per_page={PER_PAGE}");
+            let extra_runs: Vec<Run> = self.list(&first, "workflow_runs")?;
+            let mut found_wanted = false;
+            for run in extra_runs {
+                if read.insert(run.id) {
+                    let jobs = self.run_jobs(run.id)?;
+                    if jobs.iter().any(|(_, labels)| wanted(labels)) {
+                        found_wanted = true;
+                    }
+                    out.extend(jobs);
+                }
+            }
+            self.extra_active[idx] = found_wanted;
+            if !found_wanted {
+                self.next_extra_read[idx] = self.now.saturating_add(PENDING_RECHECK_S);
+            }
         }
         Ok(out
             .into_iter()
@@ -992,10 +1045,17 @@ mod tests {
         assert!(matches!(gh.runners(), Err(Error::RateLimited { .. })));
     }
 
+    fn is_deferred_status(url: &str) -> bool {
+        url.contains("status=pending")
+            || EXTRA_DEFERRED_STATUSES
+                .iter()
+                .any(|s| url.contains(&format!("status={s}")))
+    }
+
     #[test]
     fn queued_jobs_from_runs() {
         let fake = Fake::new(|s| {
-            let body = if s.url.contains("status=pending") {
+            let body = if is_deferred_status(&s.url) {
                 json!({"workflow_runs": []})
             } else if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5, "run_attempt": 2}]})
@@ -1052,7 +1112,10 @@ mod tests {
                     moved.set(false);
                     json!({"workflow_runs": []})
                 }
-            } else if s.url.contains("status=queued") {
+            } else if s.url.contains("status=requested")
+                || s.url.contains("status=waiting")
+                || s.url.contains("status=queued")
+            {
                 json!({"workflow_runs": []})
             } else if s.url.contains("status=in_progress") {
                 // Run 9 moved after the pending list was read.
@@ -1094,6 +1157,123 @@ mod tests {
         arrived.set(false);
         gh.begin_tick(T0 + PENDING_RECHECK_S + 1);
         assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn requested_and_waiting_runs_discover_deduplicate_and_preserve_etags() {
+        let active = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ready = active.clone();
+        let dup_queued = std::rc::Rc::new(std::cell::Cell::new(false));
+        let dup = dup_queued.clone();
+        let fake = Fake::new(move |s| {
+            if s.url.contains("status=pending") {
+                if s.header("if-none-match") == Some("\"p\"") {
+                    return respond(304, &[], "");
+                }
+                return respond(200, &[("ETag", "\"p\"")], r#"{"workflow_runs":[]}"#);
+            }
+            if s.url.contains("status=requested") {
+                if !ready.get() && s.header("if-none-match") == Some("\"r\"") {
+                    return respond(304, &[], "");
+                }
+                let body = if ready.get() {
+                    json!({"workflow_runs": [{"id": 11}, {"id": 12}]})
+                } else {
+                    json!({"workflow_runs": []})
+                };
+                return respond(200, &[("ETag", "\"r\"")], &body.to_string());
+            }
+            if s.url.contains("status=waiting") {
+                if !ready.get() && s.header("if-none-match") == Some("\"w\"") {
+                    return respond(304, &[], "");
+                }
+                let body = if ready.get() {
+                    // Run 12 appears in both requested and waiting; must be read once.
+                    json!({"workflow_runs": [{"id": 12}, {"id": 13}]})
+                } else {
+                    json!({"workflow_runs": []})
+                };
+                return respond(200, &[("ETag", "\"w\"")], &body.to_string());
+            }
+            if s.url.contains("status=queued") || s.url.contains("status=in_progress") {
+                // Run 13 also appears in queued at recheck time; must still be read only once.
+                let body = if dup.get() && s.url.contains("status=queued") {
+                    json!({"workflow_runs": [{"id": 13}]})
+                } else {
+                    json!({"workflow_runs": []})
+                };
+                return respond(200, &[], &body.to_string());
+            }
+            let id = if s.url.contains("/runs/11/jobs") {
+                110
+            } else if s.url.contains("/runs/12/jobs") {
+                120
+            } else {
+                130
+            };
+            let body = json!({"jobs": [{"id": id, "run_attempt": 1, "status": "queued", "labels": ["self-hosted", "large"]}]});
+            respond(200, &[], &body.to_string())
+        });
+
+        let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+        // Idle tick: reads pending/requested/waiting once, caches ETags, backs all three off.
+        gh.begin_tick(T0);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+
+        // Mid-backoff ticks must skip deferred lists AND keep their ETags alive across age_cache.
+        active.set(true);
+        gh.begin_tick(T0 + 15);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+        gh.begin_tick(T0 + PENDING_RECHECK_S - 1);
+        assert!(gh.queued_jobs(&|_| true).unwrap().is_empty());
+
+        // At PENDING_RECHECK_S: deferred lists are re-read with their preserved ETags,
+        // discovering runs 11, 12, 13 and deduplicating 12 and 13 across statuses.
+        dup_queued.set(true);
+        gh.begin_tick(T0 + PENDING_RECHECK_S);
+        let jobs = gh.queued_jobs(&|_| true).unwrap();
+        assert_eq!(
+            jobs,
+            [110, 120, 130].map(|id| QueuedJob {
+                key: JobKey { id, attempt: 1 },
+                labels: vec!["self-hosted".into(), "large".into()],
+            })
+        );
+        let sent = fake.sent();
+        for run in [11, 12, 13] {
+            let path = jobs_path(run);
+            assert_eq!(
+                sent.iter().filter(|s| s.url.contains(&path)).count(),
+                1,
+                "run {run} read once"
+            );
+        }
+        for (status, etag) in [
+            ("pending", "\"p\""),
+            ("requested", "\"r\""),
+            ("waiting", "\"w\""),
+        ] {
+            let recheck = sent
+                .iter()
+                .rfind(|s| s.url.contains(&format!("status={status}")))
+                .unwrap();
+            assert_eq!(
+                recheck.header("if-none-match"),
+                Some(etag),
+                "preserved ETag for status={status}"
+            );
+        }
+
+        // Next tick: requested yielded wanted work so it re-reads immediately; waiting had
+        // its only runs already deduplicated by requested/queued so check requested stays hot
+        // while pending stayed empty and backed off again.
+        let before = sent.len();
+        gh.begin_tick(T0 + PENDING_RECHECK_S + 1);
+        assert_eq!(gh.queued_jobs(&|_| true).unwrap().len(), 3);
+        let after = fake.sent();
+        let next_tick = &after[before..];
+        assert!(!next_tick.iter().any(|s| s.url.contains("status=pending")));
+        assert!(next_tick.iter().any(|s| s.url.contains("status=requested")));
     }
 
     #[test]
@@ -1238,7 +1418,7 @@ mod tests {
                     return respond(201, &[], body);
                 }
                 let mut st = st.borrow_mut();
-                let body = if s.url.contains("status=queued") || s.url.contains("status=pending") {
+                let body = if s.url.contains("status=queued") || is_deferred_status(&s.url) {
                     json!({"workflow_runs": []})
                 } else if s.url.contains("status=in_progress") {
                     let list: Vec<Value> = (1..=runs)
@@ -1491,8 +1671,8 @@ mod tests {
             assert!(!reads.is_empty());
             assert!(reads.iter().all(|&etag| etag), "{reads:?}");
         }
-        // The first observe reads 30 jobs and all three run lists. The 304s after it are free.
-        assert_eq!(busy.state.borrow().left, 450 - 33);
+        // The first observe reads 30 jobs and all five run lists. The 304s after it are free.
+        assert_eq!(busy.state.borrow().left, 450 - 35);
     }
 
     /// A run left unread keeps its ETag, so its next read is a free 304 when nothing changed.
@@ -1504,7 +1684,7 @@ mod tests {
             }
             let body = if s.url.contains("status=in_progress") {
                 json!({"workflow_runs": [{"id": 1, "run_attempt": 1, "updated_at": "t1"}]})
-            } else if s.url.contains("status=queued") || s.url.contains("status=pending") {
+            } else if s.url.contains("status=queued") || is_deferred_status(&s.url) {
                 json!({"workflow_runs": []})
             } else {
                 json!({"jobs": [{"id": 10, "run_attempt": 1, "status": "in_progress", "labels": []}]})
@@ -1544,7 +1724,7 @@ mod tests {
             }
             let body = if s.url.contains("status=queued") {
                 json!({"total_count": 1, "workflow_runs": [{"id": 5, "run_attempt": 1}]})
-            } else if s.url.contains("status=in_progress") || s.url.contains("status=pending") {
+            } else if s.url.contains("status=in_progress") || is_deferred_status(&s.url) {
                 json!({"total_count": 0, "workflow_runs": []})
             } else {
                 let from = (page - 1) * PER_PAGE as u64;
@@ -1609,7 +1789,7 @@ mod tests {
     fn run_lists_are_paged() {
         let fake = Fake::new(|s| {
             let page = s.url.split("&page=").nth(1).unwrap_or("1");
-            let body = if s.url.contains("status=pending") {
+            let body = if is_deferred_status(&s.url) {
                 json!({"workflow_runs": []})
             } else if s.url.contains("status=queued") {
                 let ids: Vec<u64> = match page {
@@ -1650,6 +1830,8 @@ mod tests {
                 "/repos/o/r/actions/runs?status=queued&per_page=100&page=2",
                 "/repos/o/r/actions/runs?status=in_progress&per_page=100",
                 "/repos/o/r/actions/runs?status=in_progress&per_page=100&page=2",
+                "/repos/o/r/actions/runs?status=requested&per_page=100",
+                "/repos/o/r/actions/runs?status=waiting&per_page=100",
             ]
         );
         let run_100 = sent
@@ -1665,7 +1847,7 @@ mod tests {
         let fake = Fake::new(|s| {
             let body = if s.url.contains("status=queued") {
                 json!({"workflow_runs": [{"id": 5}]})
-            } else if s.url.contains("status=in_progress") || s.url.contains("status=pending") {
+            } else if s.url.contains("status=in_progress") || is_deferred_status(&s.url) {
                 json!({"workflow_runs": []})
             } else {
                 let jobs: Vec<Value> = (0..PER_PAGE as u64)

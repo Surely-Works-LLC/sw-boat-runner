@@ -1044,8 +1044,8 @@ mod tests {
         tick_loop.tick(NOW, decide).unwrap();
         tick_loop.tick(NOW + 15, decide).unwrap();
         let sent = fake.sent();
-        assert_eq!(sent.len(), 11, "{:?}", requests(&fake));
-        let conditional: Vec<bool> = sent[6..]
+        assert_eq!(sent.len(), 13, "{:?}", requests(&fake));
+        let conditional: Vec<bool> = sent[8..]
             .iter()
             .map(|s| s.header("if-none-match").is_some())
             .collect();
