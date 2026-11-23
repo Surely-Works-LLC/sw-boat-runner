@@ -6,12 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-22
+
 ### Added
 
 - `idle_warm`, a pool's command to keep caches warm on a kept machine that is up with no
   runner. A job cancels it, and the runner goes on only once the machine confirms every
   process of the warm ended; a warm never starts a machine or delays an idle stop. It
   needs `STATE_DIRECTORY`. See [Idle warm](README.md#idle-warm).
+
+## [0.3.7] - 2026-11-22
+
+### Fixed
+
+- `run` finds queued jobs in workflow runs GitHub lists as `pending`, `requested` or
+  `waiting`, as well as `queued` and `in_progress`. Before, a job queued in such a run got
+  no runner until its run's status changed. Each run is read once whatever lists it, and a
+  status that showed no job for a pool is checked again after two minutes, so the request
+  budget holds.
+- `run` no longer kills a job when GitHub refuses to unregister its runner. `decide`
+  unregisters a runner GitHub lists offline, or one on a machine not `Up`, and gives its
+  slot a new runner in the same tick. When the runner in fact ran a job, GitHub refused
+  the delete with a 422, the register went ahead, and the slot's start command killed the
+  job with `pkill` ("The runner has received a shutdown signal"). A failed unregister now
+  leaves its runner's slot taken until GitHub deletes the runner; the machine's other
+  slots still take runners.
+- The slot start command exits with an error, and kills nothing, while the slot's
+  `Runner.Worker` runs a job.
+- A runner GitHub listed busy at the last observe and lists offline now stays `Busy` for
+  one more observe before `run` unregisters it.
+
+### Changed
+
+- `run` logs `unregister <runner>: <reason>` before it asks GitHub, so a refused unregister
+  shows what triggered it. Before, the line came only after GitHub deleted the runner.
 
 ## [0.3.6] - 2026-11-21
 
@@ -386,7 +414,9 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.7...v0.3.8
+[0.3.7]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.3...v0.3.4

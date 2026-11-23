@@ -533,11 +533,8 @@ impl Loop<'_> {
         match action {
             Action::Unregister { runner } => match t.runner_ids.get(runner).copied() {
                 Some(id) => {
-                    // The id stays until GitHub has deleted the runner: a refusal means
-                    // it runs a job, and `remove_runners` must still find it there, or a
-                    // `Delete` of its machine later this tick would go through.
-                    self.delete_runner(id)?;
-                    t.runner_ids.remove(runner);
+                    // Logged before the delete, so a refused one still says what made
+                    // `decide` ask for it.
                     let why = if self.draining() {
                         Some("drain")
                     } else {
@@ -547,6 +544,12 @@ impl Loop<'_> {
                         Some(why) => self.log(format_args!("unregister {runner}: {why}")),
                         None => self.log(format_args!("unregister {runner}")),
                     }
+                    // The id stays until GitHub has deleted the runner: a refusal means
+                    // it runs a job, and `remove_runners` and `Register` must still find
+                    // it there, or a `Delete` of its machine or a new runner on its slot
+                    // later this tick would go through.
+                    self.delete_runner(id)?;
+                    t.runner_ids.remove(runner);
                     Ok(())
                 }
                 None => Ok(()),
@@ -595,6 +598,13 @@ impl Loop<'_> {
                 machine,
                 slot,
             } => {
+                // The plan may have freed this slot, but a refused unregister leaves
+                // its runner in place. Starting a replacement would terminate it.
+                if t.snapshot.runners.iter().any(|r| {
+                    r.machine == *machine && r.slot == *slot && t.runner_ids.contains_key(&r.name)
+                }) {
+                    return Ok(());
+                }
                 // `decide` cancels a warm first; a failed cancel skips the machine.
                 if self.warm_file.warms().contains_key(machine) {
                     eprintln!("error: {machine}: its warm may still run; no runner registered");
@@ -1302,6 +1312,80 @@ mod tests {
     }
 
     #[test]
+    fn failed_unregister_protects_its_slot_until_the_runner_is_removed() {
+        let cfg = config();
+        let refuse = std::cell::Cell::new(true);
+        let fake = Fake::new(move |s| {
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") && refuse.replace(false)
+            {
+                respond(422, &[], r#"{"message":"Runner is still running a job"}"#)
+            } else {
+                reply(s)
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let replace = |_: &Snapshot, _: &Pool| {
+            vec![
+                unregister("sbr-ci-bx_22222222-0-900"),
+                register("bx_22222222", 0),
+                register("bx_22222222", 1),
+            ]
+        };
+        let registered_slots = || {
+            fake.sent()
+                .into_iter()
+                .filter(|s| s.url.ends_with("/generate-jitconfig"))
+                .map(|s| s.body_text())
+                .collect::<Vec<_>>()
+        };
+        tick_loop.tick(NOW, replace).unwrap();
+        let names = registered_slots();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].contains("sbr-ci-bx_22222222-1-"), "{names:?}");
+
+        tick_loop.tick(NOW + 15, replace).unwrap();
+        let names = registered_slots();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[1].contains("sbr-ci-bx_22222222-0-"), "{names:?}");
+    }
+
+    /// GitHub lists runner 11 online, then offline while it in fact runs a job, and
+    /// refuses its delete. The log still says why `decide` asked for the unregister.
+    #[test]
+    fn a_refused_unregister_logs_its_reason() {
+        let cfg = config();
+        let listings = std::cell::Cell::new(0);
+        let fake = Fake::new(move |s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                listings.set(listings.get() + 1);
+                let status = if listings.get() == 1 {
+                    "online"
+                } else {
+                    "offline"
+                };
+                let body = format!(
+                    r#"{{"total_count":1,"runners":[
+                    {{"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"{status}","busy":false}}]}}"#
+                );
+                return respond(200, &[], &body);
+            }
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/11") {
+                let body = r#"{"message":"Runner is still running a job and cannot be deleted."}"#;
+                return respond(422, &[], body);
+            }
+            reply(s)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        let log = capture_log(&mut tick_loop);
+        tick_loop.tick(NOW, |_, _| Vec::new()).unwrap();
+        log.take();
+        let unregister_11 = |_: &Snapshot, _: &Pool| vec![unregister("sbr-ci-bx_22222222-0-900")];
+        tick_loop.tick(NOW + 15, unregister_11).unwrap();
+        assert_eq!(log.take(), ["unregister sbr-ci-bx_22222222-0-900: offline"]);
+        assert!(requests(&fake).contains(&format!("DELETE {GH}/runners/11")));
+    }
+
+    #[test]
     fn a_stopped_machine_whose_disk_boat_deleted_is_deleted() {
         let cfg = config();
         let fake = Fake::new(|s| {
@@ -1670,7 +1754,8 @@ mod tests {
                     return respond(500, &[], r#"{"code":"internal"}"#);
                 }
             }
-            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+            if writes.get() > 0 && s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?"))
+            {
                 // GitHub lists the runner the failed start registered, never online.
                 let body = format!(
                     r#"{{"total_count":2,"runners":[
