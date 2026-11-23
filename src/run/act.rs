@@ -2,7 +2,7 @@
 //! (docs/design.md#start-budget).
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
@@ -334,11 +334,17 @@ pub(super) fn is_cleanup(a: &Action) -> bool {
     )
 }
 
+/// How long a warm's cancel may take: up to 3 s on the machine (`script::END_WARM`) and
+/// boat's round trips.
+const WARM_CANCEL_WAIT: Duration = Duration::from_secs(8);
+
 /// The machine an action works on, if any.
 fn machine_of(a: &Action) -> Option<&str> {
     match a {
         Action::Delete { machine }
         | Action::Stop { machine }
+        | Action::CancelWarm { machine }
+        | Action::Warm { machine }
         | Action::Register { machine, .. }
         | Action::Resume { machine } => Some(machine),
         Action::Unregister { .. } | Action::Fork { .. } => None,
@@ -351,9 +357,11 @@ fn rank(a: &Action) -> u8 {
         Action::Unregister { .. } => 0,
         Action::Delete { .. } => 1,
         Action::Stop { .. } => 2,
-        Action::Register { .. } => 3,
+        // `decide` puts a machine's cancel before its register; the sort keeps that order.
+        Action::Register { .. } | Action::CancelWarm { .. } => 3,
         Action::Resume { .. } => 4,
         Action::Fork { .. } => 5,
+        Action::Warm { .. } => 6,
     }
 }
 
@@ -369,6 +377,8 @@ fn backoff_key(snap: &Snapshot, a: &Action) -> Option<(String, StartKind)> {
         Action::Unregister { .. }
         | Action::Delete { .. }
         | Action::Stop { .. }
+        | Action::CancelWarm { .. }
+        | Action::Warm { .. }
         | Action::Register { .. } => None,
     }
 }
@@ -595,7 +605,11 @@ impl Loop<'_> {
                 }) {
                     return Ok(());
                 }
-                if self.free_of_logins(t, pool, machine)? {
+                // `decide` cancels a warm first; a failed cancel skips the machine.
+                if self.warm_file.warms().contains_key(machine) {
+                    eprintln!("error: {machine}: its warm may still run; no runner registered");
+                    Ok(())
+                } else if self.free_of_logins(t, pool, machine)? {
                     self.register(t, pool, machine, *slot)
                 } else {
                     Ok(())
@@ -603,6 +617,101 @@ impl Loop<'_> {
             }
             Action::Resume { machine } => self.resume(t, machine),
             Action::Fork { pool, job } => self.fork(t, pool, *job),
+            Action::CancelWarm { machine } => {
+                if !self.cancel_warm(t, machine) {
+                    t.skip.insert(machine.clone());
+                }
+                Ok(())
+            }
+            Action::Warm { machine } => self.warm(t, machine),
+        }
+    }
+
+    /// Starts the pool's `idle_warm` on `machine`, once the state file holds it, as a
+    /// launch boat may carry out after a restart or with no answer.
+    fn warm(&mut self, t: &mut Tick, machine: &str) -> Result<(), Error> {
+        let snapshot = t.snapshot;
+        let Some(m) = snapshot.machines.iter().find(|m| m.id == machine) else {
+            return Ok(());
+        };
+        let p = self.pool(&m.pool)?;
+        let Some(warm) = &p.idle_warm else {
+            return Ok(());
+        };
+        // Like a job, a warm may run code a job left behind, so it gets the same check.
+        if !self.free_of_logins(t, &p.name, machine)? {
+            return Ok(());
+        }
+        let what = machine_in(t.snapshot, machine);
+        let token = Uuid::new_v4().to_string();
+        if let Err(e) = self.warm_file.add(machine, &token) {
+            eprintln!("warm {what}: idle warm state: {e}; not started");
+            return Ok(());
+        }
+        let now = self.at(t);
+        let command = script::warm_command(&token, &p.name, warm);
+        match self.boat.exec_start(machine, &command) {
+            Ok(id) => {
+                self.memory.warm_sent(machine, now, Some(id));
+                self.log(format_args!("warm start {what}"));
+                Ok(())
+            }
+            Err(e) if e.may_have_applied() => {
+                self.memory.warm_sent(machine, now, None);
+                eprintln!("warm start {what}: {e}; cancelled before the machine takes a job");
+                Ok(())
+            }
+            Err(e) => {
+                self.memory.warm_sent(machine, now, None);
+                self.warm_file.retain(|m| m != machine);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Ends `machine`'s warm, if the state file holds one, and keeps any launch of it
+    /// boat carries out later from starting. True once the machine confirms that no warm
+    /// process is left, which takes at most a few seconds.
+    fn cancel_warm(&mut self, t: &Tick, machine: &str) -> bool {
+        let Some(token) = self.warm_file.warms().get(machine).cloned() else {
+            return true;
+        };
+        let what = machine_in(t.snapshot, machine);
+        let deadline = Instant::now() + WARM_CANCEL_WAIT;
+        let started = self
+            .boat
+            .exec_start(machine, &script::cancel_command(&token));
+        let ended = started.and_then(|id| {
+            loop {
+                match self.boat.command_status(machine, id) {
+                    Ok(s) if !s.running => {
+                        break Ok(s.exit_code == Some(0) && s.stdout.trim() == "clear");
+                    }
+                    // boat may not list a command it has just started.
+                    Ok(_) | Err(boat::Error::NotFound) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(200))
+                    }
+                    Ok(_) | Err(boat::Error::NotFound) => break Ok(false),
+                    Err(e) => break Err(e),
+                }
+            }
+        });
+        match ended {
+            Ok(true) => {
+                self.warm_file.retain(|m| m != machine);
+                self.log(format_args!("warm cancel {what}"));
+                true
+            }
+            Ok(false) => {
+                eprintln!(
+                    "warm cancel {what}: no confirmation that it ended; tried again next tick"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("warm cancel {what}: {e}; tried again next tick");
+                false
+            }
         }
     }
 
@@ -876,6 +985,125 @@ mod tests {
     use crate::model::{Placement, Pool};
     use crate::transport::NetworkError;
     use crate::transport::fake::{Fake, Reply, Sent, respond};
+
+    /// A state file for warms in a new temporary directory.
+    fn warm_file() -> (std::path::PathBuf, super::super::warm_file::WarmFile) {
+        let dir = std::env::temp_dir().join(format!("sbr-warm-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = super::super::warm_file::WarmFile::at(dir.join("warms.tsv")).unwrap();
+        (dir, file)
+    }
+
+    /// A warm a predecessor launched ends before its machine takes the queued job, even
+    /// with `idle_warm` gone from the policy; while that is unconfirmed the job waits and
+    /// nothing starts in its place. One on a stopped machine waits for it to come up, as
+    /// a launch boat never answered may still reach it then.
+    #[test]
+    fn a_warm_ends_before_its_machine_takes_a_job() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        for confirmed in [false, true] {
+            let (dir, mut file) = warm_file();
+            file.add("bx_22222222", "t1").unwrap();
+            file.add("bx_33333333", "t3").unwrap();
+            let fake = Fake::new(move |s| {
+                if s.url.starts_with(&format!("{GH}/runners?")) {
+                    respond(200, &[], r#"{"total_count":0,"runners":[]}"#)
+                } else if s.body_text().contains(": > /tmp/sbr-warm-t1 &&") {
+                    respond(200, &[], r#"{"processId":7}"#)
+                } else if s.url.ends_with("/commands/7") {
+                    let (code, out) = if confirmed { (0, "clear") } else { (1, "") };
+                    let body =
+                        format!(r#"{{"running":false,"exitCode":{code},"stdout":"{out}\n"}}"#);
+                    respond(200, &[], &body)
+                } else {
+                    reply(s)
+                }
+            });
+            let mut tick_loop = started(&cfg, &fake);
+            tick_loop.warm_file = file;
+            let logged = capture_log(&mut tick_loop);
+            tick_loop.tick(NOW, decide).unwrap();
+            let calls = requests(&fake);
+            let cancelled = calls.iter().position(|r| r.ends_with("/commands/7"));
+            let jit = calls
+                .iter()
+                .position(|r| r.ends_with("/generate-jitconfig"));
+            if confirmed {
+                assert!(cancelled.unwrap() < jit.unwrap());
+                assert!(
+                    logged
+                        .take()
+                        .contains(&"warm cancel bx_22222222 (pool ci)".to_string())
+                );
+            } else {
+                assert!(cancelled.is_some() && jit.is_none());
+            }
+            assert_eq!(resumes(&fake) + forks(&fake).len(), 0);
+            let read = super::super::warm_file::WarmFile::at(dir.join("warms.tsv")).unwrap();
+            assert_eq!(read.warms().contains_key("bx_22222222"), !confirmed);
+            assert!(read.warms().contains_key("bx_33333333"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// A warm is in the state file before its launch is sent, it is watched until it
+    /// ends, and it leaves the idle clock alone: the machine stops `idle_stop_s` after
+    /// it was last busy.
+    #[test]
+    fn a_warm_is_saved_before_its_launch_and_never_delays_the_stop() {
+        let mut cfg = config();
+        cfg.pools[0].placement = vec![Placement::Slot, Placement::Resume];
+        cfg.pools[0].idle_warm = Some(crate::model::IdleWarm {
+            argv: vec!["./warm".into()],
+            cwd: "/home/user/work".into(),
+            interval_s: 200,
+            timeout_s: 60,
+        });
+        let (dir, file) = warm_file();
+        let path = dir.join("warms.tsv");
+        let listing = r#"{"id":"bx_22222222","state":"running","labels":{"sw-boat-runner":"ci"}}"#;
+        let fake = Fake::new(move |s| {
+            if s.method == "POST" && s.url.ends_with("/commands") {
+                let saved = std::fs::read_to_string(&path).unwrap();
+                assert!(saved.starts_with("bx_22222222\t"), "{saved:?}");
+                let token = saved.trim_end().split('\t').nth(1).unwrap().to_string();
+                assert!(s.body_text().contains(&format!("SBR_WARM={token} ")));
+                respond(200, &[], r#"{"processId":9}"#)
+            } else if s.url.ends_with("/commands/9") {
+                respond(
+                    200,
+                    &[],
+                    r#"{"running":false,"exitCode":0,"stdout":"finish 0 12\n"}"#,
+                )
+            } else {
+                lagging_reply(s, listing, "")
+            }
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        tick_loop.warm_file = file;
+        let logged = capture_log(&mut tick_loop);
+        // First sight: last busy a second ago.
+        tick_loop.tick(NOW, decide).unwrap();
+        tick_loop.tick(NOW + 198, decide).unwrap();
+        assert!(!requests(&fake).iter().any(|r| r.ends_with("/commands")));
+        logged.take();
+        tick_loop.tick(NOW + 199, decide).unwrap();
+        assert_eq!(logged.take(), ["warm start bx_22222222 (pool ci)"]);
+        tick_loop.tick(NOW + 210, decide).unwrap();
+        assert_eq!(
+            logged.take(),
+            ["warm finish bx_22222222 (pool ci): status 0, 12s"]
+        );
+        assert!(tick_loop.warm_file.warms().is_empty());
+        tick_loop.tick(NOW + 599, decide).unwrap();
+        assert!(
+            requests(&fake)
+                .iter()
+                .any(|r| r.ends_with("/bx_22222222/stop"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn refused_start_closes_starts() {

@@ -1,0 +1,8 @@
+# Pins: Warm: of the kept machines idle for interval_s since their last job and their last warm, the one idle longest. bx_22222222 last warmed 700 s ago, bx_33333333 last ran a job 1500 s ago, bx_44444444 500 s ago.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+idle_warm = { argv = ["./warm-cache"], cwd = "/home/user/work", interval_s = 600, timeout_s = 90 }

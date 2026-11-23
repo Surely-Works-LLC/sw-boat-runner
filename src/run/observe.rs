@@ -1,14 +1,14 @@
 //! Reads boat and GitHub into the `Snapshot` that `decide` sees, adding what this process
 //! remembers between ticks (docs/design.md#observed-state).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::idle_file::{self, Clock};
-use super::{Error, HTTP_TIMEOUT, Loop};
-use crate::boat::Sandbox;
+use super::{Error, HTTP_TIMEOUT, Loop, script};
+use crate::boat::{self, Sandbox};
 use crate::github::{self, GhRunner};
 use crate::model::{
-    Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs,
+    Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs, Warming,
 };
 
 /// A snapshot, and the GitHub id of each of its runners, which deleting one needs.
@@ -65,6 +65,11 @@ pub(super) struct Memory {
     /// When this process started. A job it never saw queued counts as queued then, for
     /// `orphaned`: one may have been queued just before a restart.
     started: UnixSecs,
+    /// When each machine last started a warm, for `Snapshot::warmed_at`.
+    warmed: HashMap<String, UnixSecs>,
+    /// The boat process id of each warm whose launch boat answered, until it ends.
+    /// Another process's ids are not trusted: a restart cancels its warms instead.
+    warm_commands: HashMap<String, u64>,
 }
 
 struct Seen {
@@ -135,6 +140,15 @@ impl Memory {
     pub(super) fn mark_used(&mut self, machine: &str, now: UnixSecs) {
         if let Some(seen) = self.machines.get_mut(machine) {
             seen.last_busy = now;
+        }
+    }
+
+    /// Notes a warm launch sent to `machine` at `now`, and its boat process id once boat
+    /// answered with one.
+    pub(super) fn warm_sent(&mut self, machine: &str, now: UnixSecs, command: Option<u64>) {
+        self.warmed.insert(machine.to_string(), now);
+        if let Some(id) = command {
+            self.warm_commands.insert(machine.to_string(), id);
         }
     }
 
@@ -488,6 +502,20 @@ impl Loop<'_> {
         let machines = self.memory.machines(now, lag_s, listed, &runners);
         let clocks = self.memory.idle_clocks();
         self.idle_file.save(&clocks);
+        let warming = self.warms(&machines);
+        let listed: HashSet<&str> = machines.iter().map(|m| m.id.as_str()).collect();
+        self.memory
+            .warmed
+            .retain(|id, _| listed.contains(id.as_str()));
+        let warmed_at = machines
+            .iter()
+            .filter(|m| !m.is_ephemeral() && m.state == MachineState::Up)
+            .filter(|m| self.pool(&m.pool).is_ok_and(|p| p.idle_warm.is_some()))
+            .map(|m| {
+                let at = self.memory.warmed.get(&m.id).copied();
+                (m.id.clone(), at.unwrap_or(self.memory.started))
+            })
+            .collect();
         let limits = Limits {
             can_start: quote.allows && self.ledger.starts_open(now),
             next_start_cents: quote.cents,
@@ -509,6 +537,8 @@ impl Loop<'_> {
                     (p.name.clone(), at.unwrap_or(self.memory.started))
                 })
                 .collect(),
+            warming,
+            warmed_at,
         };
         self.memory.warn_near_ttl(self.cfg, now, &snapshot);
         self.last_observe = Some(super::LastObserve {
@@ -520,6 +550,54 @@ impl Loop<'_> {
             runner_ids,
             abandoned,
         })
+    }
+
+    /// The warms in the state file, after dropping those of machines boat no longer
+    /// lists and those that ended. A warm whose command this process watches on an `Up`
+    /// machine is `Running` until boat says it ended; it is `Unknown` once its machine is
+    /// down (a resumed machine may still get a late launch), when it ended without a
+    /// result (something may be left running), or when this process never had its id.
+    fn warms(&mut self, machines: &[Machine]) -> BTreeMap<String, Warming> {
+        let listed = |id: &str| {
+            machines
+                .iter()
+                .find(|m| m.id == id && m.state != MachineState::Gone)
+        };
+        self.warm_file.retain(|id| listed(id).is_some());
+        let warms = self.warm_file.warms();
+        self.memory
+            .warm_commands
+            .retain(|id, _| warms.contains_key(id));
+        let mut warming = BTreeMap::new();
+        for id in self.warm_file.warms().keys().cloned().collect::<Vec<_>>() {
+            let Some(m) = listed(&id) else { continue };
+            let command = self.memory.warm_commands.get(&id).copied();
+            let command = command.filter(|_| m.state == MachineState::Up);
+            let state = match command.map(|c| self.boat.command_status(&id, c)) {
+                Some(Ok(s)) if s.running => Warming::Running,
+                // The supervisor's result means it ended every process of the warm.
+                Some(Ok(s)) if s.exit_code == Some(0) => match script::warm_result(&s.stdout) {
+                    Some((event, detail)) => {
+                        self.log(format_args!(
+                            "warm {event} {id} (pool {}): {detail}",
+                            m.pool
+                        ));
+                        self.warm_file.retain(|w| w != id);
+                        self.memory.warm_commands.remove(&id);
+                        continue;
+                    }
+                    None => Warming::Unknown,
+                },
+                // Asked again next tick.
+                Some(Err(e)) if !matches!(e, boat::Error::NotFound) => Warming::Running,
+                _ => Warming::Unknown,
+            };
+            if state == Warming::Unknown {
+                self.memory.warm_commands.remove(&id);
+            }
+            warming.insert(id, state);
+        }
+        warming
     }
 }
 

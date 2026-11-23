@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-22
+
+### Added
+
+- `idle_warm`, a pool's command to keep caches warm on a kept machine that is up with no
+  runner. A job cancels it, and the runner goes on only once the machine confirms every
+  process of the warm ended; a warm never starts a machine or delays an idle stop. It
+  needs `STATE_DIRECTORY`. See [Idle warm](README.md#idle-warm).
+
 ## [0.3.7] - 2026-11-22
 
 ### Fixed
@@ -405,7 +414,8 @@ First release. sw-boat-runner keeps self-hosted GitHub Actions runners on
   deleted and the pool's forks back off; a kept machine waits for its next start.
 - Resumes send `noEnv`, so boat scrubs owner secrets from the restored disk.
 
-[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/Surely-Works-LLC/sw-boat-runner/compare/v0.3.4...v0.3.5

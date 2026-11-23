@@ -34,12 +34,7 @@ impl IdleFile {
     /// systemd's `StateDirectory=` sets `STATE_DIRECTORY`, colon-separated when there are
     /// several; the first is used. Unset, nothing is saved and a restart resets the clocks.
     pub(super) fn from_env() -> Self {
-        let dir = std::env::var_os("STATE_DIRECTORY");
-        let first = dir.and_then(|d| {
-            let d = d.to_string_lossy().split(':').next()?.to_string();
-            (!d.is_empty()).then_some(d)
-        });
-        Self::at(first.map(|d| PathBuf::from(d).join(FILE_NAME)))
+        Self::at(state_path(FILE_NAME))
     }
 
     /// Saves to `path`; `None` saves nothing.
@@ -91,6 +86,13 @@ impl IdleFile {
             Err(_) => {}
         }
     }
+}
+
+/// `name` in the state directory, if there is one.
+pub(super) fn state_path(name: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("STATE_DIRECTORY")?;
+    let first = dir.to_string_lossy().split(':').next()?.to_string();
+    (!first.is_empty()).then(|| PathBuf::from(first).join(name))
 }
 
 /// One `id\tsince\tlast_busy` line per machine.

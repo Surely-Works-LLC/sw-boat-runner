@@ -45,7 +45,7 @@ take ten hosts.
 Releases run on Linux x86_64 and arm64 with glibc 2.35 or newer, and `--remote` also on
 macOS arm64. On an Intel Mac, build from source (`cargo install`, as in
 [Any other host](examples/always-on/README.md#any-other-host)). Use the release you
-tested; v0.3.7 below is an example.
+tested; v0.3.8 below is an example.
 
 ### From your laptop (recommended)
 
@@ -54,7 +54,7 @@ tested; v0.3.7 below is an example.
    ```sh
    # macOS arm64. On Linux: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu.
    T=sw-boat-runner-aarch64-apple-darwin.tar.gz
-   base=https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.3.7
+   base=https://github.com/Surely-Works-LLC/sw-boat-runner/releases/download/v0.3.8
    curl -fsSLO "$base/$T"
    curl -fsSLO "$base/SHA256SUMS"
    grep " $T\$" SHA256SUMS | shasum -a 256 -c
@@ -89,8 +89,8 @@ On a boat machine, or any Ubuntu host with systemd and sudo:
 2. Get install.sh at the tag you tested and run it with the same tag:
 
    ```sh
-   curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.7/examples/always-on/install.sh
-   SBR_REF=v0.3.7 bash install.sh
+   curl -fsSLO https://raw.githubusercontent.com/Surely-Works-LLC/sw-boat-runner/v0.3.8/examples/always-on/install.sh
+   SBR_REF=v0.3.8 bash install.sh
    ```
 
    It checks the binary against the release's `SHA256SUMS`, and its attestation when `gh`
@@ -161,6 +161,7 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | `register_timeout_s` | 900 | Time a runner may take to come online. Keep it above 600, the runner's wait for the snapshot copy. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. Keep it above `register_timeout_s` plus 300; `check` warns. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only included starts. |
+| `idle_warm` | unset | A command run on kept machines no job needs, to keep caches warm; see [Idle warm](#idle-warm). |
 
 | Preset | Placement | Idle machines |
 | - | - | - |
@@ -174,6 +175,42 @@ most `fork_ttl_s` (default 3600 s), so raise it for jobs that run longer. Kept m
 machine time while up. boat snapshots do not save `/tmp` or `~/.cache`, so keep caches
 under a home subdirectory such as `/home/user/ci-cache`. [docs/design.md](docs/design.md)
 has the full design and the [GitHub request budget](docs/design.md#github-requests).
+
+### Idle warm
+
+`idle_warm` runs a command on a kept machine that is up with no runner on it, for
+example to fetch the default branch or build it into a cache between jobs:
+
+```toml
+[pool.idle_warm]
+argv = ["./ci/warm-cache", "--default-branch"]
+cwd = "/home/user/work"
+interval_s = 600   # at least this long after the machine's last job and last warm
+timeout_s = 300
+```
+
+With the single-pool shorthand, write `[idle_warm]`. The pool needs `slot` placement,
+and `interval_s` must be above 90 plus `tick_s`. The daemon warms one machine per pool at
+a time, the one idle longest, and never starts or keeps up a machine for it: a job or a
+standby runner takes the machine first, and the idle stop comes on time and ends a
+running warm with the machine.
+
+The command runs as the runner user in `cwd`, with `argv` as given, stdin from
+`/dev/null`, and only `HOME=/home/user`, `PATH=/usr/local/bin:/usr/bin:/bin`,
+`SBR_POOL` (the pool's name) and `SBR_WARM` in its environment. Its output goes to
+`/tmp/sbr-idle-warm.log` on the machine, replaced by each run. Its exit status is logged
+and changes nothing. At `timeout_s` it gets TERM, and KILL 2 s later. Before a runner
+goes on the machine, the daemon cancels the warm: every process that carries `SBR_WARM`
+gets TERM, then KILL after 2 s, and the runner is registered only once the machine
+confirms none is left, within a few seconds; otherwise the job waits for the next tick.
+A process that clears its environment, runs as another user or hands work to a daemon
+such as Docker escapes the cancel, so the command must not.
+
+boat keeps every command in its history, so `argv` must hold no secret. The daemon keeps
+the warms that may still run in `STATE_DIRECTORY`, which the systemd service sets; it
+refuses to start with `idle_warm` and no state directory. The log has a `warm start`,
+`warm finish`, `warm timeout` or `warm cancel` line for each warm. See
+[Idle warm](docs/design.md#idle-warm) in the design.
 
 ## Operating
 
@@ -281,9 +318,10 @@ a change to the page reaches every released binary once it is on `main`.
 The `--remote` host is not a `noEnv` machine, so boat may give it its creator's logins,
 such as a GitHub token, next to the boat key and the App's key.
 
-TLC checks a [TLA+ model](spec/README.md) of the 0.2.0 loop, for example that no machine
-stops mid-job. Repository scoping, `drain`'s settle wait and the early delete of a fork
-whose job left the queue came in 0.3.0 and are not modelled yet.
+TLC checks a [TLA+ model](spec/README.md) of the 0.2.0 loop and idle warming, for example
+that no machine stops mid-job and no job runs beside a warm. Repository scoping,
+`drain`'s settle wait and the early delete of a fork whose job left the queue came in
+0.3.0 and are not modelled yet.
 
 Report vulnerabilities per [SECURITY.md](SECURITY.md).
 

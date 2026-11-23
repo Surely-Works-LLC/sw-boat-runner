@@ -4,7 +4,7 @@
 boat's machines, and the daemon as `src/decide.rs` and `src/run/` implement the rules
 in [docs/design.md](../docs/design.md). The spec does not read Rust code.
 
-The model follows the 0.2.0 loop. Later changes are not modelled yet: repository
+The model follows the 0.2.0 loop and idle warming. Later changes are not modelled yet: repository
 scoping (a daemon keeps only machines labelled with its repository), `drain`'s settle
 wait, and the 60 s retirement of a job fork whose job left the queue.
 
@@ -24,6 +24,17 @@ wait, and the 60 s retirement of a job fork whose job left the queue.
   0, Register also puts a runner on a free kept slot while no job waits and fewer than
   `Standby` runners are ready (`StandbyPick`); the `warm-standby` and
   `hybrid-minup-standby` models run with `Standby = 1`.
+- Idle warming (`WarmEnabled`, on in the `idle-warm` model). `warm` is the daemon's state
+  file of warms: `Running` while it watches the command, `Unknown` once it lost track
+  (an unanswered launch, a crash, a stop). `proc` is a warm process on the machine and
+  `launch` a launch boat never answered and may still carry out once the machine is up.
+  `StartWarm` takes a free kept slot no `Register` or `Stop` takes, while no machine up
+  may still run a warm; `UnansweredWarm` is the fault. `CancelWarm` runs before a
+  `Register` on the machine and for an `Unknown` warm on an `Up` machine; it ends the
+  process and the launch together, as the token file and the environment scan do, and
+  the model leaves out a cancel that fails, which changes nothing. `Register` needs a
+  `Clear` warm. A stop ends the process and leaves the warm `Unknown`; a delete clears
+  it. The interval and the time limit are left out: a warm may start or end at any time.
 - The snapshot-to-act gap. Stop and Delete are decided from one snapshot (`plan`) and
   carried out by a later `Execute`, because `run::execute` does not look at the runner
   again. GitHub may assign a job in between. No new decision is made while a plan is
@@ -91,12 +102,17 @@ Safety: `NoBusyStop`, `OneJobPerRunner`, `MaxBoxes`, `StartBudget` (boat's own c
 paid starts, across crashes), `NoDoubleFork` (no two live forks for one job key) and
 `EphemeralIsolation` (in a fork-only pool, a runner takes a job only on a machine that
 has run none). `ForkIsolation` asks the same of job forks in any placement.
+`NoJobDuringWarm` (no job runs beside a warm process), `WarmRetainsCapacity` (a warm
+process runs only on a free kept slot) and `WarmingNeverIncreasesBoxes` (a start needs
+demand above every free slot, warming ones included, or a `min_up` shortfall).
 
 Liveness: `NoLeak` (a job fork whose job is done or whose TTL passed is deleted),
 `NoStarvation` (a queued job leaves the queue unless nothing is live and no start is
-possible), `IdleStops`, and `Settles` (once arrivals and faults stop, the daemon has
-nothing left to do). Every daemon action, time, boot, runner start-up and GitHub's
-dispatcher are weakly fair; arrivals and faults are not.
+possible), `IdleStops`, `Settles` (once arrivals and faults stop, the daemon has
+nothing left to do but warms) and `WarmClears` (a warm that may still run is cancelled
+or ends while its machine is up). Every daemon action but `StartWarm`, time, boot, runner
+start-up, the end of a warm and GitHub's dispatcher are weakly fair; arrivals, faults and
+a late launch are not.
 
 TLC runs with `-deadlock`, which turns the deadlock check off: arrivals and faults are
 bounded, so every behaviour ends in a state where nothing is enabled. A state stuck with
@@ -175,6 +191,12 @@ java -XX:+UseParallelGC -cp tla2tools.jar tlc2.TLC -workers auto -deadlock \
   -config spec/Variant.cfg spec/BoatRunner.tla
 ```
 
+The `idle-warm` model, for a change to idle warming, is:
+
+```sh
+EDIT='s/^Placement = .*/Placement = {"slot", "resume"}/;s/^WarmEnabled = FALSE/WarmEnabled = TRUE/'
+```
+
 The workflow runs every model on a push to `main` that changes `spec/` or the workflow,
 and on manual dispatch, not on pull requests. A passing model must exit 0; a
 counterexample model must fail with the message in its `expect` field. The passing
@@ -186,6 +208,7 @@ models:
 | hybrid-minup | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start | 40676 |
 | warm | `BoatRunner.cfg` | placement `slot, resume` | 4131 |
 | warm-standby | `BoatRunner.cfg` | placement `slot, resume`, `Standby = 1` | 6773 |
+| idle-warm | `BoatRunner.cfg` | placement `slot, resume`, `WarmEnabled = TRUE` | 13431 |
 | hybrid-minup-standby | `BoatRunner.cfg` | `MinUp = 1`, no stopped machine at the start, `Standby = 1` | 58643 |
 | fork | `BoatRunnerFork.cfg` | none | 148353 |
 

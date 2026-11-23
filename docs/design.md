@@ -53,6 +53,39 @@ from a boat snapshot, which does not save `/tmp` or `~/.cache`, so caches meant 
 a stop go elsewhere under `/home`, set in the runner's `.env`;
 [Snapshots](#snapshots) has an example.
 
+## Idle warm
+
+A pool with `idle_warm` runs its command on a kept machine that is `Up` with no runner,
+that no `Register` or `Stop` takes this tick, and that has been idle for `interval_s`
+since its last job and its last warm: the one idle longest, and one per pool while no
+machine of the pool that is up may still run a warm. The warm is left out of every other
+rule: it does not set `last_busy`, a job or standby runner takes its machine as if it
+were idle, and `Stop` and `Delete` ignore it. So it never starts a machine, keeps one up
+or takes a slot from a job; it only adds a cancel in front of a `Register`. A restarted
+daemon counts `interval_s` from its own start.
+
+The command runs under a shell supervisor, sent as one boat command with only `HOME`,
+`PATH`, `SBR_POOL` and `SBR_WARM=<token>` in its environment, a fresh UUID per warm. The
+supervisor runs it under `timeout`, then ends every process it left, and prints its
+status. Every process the warm starts inherits `SBR_WARM`, wherever it moves in process
+groups or sessions, so the cancel finds them all in `/proc/*/environ`: it sends TERM,
+waits up to 2 s, sends KILL every 0.1 s for up to 1 s more, and prints `clear` once none
+is left. Before that it creates `/tmp/sbr-warm-<token>`; the supervisor checks for that
+file after `SBR_WARM` is set and before it starts anything, so a launch boat carries out
+after the cancel does nothing.
+
+`act` saves each warm's machine and token to `idle-warm-<owner>+<name>.tsv` in
+`STATE_DIRECTORY`, synced, before it sends the launch, and drops the line once it has the
+supervisor's result, a confirmed cancel, or a listing without the machine. A warm in the
+file is `Running` while this process watches the command boat answered with, and
+`Unknown` after a launch with no answer, a restart, a result it cannot read, or a stop:
+a stopped machine runs nothing, but a launch may still reach it once it is resumed.
+`decide` cancels an `Unknown` warm as soon as its machine is up, and any warm before the
+first `Register` on its machine. `act` registers only once the cancel is confirmed,
+within `WARM_CANCEL_WAIT` (8 s); otherwise it skips the machine for the tick, and
+`decide` asks again on the next. The daemon does not start with a file it cannot read,
+or with `idle_warm` and no state directory.
+
 ## Snapshots
 
 Every pool starts its machines from one boat snapshot. It holds an extracted
@@ -419,6 +452,8 @@ process saw it online is `Registered` until that timeout.
 | `Stop(machine)` | machine `Up`, not ephemeral, `resume` in placement, no unmet demand left after this tick's starts, no `Busy` or `Registered` runner and no `Register` this tick, idle for `idle_stop_s`, up for `min_up_s`, more than `min_up` kept machines `Up` after this tick's other stops; or a kept machine stuck `Starting` (below) in a pool with `resume`, whatever the demand |
 | `Delete(machine)` | ephemeral machine with no `Busy` runner whose job finished, or past `fork_ttl_s`, or orphaned (below); or a `Stopped` kept machine with no `Busy` runner in a pool without `resume`, which nothing would resume; or, in a pool with `resume` and no demand, a `Stopped` kept machine with no `Busy` runner while kept `Up`, `Starting` and `Stopped` machines number more than `max_boxes`, highest ids first (`surplus`); or a kept machine `Up` or `Starting` with no `Busy` or `Registered` runner in a pool without `slot`, which nothing would use; or a kept machine stuck `Starting` in a pool without `resume` |
 | `Unregister(runner)` | `Registered` past `register_timeout_s`, `Offline`, or runner on a machine that the pool's listing does not show `Up` |
+| `CancelWarm(machine)` | kept machine `Up` whose warm may still run, before its first `Register` this tick; or whose warm is `Unknown`, unless registered on or stopped this tick |
+| `Warm(machine)` | pool with `idle_warm` and no machine `Up` whose warm may still run; kept machine `Up` with no runner, not registered on or stopped this tick, idle for `interval_s` since its last job and its last warm; the one idle longest |
 
 Demand for a pool is the number of queued jobs whose labels it matches, each id and
 attempt counted once, minus its runners in `Registered` or `Idle` that keep their slot
@@ -480,8 +515,8 @@ with no live runner and either a runner was seen on it or it has been `Up` longe
 
 ## Properties
 
-TLC checks the model of the 0.2.0 loop; repository scoping, `drain`'s settle wait and
-the early delete of a fork whose job left the queue are not in it yet ([spec/README.md](../spec/README.md)).
+TLC checks the model of the 0.2.0 loop and idle warming; repository scoping, `drain`'s
+settle wait and the early delete of a fork whose job left the queue are not in it yet ([spec/README.md](../spec/README.md)).
 
 Safety, checked by TLC. Every property below but `OneJobPerRunner`, which is GitHub's
 behaviour, also has a property test on one tick of `decide`, named after it in
@@ -494,6 +529,10 @@ behaviour, also has a property test on one tick of `decide`, named after it in
 5. `NoDoubleFork`: at most one live job fork per job id and attempt.
 6. `EphemeralIsolation`: a pool whose placement is only `fork` never runs two jobs on one
    machine.
+7. `NoJobDuringWarm`: no job runs on a machine while a warm process runs there.
+8. `WarmRetainsCapacity` and `WarmingNeverIncreasesBoxes`: a warm runs only on a free
+   kept slot, which counts as capacity, so no machine starts while demand fits the free
+   slots, warming ones included. The property test is `warming_changes_no_other_action`.
 
 Liveness, checked by TLC under weak fairness of the daemon's actions and of time, boot,
 runner start-up and GitHub's dispatcher:
@@ -502,8 +541,10 @@ runner start-up and GitHub's dispatcher:
    budget and `max_boxes` allow it.
 2. `IdleStops`: in `warm` and `hybrid`, an idle machine above `min_up` is eventually
    stopped.
-3. `Settles`: with no new jobs, the system reaches a state where `decide` returns nothing.
+3. `Settles`: with no new jobs, the system reaches a state where `decide` returns nothing
+   but warms and what ends them.
 4. `NoLeak`: every ephemeral machine is deleted after its job ends or its TTL passes.
+5. `WarmClears`: a warm that may still run is cancelled or ends while its machine is up.
 
 The spec also models the faults the daemon must survive, among them a refused start, a
 create whose answer is lost, a lost kept disk, and a crash between any two actions.

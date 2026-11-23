@@ -19,6 +19,7 @@ CONSTANTS
     BoxCap,         \* max_boxes
     MinUp,          \* min_up
     Standby,        \* standby: runners kept registered ahead of demand
+    WarmEnabled,    \* the pool has idle_warm
     Included,       \* included starts left today
     PaidBudget,     \* paid_start_cents_per_day, in units of one start's price
     MaxFaults,      \* faults per behaviour, shared by every fault kind
@@ -45,6 +46,8 @@ ASSUME
     /\ BoxCap \in Nat /\ MinUp \in Nat /\ Included \in Nat
     /\ Standby \in Nat
     /\ Standby > 0 => "slot" \in Placement
+    /\ WarmEnabled \in BOOLEAN
+    /\ WarmEnabled => "slot" \in Placement
     /\ PaidBudget \in Nat /\ MaxFaults \in Nat
     /\ {FixCrashSpend, FixRegSeen, FixCrashSeen, FixForkKey, FixStaleAct,
         FixKeptInflight, FixListLag, FixLostCreate, FixLostSpend} \subseteq BOOLEAN
@@ -67,10 +70,15 @@ VARIABLES
     keys,         \* boat: job fork Idempotency-Keys already used today
     ran,          \* ghost: a job ran on this ephemeral machine
     lag,          \* boat's listing and daemon memory of a created machine; see Vis
-    faults
+    faults,
+    warm,         \* daemon: the state file's warm on the machine, Clear, Running or Unknown
+    proc,         \* ghost: a warm process runs on the machine
+    launch        \* boat: a warm launch it never answered and may still carry out
 
-vars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
-          starts, spent_today, keys, ran, lag, faults>>
+coreVars == <<mstate, job, keep, runner, status, jobOn, seen, idle, age, plan,
+              starts, spent_today, keys, ran, lag>>
+warmVars == <<warm, proc, launch>>
+vars == <<coreVars, faults, warmVars>>
 
 RegTimeout == 1   \* age past register_timeout_s
 ForkTtl == 2      \* age past fork_ttl_s
@@ -180,7 +188,7 @@ StandbyPick(m) ==
 RegisterPick(m) ==
     \/ Want0 > 0 /\ (m \in Fresh \/ (m \in FreeKept /\ Fresh = {}))
     \/ StandbyPick(m)
-RegisterGuard(m) == Observed /\ NoPlan /\ RegisterPick(m)
+RegisterGuard(m) == Observed /\ NoPlan /\ RegisterPick(m) /\ warm[m] = "Clear"
 
 ResumeGuard(m) ==
     /\ Observed
@@ -224,6 +232,20 @@ StopGuard(m) ==
     /\ UpKept - Cardinality({n \in Machines : plan[n] = "Stop"}) > MinUp
     /\ WantStart <= 0
     /\ ~RegisterPick(m)
+
+\* decide's Warm: a free kept slot no Register or Stop takes, while no machine that is up
+\* may still run a warm. Any time is allowed; the code waits interval_s.
+WarmGuard(m) ==
+    /\ WarmEnabled /\ Observed /\ NoPlan
+    /\ m \in FreeKept
+    /\ \A n \in Machines : mstate[n] = "Up" => warm[n] = "Clear"
+    /\ ~RegisterPick(m) /\ ~StopGuard(m)
+
+\* decide's CancelWarm: before a Register, and as soon as an Unknown warm's machine is up.
+CancelGuard(m) ==
+    /\ Observed /\ NoPlan
+    /\ mstate[m] = "Up" /\ warm[m] # "Clear"
+    /\ warm[m] = "Unknown" \/ RegisterPick(m)
 
 \* A stopped or deleted machine takes its runner offline, and the job that was
 \* running there goes back to the queue. With FixStaleAct the daemon deleted the
@@ -332,6 +354,39 @@ Observe(m) ==
     /\ UNCHANGED <<lag, mstate, job, keep, runner, status, jobOn, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
+\* The warm is in the state file before its launch goes out, and boat answers it.
+StartWarm(m) ==
+    /\ WarmGuard(m)
+    /\ warm' = [warm EXCEPT ![m] = "Running"]
+    /\ proc' = [proc EXCEPT ![m] = TRUE]
+    /\ UNCHANGED <<coreVars, faults, launch>>
+
+\* observe sees the watched command end; the supervisor ended every warm process first.
+ObserveWarm(m) ==
+    /\ warm[m] = "Running"
+    /\ ~proc[m]
+    /\ warm' = [warm EXCEPT ![m] = "Clear"]
+    /\ UNCHANGED <<coreVars, faults, proc, launch>>
+
+\* The cancel marks the launch's token, so boat carrying it out later starts nothing,
+\* then ends every warm process. A cancel the machine does not confirm changes nothing.
+CancelWarm(m) ==
+    /\ CancelGuard(m)
+    /\ warm' = [warm EXCEPT ![m] = "Clear"]
+    /\ proc' = [proc EXCEPT ![m] = FALSE]
+    /\ launch' = [launch EXCEPT ![m] = FALSE]
+    /\ UNCHANGED <<coreVars, faults>>
+
+\* A stopped machine runs nothing, but a launch may still reach it once it is resumed, so
+\* its warm stays in the state file, Unknown. A deleted one is gone for good.
+ExecuteWarm(m) ==
+    LET down == mstate'[m] # "Up"
+        gone == mstate'[m] = "Gone"
+    IN /\ proc' = [proc EXCEPT ![m] = @ /\ ~down]
+       /\ warm' = [warm EXCEPT ![m] = IF gone \/ @ = "Clear" THEN "Clear"
+                                       ELSE IF down THEN "Unknown" ELSE @]
+       /\ launch' = [launch EXCEPT ![m] = @ /\ ~gone]
+
 -----------------------------------------------------------------------------
 (* GitHub and boat. *)
 
@@ -412,6 +467,20 @@ TickKeep(m) ==
     /\ UNCHANGED <<lag, mstate, job, runner, status, jobOn, seen, idle, age, plan,
                    starts, spent_today, keys, ran, faults>>
 
+\* The warm's command ends, or its timeout ends it.
+WarmEnds(m) ==
+    /\ proc[m]
+    /\ proc' = [proc EXCEPT ![m] = FALSE]
+    /\ UNCHANGED <<coreVars, faults, warm, launch>>
+
+\* boat carries out a launch it never answered.
+LateLaunch(m) ==
+    /\ launch[m]
+    /\ mstate[m] = "Up"
+    /\ proc' = [proc EXCEPT ![m] = TRUE]
+    /\ launch' = [launch EXCEPT ![m] = FALSE]
+    /\ UNCHANGED <<coreVars, faults, warm>>
+
 -----------------------------------------------------------------------------
 (* Faults, bounded by MaxFaults so that liveness can hold. *)
 
@@ -477,6 +546,14 @@ LostCreate ==
     /\ IF FixLostSpend THEN Pay ELSE UNCHANGED spent_today
     /\ UNCHANGED <<keep, runner, status, jobOn, idle, plan, ran>>
 
+\* A warm launch gets no answer: boat may carry it out later, or never.
+UnansweredWarm(m) ==
+    /\ Fault
+    /\ WarmGuard(m)
+    /\ warm' = [warm EXCEPT ![m] = "Unknown"]
+    /\ launch' = [launch EXCEPT ![m] = TRUE]
+    /\ UNCHANGED <<coreVars, proc>>
+
 \* boat answers 429, or 503 no_ready_machine or out_of_capacity: nothing starts,
 \* nothing is counted, and the daemon tries again after Retry-After.
 RefuseStart ==
@@ -492,7 +569,8 @@ RefuseStart ==
 (* fresh UUID v4, so the daemon cannot find a create that boat has not     *)
 (* listed yet: that machine becomes an Orphan. A create still in flight at *)
 (* the crash is the same case, with boat counting the start a little       *)
-(* later.                                                                  *)
+(* later. The state file of warms survives; which commands the daemon      *)
+(* watched does not.                                                       *)
 Crash ==
     /\ Fault
     /\ seen' = [m \in Machines |-> FixCrashSeen /\ IsEph(m) /\ mstate[m] = "Up"]
@@ -502,7 +580,8 @@ Crash ==
     /\ runner' = [m \in Machines |-> IF runner[m] = "Offline" THEN "Expired" ELSE runner[m]]
     /\ spent_today' = IF FixCrashSpend THEN PaidBudget ELSE 0
     /\ lag' = [m \in Machines |-> IF lag[m] = "Listed" THEN "Listed" ELSE "Orphan"]
-    /\ UNCHANGED <<mstate, job, keep, status, jobOn, starts, keys, ran>>
+    /\ warm' = [m \in Machines |-> IF warm[m] = "Running" THEN "Unknown" ELSE warm[m]]
+    /\ UNCHANGED <<mstate, job, keep, status, jobOn, starts, keys, ran, proc, launch>>
 
 -----------------------------------------------------------------------------
 
@@ -523,40 +602,53 @@ Init ==
     /\ ran = [m \in Machines |-> FALSE]
     /\ lag = [m \in Machines |-> "Listed"]
     /\ faults = 0
+    /\ warm = [m \in Machines |-> "Clear"]
+    /\ proc = [m \in Machines |-> FALSE]
+    /\ launch = [m \in Machines |-> FALSE]
+
+\* The loop without warms, which Settles measures.
+CoreToolStep ==
+    \/ /\ \E m \in Machines :
+             \/ Observe(m)
+             \/ Unregister(m)
+             \/ Delete(m)
+             \/ Stop(m)
+             \/ Register(m)
+             \/ Resume(m)
+          \/ ForkKept
+          \/ \E j \in Jobs : Fork(j)
+       /\ UNCHANGED warmVars
+    \/ \E m \in Machines : Execute(m) /\ ExecuteWarm(m)
 
 ToolStep ==
-    \/ \E m \in Machines :
-          \/ Observe(m)
-          \/ Unregister(m)
-          \/ Delete(m)
-          \/ Stop(m)
-          \/ Execute(m)
-          \/ Register(m)
-          \/ Resume(m)
-    \/ ForkKept
-    \/ \E j \in Jobs : Fork(j)
+    \/ CoreToolStep
+    \/ \E m \in Machines : StartWarm(m) \/ ObserveWarm(m) \/ CancelWarm(m)
 
 EnvStep ==
-    \/ \E j \in Jobs :
-          \/ Arrive(j)
-          \/ Finish(j)
-          \/ \E m \in Machines : Assign(j, m)
-    \/ \E m \in Machines :
-          \/ Boot(m)
-          \/ ComeOnline(m)
-          \/ TickIdle(m)
-          \/ TickAge(m)
-          \/ TickKeep(m)
+    \/ /\ \/ \E j \in Jobs :
+                \/ Arrive(j)
+                \/ Finish(j)
+                \/ \E m \in Machines : Assign(j, m)
+          \/ \E m \in Machines :
+                \/ Boot(m)
+                \/ ComeOnline(m)
+                \/ TickIdle(m)
+                \/ TickAge(m)
+                \/ TickKeep(m)
+       /\ UNCHANGED warmVars
+    \/ \E m \in Machines : WarmEnds(m) \/ LateLaunch(m)
 
 FaultStep ==
-    \/ \E j \in Jobs : Reassign(j)
-    \/ \E m \in Machines :
-          \/ LoseKept(m)
-          \/ NeverOnline(m)
-          \/ RunnerOffline(m)
-          \/ RefuseUnregister(m)
-    \/ RefuseStart
-    \/ LostCreate
+    \/ /\ \/ \E j \in Jobs : Reassign(j)
+          \/ \E m \in Machines :
+                \/ LoseKept(m)
+                \/ NeverOnline(m)
+                \/ RunnerOffline(m)
+                \/ RefuseUnregister(m)
+          \/ RefuseStart
+          \/ LostCreate
+       /\ UNCHANGED warmVars
+    \/ \E m \in Machines : UnansweredWarm(m)
     \/ Crash
 
 Next == ToolStep \/ EnvStep \/ FaultStep
@@ -566,23 +658,26 @@ Next == ToolStep \/ EnvStep \/ FaultStep
 \* Arrivals and faults get no fairness.
 Fairness ==
     /\ \A m \in Machines :
-          /\ WF_vars(Observe(m))
-          /\ WF_vars(Unregister(m))
-          /\ WF_vars(Delete(m))
-          /\ WF_vars(Stop(m))
-          /\ WF_vars(Execute(m))
-          /\ WF_vars(Register(m))
-          /\ WF_vars(Resume(m))
-          /\ WF_vars(Boot(m))
-          /\ WF_vars(ComeOnline(m))
-          /\ WF_vars(TickIdle(m))
-          /\ WF_vars(TickAge(m))
-          /\ WF_vars(TickKeep(m))
-    /\ WF_vars(ForkKept)
+          /\ WF_vars(Observe(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Unregister(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Delete(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Stop(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Execute(m) /\ ExecuteWarm(m))
+          /\ WF_vars(Register(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Resume(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(Boot(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(ComeOnline(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(TickIdle(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(TickAge(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(TickKeep(m) /\ UNCHANGED warmVars)
+          /\ WF_vars(ObserveWarm(m))
+          /\ WF_vars(CancelWarm(m))
+          /\ WF_vars(WarmEnds(m))
+    /\ WF_vars(ForkKept /\ UNCHANGED warmVars)
     /\ \A j \in Jobs :
-          /\ WF_vars(Fork(j))
-          /\ WF_vars(Finish(j))
-          /\ WF_vars(\E m \in Machines : Assign(j, m))
+          /\ WF_vars(Fork(j) /\ UNCHANGED warmVars)
+          /\ WF_vars(Finish(j) /\ UNCHANGED warmVars)
+          /\ WF_vars((\E m \in Machines : Assign(j, m)) /\ UNCHANGED warmVars)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -606,6 +701,9 @@ TypeOK ==
     /\ ran \in [Machines -> BOOLEAN]
     /\ lag \in [Machines -> {"Listed", "Known", "Hidden", "Lost", "Orphan"}]
     /\ faults \in 0..MaxFaults
+    /\ warm \in [Machines -> {"Clear", "Running", "Unknown"}]
+    /\ proc \in [Machines -> BOOLEAN]
+    /\ launch \in [Machines -> BOOLEAN]
 
 \* 1
 NoBusyStop ==
@@ -640,6 +738,24 @@ EphemeralIsolation == [][Placement = {"fork"} => FirstJob]_vars
 \* 6 for job forks in any placement; stronger than the design asks.
 ForkIsolation == [][FirstJob]_vars
 
+\* 7: no job runs beside a warm process.
+NoJobDuringWarm == \A j \in Jobs : status[j] = "Running" => ~proc[jobOn[j]]
+
+\* 8: a warm process runs only on a free kept slot, which decide counts as capacity.
+WarmRetainsCapacity == \A m \in Machines : proc[m] => m \in FreeKept
+
+\* 8: a start needs demand above every free slot, warming or not, or a min_up shortfall.
+FreeSlots == {m \in Machines : Has("slot") /\ Kept(m) /\ mstate[m] = "Up" /\ runner[m] = "None"}
+WarmingNeverIncreasesBoxes ==
+    [][Boxes' > Boxes =>
+         \/ Short > 0
+         \/ Cardinality(Queued) > Supply + Cardinality(Fresh) + Cardinality(FreeSlots) + PendingBoxes
+      ]_vars
+
+\* Liveness 5: a warm the daemon lost track of, or one that ended, leaves the state file.
+WarmClears ==
+    \A m \in Machines : (warm[m] # "Clear") ~> (warm[m] = "Clear" \/ mstate[m] # "Up")
+
 \* Liveness 4
 NoLeak ==
     \A m \in Machines :
@@ -666,6 +782,6 @@ IdleStops ==
             ~> (mstate[m] # "Up" \/ runner[m] = "Busy" \/ UpKept <= MinUp)
 
 \* Liveness 3: arrivals and faults are bounded, so "no new jobs" holds eventually.
-Settles == <>[](~ENABLED ToolStep)
+Settles == <>[](~ENABLED CoreToolStep)
 
 =============================================================================

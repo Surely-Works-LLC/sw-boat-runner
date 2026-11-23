@@ -4,10 +4,11 @@
 //! 2. `plan` asks `decide` for each pool's actions;
 //! 3. `act` (act.rs) carries them out, cheapest first.
 //!
-//! What a tick leaves for the next has two homes, each written by one module only:
-//! `observe::Memory` holds the facts about machines and runners that boat and GitHub do not
-//! report (docs/design.md#observed-state), and `act::Ledger` the start budget and back-off
-//! (docs/design.md#start-budget).
+//! What a tick leaves for the next has three homes: `observe::Memory` holds the facts
+//! about machines and runners that boat and GitHub do not report
+//! (docs/design.md#observed-state), `act::Ledger` the start budget and back-off
+//! (docs/design.md#start-budget), and `warm_file::WarmFile` the idle warms that may
+//! outlive the process (docs/design.md#idle-warm).
 
 mod act;
 mod idle_file;
@@ -15,6 +16,7 @@ mod observe;
 mod script;
 #[cfg(test)]
 mod testkit;
+mod warm_file;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -131,6 +133,9 @@ pub fn run(
     let stop = stop_on_signal();
     let transport = Ureq::new(HTTP_TIMEOUT);
     let mut tick_loop = Loop::connect(cfg, &transport, unix_now())?;
+    let needed = cfg.pools.iter().any(|p| p.idle_warm.is_some());
+    tick_loop.warm_file =
+        warm_file::WarmFile::from_env(&cfg.repo, needed).map_err(Error::Config)?;
     tick_loop.log(start_line(cfg));
     // Once, and only advice: a failed read changes nothing.
     match tick_loop.boat.saved_snapshots(None) {
@@ -492,6 +497,8 @@ pub struct Loop<'a> {
     summary_logged: Option<UnixSecs>,
     /// Where kept machines' idle clocks outlive a restart; see `idle_file`.
     idle_file: idle_file::IdleFile,
+    /// The warms that may outlive this process; see `warm_file`.
+    warm_file: warm_file::WarmFile,
 }
 
 #[derive(Clone)]
@@ -540,6 +547,7 @@ impl<'a> Loop<'a> {
             log: Box::new(Stderr),
             summary_logged: None,
             idle_file,
+            warm_file: warm_file::WarmFile::default(),
         }
     }
 
@@ -1292,6 +1300,8 @@ mod tests {
                 free_starts_left: None,
             },
             queued_at: Default::default(),
+            warming: Default::default(),
+            warmed_at: Default::default(),
         };
         let forks = |snap: &Snapshot, decide: fn(&Snapshot, &Pool) -> Vec<Action>| {
             plan(&cfg, snap, decide)

@@ -1,0 +1,8 @@
+# Pins: Stop: a running warm leaves the machine's normal idle-stop deadline unchanged.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+idle_warm = { argv = ["./warm-cache"], cwd = "/home/user/work", interval_s = 600, timeout_s = 90 }
