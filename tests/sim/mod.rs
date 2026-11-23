@@ -5,7 +5,9 @@
 //!   and Deleted, with a listing that lags by `Knobs::list_lag_s`, boat's TTL, a start
 //!   price and start windows; GitHub has runners that come online only after their JIT
 //!   config is written and started on an Up machine, and runs whose jobs are queued,
-//!   dispatched to matching idle runners, finished or cancelled.
+//!   dispatched to matching idle runners, finished or cancelled. A pool's `idle_warm`
+//!   command runs `Knobs::warm_s` on its machine until it ends, its timeout ends it, a
+//!   cancel ends it or its machine stops.
 //! - `Net` is the `Transport` the loops send through. It applies random `Faults` and
 //!   targeted `Rule`s: errors before boat or GitHub act, and answers lost after they act.
 //! - `Sim` ticks one or more daemons (`Loop`s) over one `World`, restarts them (dropping
@@ -21,6 +23,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use serde_json::{Value, json};
@@ -135,6 +138,8 @@ pub struct Knobs {
     /// stays the tick's.
     pub latency_s: u64,
     pub pricing: Pricing,
+    /// An idle warm's command runs this long, then exits 0, unless its `timeout_s` ends it.
+    pub warm_s: u64,
 }
 
 impl Default for Knobs {
@@ -158,6 +163,7 @@ impl Default for Knobs {
             dispatch_every_request: true,
             latency_s: 0,
             pricing: Pricing::free(),
+            warm_s: 60,
         }
     }
 }
@@ -458,6 +464,53 @@ pub struct Run {
 }
 
 // ---------------------------------------------------------------------------------------
+// Idle warms
+
+/// How a warm's supervisor ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarmEnd {
+    /// Its command exited 0.
+    Finished,
+    /// Its `timeout_s` ended it.
+    TimedOut,
+    /// A cancel ended it.
+    Cancelled,
+    /// Its machine stopped or was deleted under it.
+    Stopped,
+}
+
+/// One warm launch boat carried out: the supervisor of `script::warm_command`.
+#[derive(Clone, Debug)]
+pub struct WarmProc {
+    pub pid: u64,
+    pub machine: String,
+    pub started: UnixSecs,
+    /// When it ends on its own: its command's end or its timeout.
+    pub ends_at: UnixSecs,
+    pub timed_out: bool,
+    /// `None` while it runs.
+    pub ended: Option<(UnixSecs, WarmEnd)>,
+}
+
+/// What `GET /sandboxes/{id}/commands/{pid}` answers for a command that is not a warm:
+/// a cancel, or a warm launch its token's cancel came before.
+#[derive(Clone, Debug)]
+struct Done {
+    machine: String,
+    stdout: &'static str,
+}
+
+/// The token a warm launch (`SBR_WARM=<token> `) or a cancel (`: > /tmp/sbr-warm-<token> &&`)
+/// carries.
+fn warm_token(command: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = command.strip_prefix(": > /tmp/sbr-warm-") {
+        return Some((false, rest.split(' ').next()?));
+    }
+    let rest = command.split("SBR_WARM=").nth(1)?;
+    Some((true, rest.split(' ').next()?))
+}
+
+// ---------------------------------------------------------------------------------------
 // Invariants
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -486,6 +539,9 @@ pub enum Kind {
     Exit,
     /// The daemon sent a request the fake does not know.
     Unknown,
+    /// A runner started, or a job ran, on a machine while a warm ran on it
+    /// (`NoJobDuringWarm`).
+    WarmDuringJob,
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +582,12 @@ pub struct Stats {
     pub faults: u64,
     pub exits: u64,
     pub restarts: u64,
+    /// Warms that started a command, and the seconds they ran in all.
+    pub warms: u64,
+    pub warm_s: u64,
+    /// Running warms a cancel ended, and those a stop or delete of their machine ended.
+    pub warm_cancels: u64,
+    pub warm_stops: u64,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -565,6 +627,13 @@ pub struct World {
     spend: BTreeMap<(usize, String, u64), u64>,
     /// GitHub requests counted by (token, clock hour).
     gh_used: HashMap<(String, u64), u64>,
+    /// Every warm launch boat carried out, oldest first.
+    pub warms: Vec<WarmProc>,
+    /// Cancels, and warm launches a cancel came before, by process id.
+    done: HashMap<u64, Done>,
+    /// Process ids of warms and cancels, apart from `next_id` so that sandbox ids do not
+    /// depend on them.
+    next_pid: u64,
 }
 
 impl World {
@@ -592,6 +661,9 @@ impl World {
             hour_starts: (0, 0),
             spend: BTreeMap::new(),
             gh_used: HashMap::new(),
+            warms: Vec::new(),
+            done: HashMap::new(),
+            next_pid: 1 << 40,
         }
     }
 
@@ -743,6 +815,18 @@ impl World {
             for id in died {
                 let killed = self.kill_runners_on(&id, None);
                 self.stats.ttl_kills += killed as u64;
+                self.end_warms_on(&id, WarmEnd::Stopped);
+            }
+        }
+        for w in self.warms.iter_mut().filter(|w| w.ended.is_none()) {
+            if w.ends_at <= now {
+                let end = if w.timed_out {
+                    WarmEnd::TimedOut
+                } else {
+                    WarmEnd::Finished
+                };
+                w.ended = Some((w.ends_at, end));
+                self.stats.warm_s += w.ends_at - w.started;
             }
         }
         self.github_step();
@@ -835,6 +919,11 @@ impl World {
                 .filter(|&i| fits(&self.runners[i]))
                 .min_by_key(|&i| (self.runners[i].online_since, self.runners[i].id));
             if let Some(i) = pick {
+                let machine = self.runners[i].machine.clone();
+                if self.warming(&machine) {
+                    let detail = format!("job {} ran on {machine} beside a warm", self.jobs[j].id);
+                    self.violate(Kind::WarmDuringJob, detail);
+                }
                 let job = &mut self.jobs[j];
                 job.status = JobStatus::InProgress {
                     runner: self.runners[i].id,
@@ -1353,6 +1442,7 @@ impl World {
                     self.violate(Kind::BusyStop, format!("stop of {id} under {busy:?}"));
                 }
                 self.kill_runners_on(&id, None);
+                self.end_warms_on(&id, WarmEnd::Stopped);
                 (202, Vec::new(), json!({}))
             }
             ("DELETE", ["sandboxes", id]) => {
@@ -1374,6 +1464,7 @@ impl World {
                     self.violate(Kind::BusyStop, format!("delete of {id} under {busy:?}"));
                 }
                 self.kill_runners_on(&id, None);
+                self.end_warms_on(&id, WarmEnd::Stopped);
                 ok(json!({}))
             }
             ("PUT", ["sandboxes", id, "files"]) => {
@@ -1399,14 +1490,118 @@ impl World {
                     Some(sb) if sb.state.live() => return err(409, "invalid_state"),
                     _ => return err(404, "not_found"),
                 }
+                if let Some((launch, token)) = warm_token(&command) {
+                    let pid = self.warm_command(&id, launch, token);
+                    return ok(json!({ "processId": pid }));
+                }
                 self.start_runner(&id, &command);
                 ok(json!({ "processId": self.fresh_id() }))
+            }
+            ("GET", ["sandboxes", id, "commands", pid]) => {
+                let pid: u64 = pid.parse().unwrap_or(0);
+                match self.sandbox(id) {
+                    Some(sb) if sb.state == BoxState::Up => {}
+                    Some(sb) if sb.state.live() => return err(409, "invalid_state"),
+                    _ => return err(404, "not_found"),
+                }
+                if let Some(d) = self.done.get(&pid).filter(|d| d.machine == *id) {
+                    return ok(json!({
+                        "running": false, "status": "exited", "exitCode": 0, "stdout": d.stdout,
+                    }));
+                }
+                let Some(w) = self.warms.iter().find(|w| w.pid == pid && w.machine == *id) else {
+                    return err(404, "not_found");
+                };
+                let (exit, stdout) = match w.ended {
+                    None => return ok(json!({ "running": true, "status": "running" })),
+                    Some((at, WarmEnd::Finished)) => (0, format!("finish 0 {}\n", at - w.started)),
+                    Some((at, WarmEnd::TimedOut)) => (0, format!("timeout {}\n", at - w.started)),
+                    // TERM from the cancel, or the machine went down under it.
+                    Some(_) => (143, String::new()),
+                };
+                ok(
+                    json!({ "running": false, "status": "exited", "exitCode": exit, "stdout": stdout }),
+                )
             }
             _ => {
                 self.violate(Kind::Unknown, req.line());
                 err(404, "not_found")
             }
         }
+    }
+
+    /// A warm launch or a cancel on `machine`, as boat runs it. A cancel marks its token,
+    /// ends every warm on the machine and prints `clear`; a launch whose token is marked
+    /// exits at once. Returns the process id.
+    fn warm_command(&mut self, machine: &str, launch: bool, token: &str) -> u64 {
+        self.next_pid += 1;
+        let pid = self.next_pid;
+        let marker = format!("/tmp/sbr-warm-{token}");
+        let now = self.now;
+        let done = |stdout| Done {
+            machine: machine.to_string(),
+            stdout,
+        };
+        if !launch {
+            if let Some(sb) = self.sandbox_mut(machine) {
+                sb.files.insert(marker, String::new());
+            }
+            self.stats.warm_cancels += self.end_warms_on(machine, WarmEnd::Cancelled);
+            self.done.insert(pid, done("clear\n"));
+            return pid;
+        }
+        let marked = self
+            .sandbox(machine)
+            .is_some_and(|s| s.files.contains_key(&marker));
+        if marked {
+            self.done.insert(pid, done(""));
+            return pid;
+        }
+        if !self.busy_on(machine).is_empty() {
+            let detail = format!("warm on {machine} beside a job");
+            self.violate(Kind::WarmDuringJob, detail);
+        }
+        let timeout_s = self
+            .sandbox(machine)
+            .and_then(|s| s.pool().map(str::to_string))
+            .and_then(|p| self.pools.iter().find(|o| o.pool.name == p).cloned())
+            .and_then(|o| o.pool.idle_warm.map(|w| w.timeout_s))
+            .unwrap_or(u64::MAX);
+        let run_s = self.knobs.warm_s;
+        self.stats.warms += 1;
+        self.warms.push(WarmProc {
+            pid,
+            machine: machine.to_string(),
+            started: now,
+            ends_at: now + run_s.min(timeout_s),
+            timed_out: run_s > timeout_s,
+            ended: None,
+        });
+        pid
+    }
+
+    /// Ends every warm running on `machine` as `how`; returns how many there were.
+    fn end_warms_on(&mut self, machine: &str, how: WarmEnd) -> u64 {
+        let now = self.now;
+        let mut ended = 0;
+        for w in self.warms.iter_mut() {
+            if w.machine == machine && w.ended.is_none() {
+                w.ended = Some((now, how));
+                self.stats.warm_s += now - w.started;
+                ended += 1;
+            }
+        }
+        if how == WarmEnd::Stopped {
+            self.stats.warm_stops += ended;
+        }
+        ended
+    }
+
+    /// A warm runs on `machine`.
+    pub fn warming(&self, machine: &str) -> bool {
+        self.warms
+            .iter()
+            .any(|w| w.machine == machine && w.ended.is_none())
     }
 
     /// The daemon's start command: kills the slot's old runner, reads the JIT config from
@@ -1420,6 +1615,10 @@ impl World {
         let Ok(slot) = slot.parse::<u32>() else {
             return;
         };
+        if self.warming(machine) {
+            let detail = format!("runner started on {machine} slot {slot} beside a warm");
+            self.violate(Kind::WarmDuringJob, detail);
+        }
         let killed = self.kill_runners_on(machine, Some(slot));
         if killed > 0 {
             let detail = format!("start on {machine} slot {slot} killed a Busy runner");
@@ -1834,12 +2033,34 @@ pub struct Sim {
     down: Vec<u64>,
     /// Ticks a daemon stays down after its tick returned an error.
     pub restart_ticks: u64,
+    /// Each daemon's state directory, which outlives its restarts; see `with_state`.
+    state: Vec<Option<PathBuf>>,
+}
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        for dir in self.state.iter().flatten() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 impl Sim {
     /// Daemon `i` runs `cfgs[i]` with credentials `boat_key(i)` and `gh_token(i)`, and all
     /// start at `world.now`.
     pub fn new(world: World, cfgs: Vec<Config>) -> Sim {
+        Sim::make(world, cfgs, false)
+    }
+
+    /// As `new`, with a state directory per daemon that its restarts keep, as systemd's
+    /// `StateDirectory=` does: the idle clocks and the warms that may still run. A pool
+    /// with `idle_warm` launches no warm without one.
+    pub fn with_state(world: World, cfgs: Vec<Config>) -> Sim {
+        Sim::make(world, cfgs, true)
+    }
+
+    fn make(world: World, cfgs: Vec<Config>, state: bool) -> Sim {
+        static DIRS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut world = world;
         for (owner, cfg) in cfgs.iter().enumerate() {
             for pool in &cfg.pools {
@@ -1863,6 +2084,17 @@ impl Sim {
             decide: decide::decide,
             down: vec![0; cfgs.len()],
             restart_ticks: 1,
+            state: (0..cfgs.len())
+                .map(|_| {
+                    let n = DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let dir = std::env::temp_dir()
+                        .join(format!("sbr-sim-state-{}-{n}", std::process::id()));
+                    state.then(|| {
+                        std::fs::create_dir_all(&dir).expect("a state directory");
+                        dir
+                    })
+                })
+                .collect(),
         };
         for cfg in cfgs {
             let cfg: &'static Config = Box::leak(Box::new(cfg));
@@ -1913,6 +2145,9 @@ impl Sim {
             lp.set_clock(Box::new(move || {
                 std::time::Duration::from_secs(net.world.borrow().now)
             }));
+            if let Some(dir) = &self.state[i] {
+                lp.set_state_dir(dir).expect("the state directory reads");
+            }
         }
     }
 

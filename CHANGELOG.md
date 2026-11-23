@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `tests/sim_idle_warm.rs` runs bursts, quiet hours, restarts, lost launches and failed
+  cancels with and without `idle_warm` on the stateful fake, which now runs warms and
+  cancels, and checks that every stop, start, register and job start falls on the same
+  tick. `run::Loop::set_state_dir` is public so the tests can keep a loop's idle clocks
+  and warms across its restarts.
+
+### Changed
+
+- The README's Idle warm section says when a quiet pool warms: never on a machine that
+  holds a standby runner, so not at all once a pool with `min_up = 1` and a `standby` is
+  down to `min_up`, and how long a job waits for a machine whose cancel keeps failing.
+
 ## [0.3.8] - 2026-11-22
 
 ### Added
