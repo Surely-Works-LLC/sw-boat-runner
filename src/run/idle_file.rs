@@ -8,7 +8,7 @@
 //! an idle machine early or late, never one that runs a job.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::model::UnixSecs;
 
@@ -35,6 +35,11 @@ impl IdleFile {
     /// several; the first is used. Unset, nothing is saved and a restart resets the clocks.
     pub(super) fn from_env() -> Self {
         Self::at(state_path(FILE_NAME))
+    }
+
+    /// The file in `dir`, as `from_env` finds it in the state directory.
+    pub(super) fn in_dir(dir: &Path) -> Self {
+        Self::at(Some(dir.join(FILE_NAME)))
     }
 
     /// Saves to `path`; `None` saves nothing.

@@ -22,15 +22,18 @@ impl WarmFile {
     /// as the warms it may name would go uncancelled, and when a pool has `idle_warm`
     /// but there is no state directory.
     pub(super) fn from_env(repo: &str, needed: bool) -> Result<Self, String> {
-        let name = format!(
-            "idle-warm-{}.tsv",
-            repo.to_ascii_lowercase().replace('/', "+")
-        );
+        let name = file_name(repo);
         match state_path(&name) {
             Some(path) => Self::at(path).map_err(|e| format!("{name}: {e}")),
             None if needed => Err("idle_warm needs STATE_DIRECTORY".into()),
             None => Ok(Self::default()),
         }
+    }
+
+    /// The file for `repo` in `dir`, as `from_env` finds it in the state directory.
+    pub(super) fn in_dir(dir: &Path, repo: &str) -> Result<Self, String> {
+        let name = file_name(repo);
+        Self::at(dir.join(&name)).map_err(|e| format!("{name}: {e}"))
     }
 
     pub(super) fn at(path: PathBuf) -> io::Result<Self> {
@@ -75,6 +78,13 @@ impl WarmFile {
             eprintln!("warn: idle warm state: {e}");
         }
     }
+}
+
+fn file_name(repo: &str) -> String {
+    format!(
+        "idle-warm-{}.tsv",
+        repo.to_ascii_lowercase().replace('/', "+")
+    )
 }
 
 /// Through a synced temporary file and a rename, so a crash leaves the old file or the

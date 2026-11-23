@@ -1,0 +1,11 @@
+# Pins: Warm: a pool at min_up keeps its standby runner on its one machine, so a quiet pool with standby never warms.
+repo = "acme/app"
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "boat"]
+snapshot = "snap-1"
+min_up = 1
+standby = 2
+idle_stop_s = 600
+idle_warm = { argv = ["./warm-cache"], cwd = "/home/user/work", interval_s = 300, timeout_s = 600 }

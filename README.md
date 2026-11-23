@@ -195,6 +195,14 @@ a time, the one idle longest, and never starts or keeps up a machine for it: a j
 standby runner takes the machine first, and the idle stop comes on time and ends a
 running warm with the machine.
 
+A warm goes only on a machine with no runner, and a quiet pool keeps its `standby`
+runners on the machines it keeps up for `min_up`. So once a quiet pool is down to
+`min_up` with a standby runner on each of those machines (`min_up = 1` and `standby` of 1
+or more, for example), it runs no warm at all. Any other kept machine with no runner
+warms at most once per `interval_s`: one waiting for its idle stop after a burst, or one
+kept up for `min_up` that no standby runner holds, such as every machine of a pool with
+`standby = 0`.
+
 The command runs as the runner user in `cwd`, with `argv` as given, stdin from
 `/dev/null`, and only `HOME=/home/user`, `PATH=/usr/local/bin:/usr/bin:/bin`,
 `SBR_POOL` (the pool's name) and `SBR_WARM` in its environment. Its output goes to
@@ -203,6 +211,8 @@ and changes nothing. At `timeout_s` it gets TERM, and KILL 2 s later. Before a r
 goes on the machine, the daemon cancels the warm: every process that carries `SBR_WARM`
 gets TERM, then KILL after 2 s, and the runner is registered only once the machine
 confirms none is left, within a few seconds; otherwise the job waits for the next tick.
+While the cancel keeps failing, the job keeps waiting for that machine, with no other
+machine started for it, until the warm ends on its own, at the latest at `timeout_s`.
 A process that clears its environment, runs as another user or hands work to a daemon
 such as Docker escapes the cancel, so the command must not.
 

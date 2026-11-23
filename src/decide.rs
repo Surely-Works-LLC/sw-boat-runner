@@ -1828,6 +1828,31 @@ mod tests {
                 prop_assert_eq!(actions, decide(&cleared, &no_hook));
             }
 
+            /// Spec `CancelGuard`: a `CancelWarm` goes, at most once, to a kept `Up`
+            /// machine whose warm may run, that the tick neither stops nor deletes; a
+            /// running warm only when a `Register` on the machine follows it.
+            #[test]
+            fn cancel_only_on_a_machine_that_stays_up(snap in arb_snapshot(), pool in arb_pool()) {
+                let actions = decide(&snap, &pool);
+                let mut cancelled = BTreeSet::new();
+                for (i, a) in actions.iter().enumerate() {
+                    let Action::CancelWarm { machine } = a else { continue };
+                    prop_assert!(cancelled.insert(machine), "{actions:?}");
+                    let m = pool_machine(&snap, &pool, machine).unwrap();
+                    prop_assert!(!m.is_ephemeral() && m.state == Ms::Up, "{actions:?}");
+                    let ends = actions.iter().any(|b| matches!(b,
+                        Action::Stop { machine: n } | Action::Delete { machine: n } if n == machine));
+                    prop_assert!(!ends, "{actions:?}");
+                    let registers = actions[i..].iter().any(|b| matches!(b,
+                        Action::Register { machine: n, .. } if n == machine));
+                    match snap.warming.get(machine) {
+                        Some(Warming::Running) => prop_assert!(registers, "{actions:?}"),
+                        Some(Warming::Unknown) => {}
+                        None => prop_assert!(false, "{actions:?}"),
+                    }
+                }
+            }
+
             /// `Warm` (spec `WarmGuard`): at most one, while no machine of the pool that is
             /// up may still run one, on a kept `Up` machine with no runner and no other
             /// action, idle since its last job and warm for `interval_s`.

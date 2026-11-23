@@ -681,6 +681,16 @@ impl<'a> Loop<'a> {
         }
     }
 
+    /// Keeps the idle clocks and the warms in `dir`, as `run` keeps them in
+    /// `STATE_DIRECTORY`, for a test that drives the loop itself (tests/sim). Call it
+    /// before the first tick; an error when the warm file cannot be read, as for `run`.
+    pub fn set_state_dir(&mut self, dir: &Path) -> Result<(), Error> {
+        self.idle_file = idle_file::IdleFile::in_dir(dir);
+        self.memory.restore_clocks(self.idle_file.load());
+        self.warm_file = warm_file::WarmFile::in_dir(dir, &self.cfg.repo).map_err(Error::Config)?;
+        Ok(())
+    }
+
     /// Replaces the clock that times what waits for a request's answer (see `clock`):
     /// the time since some fixed instant, for a test that runs requests on virtual time.
     pub fn set_clock(&mut self, clock: Box<dyn Fn() -> Duration>) {
