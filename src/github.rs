@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroU64;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::boat;
-use crate::github_app::App;
-use crate::model::{JobKey, QueuedJob, RunnerState, UnixSecs};
+use crate::github_app::{App, RunnerPermissions};
+use crate::model::{Config, JobKey, QueuedJob, RunnerState, UnixSecs};
 use crate::transport::{Response, Transport, redact};
 
 pub(crate) const API: &str = "https://api.github.com";
@@ -71,6 +72,7 @@ pub enum Error {
     RunnersForbidden {
         message: String,
     },
+    RunnerGroup(String),
     NotFound,
     /// The GitHub App's JWT or installation was refused: wrong app id or key, the app
     /// not installed on the repository (or uninstalled), suspended, or a missing
@@ -109,6 +111,7 @@ impl Error {
             | Error::Status { message: text, .. }
             | Error::Unauthorized { message: text, .. }
             | Error::RunnersForbidden { message: text }
+            | Error::RunnerGroup(text)
             | Error::Parse(text)
             | Error::App(text)
             | Error::Clock(text) => redact(text, secret),
@@ -147,6 +150,7 @@ impl fmt::Display for Error {
                  allow both in the organization's Settings > Actions"
             ),
             Error::NotFound => write!(f, "GitHub: not found"),
+            Error::RunnerGroup(message) => write!(f, "GitHub runner group: {message}"),
             Error::App(e) => write!(f, "GitHub App: {e}"),
             Error::Clock(e) => write!(f, "GitHub App: {e}"),
             Error::Network(e) => write!(f, "GitHub network error: {e}"),
@@ -170,15 +174,35 @@ pub(crate) struct GhRunner {
     /// `online` or `offline`.
     pub status: String,
     pub busy: bool,
+    #[serde(skip)]
+    pub organization_group: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunnerRef {
+    pub id: u64,
+    organization_group: Option<NonZeroU64>,
+}
+
+impl GhRunner {
+    pub(crate) fn reference(&self) -> RunnerRef {
+        RunnerRef {
+            id: self.id,
+            organization_group: self.organization_group,
+        }
+    }
 }
 
 /// A just-in-time runner config. It is a credential: no `Debug`, no `Display`, and the
 /// only way out is `expose`.
-pub(crate) struct JitConfig(String);
+pub(crate) struct JitConfig {
+    encoded: String,
+    pub(crate) runner: Option<RunnerRef>,
+}
 
 impl JitConfig {
     pub(crate) fn expose(&self) -> &str {
-        &self.0
+        &self.encoded
     }
 }
 
@@ -282,6 +306,19 @@ impl Budget {
 }
 
 const JITCONFIG: &str = "/actions/runners/generate-jitconfig";
+
+pub(crate) fn policy_permissions(cfg: &Config) -> RunnerPermissions {
+    RunnerPermissions {
+        repository_write: cfg
+            .pools
+            .iter()
+            .any(|p| p.organization_runner_group.is_none()),
+        organization_write: cfg
+            .pools
+            .iter()
+            .any(|p| p.organization_runner_group.is_some()),
+    }
+}
 
 /// A run's jobs, first page. GitHub's default `filter` is `latest`, so a re-run lists only
 /// its latest attempt's jobs.
@@ -390,6 +427,13 @@ impl<'t> Client<'t> {
         }
     }
 
+    pub(crate) fn for_policy(t: &'t dyn Transport, mut auth: Auth, cfg: &Config) -> Self {
+        if let Auth::App(app) = &mut auth {
+            app.set_runner_permissions(policy_permissions(cfg));
+        }
+        Self::new(t, auth, cfg.repo.clone())
+    }
+
     /// A client whose monotonic clock is `elapsed`, for tests of slow requests.
     #[cfg(test)]
     fn with_clock(mut self, elapsed: impl Fn() -> u64 + 'static) -> Self {
@@ -458,31 +502,48 @@ impl<'t> Client<'t> {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Vec<u8>, Error> {
+        let url = format!("{API}/repos/{}{path}", self.repo);
+        self.request_at(method, &url, body)
+    }
+
+    fn organization_url(&self, path: &str) -> String {
+        let (owner, _) = self
+            .repo
+            .split_once('/')
+            .expect("policy repo is owner/name");
+        format!("{API}/orgs/{owner}{path}")
+    }
+
+    fn request_at(
+        &mut self,
+        method: &str,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<Vec<u8>, Error> {
         self.age_cache();
-        let result = self.send(method, path, body);
+        let result = self.send(method, url, body);
         result.map_err(|e| match self.auth.secret() {
             Some(secret) => e.redact(secret),
             None => e,
         })
     }
 
-    fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Vec<u8>, Error> {
+    fn send(&mut self, method: &str, url: &str, body: Option<&Value>) -> Result<Vec<u8>, Error> {
         if let Some((remaining, reset)) = self.limited {
             if self.now < reset {
                 return Err(Error::RateLimited { remaining, reset });
             }
             self.limited = None;
         }
-        let url = format!("{API}/repos/{}{path}", self.repo);
         let cacheable = method == "GET";
-        let mut resp = self.send_once(method, &url, body)?;
+        let mut resp = self.send_once(method, url, body)?;
         // An installation token GitHub no longer takes, revoked or outlived by a clock
         // that ran slow, is minted again once.
         if resp.status == 401 {
             if let Auth::App(app) = &mut self.auth {
                 app.forget_token();
                 self.budget.tokens -= 1.0;
-                resp = self.send_once(method, &url, body)?;
+                resp = self.send_once(method, url, body)?;
             }
         }
 
@@ -533,7 +594,7 @@ impl<'t> Client<'t> {
             });
         }
         match resp.status {
-            304 => match self.cache.get_mut(&url) {
+            304 => match self.cache.get_mut(url) {
                 Some(c) => {
                     c.used = true;
                     Ok(c.body.clone())
@@ -550,11 +611,11 @@ impl<'t> Client<'t> {
                         body: resp.body.clone(),
                         used: true,
                     };
-                    self.cache.insert(url, cached);
+                    self.cache.insert(url.to_string(), cached);
                 }
                 Ok(resp.body)
             }
-            403 if path == JITCONFIG && forbids_runners(&message()) => {
+            403 if url.ends_with(JITCONFIG) && forbids_runners(&message()) => {
                 Err(Error::RunnersForbidden { message: message() })
             }
             401 | 403 => Err(Error::Unauthorized {
@@ -609,8 +670,8 @@ impl<'t> Client<'t> {
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&mut self, path: &str) -> Result<T, Error> {
-        let body = self.request("GET", path, None)?;
-        serde_json::from_slice(&body).map_err(|e| Error::Parse(e.to_string()))
+        let url = format!("{API}/repos/{}{path}", self.repo);
+        self.get_at(&url)
     }
 
     /// Every item under `key` of the list whose first page is `first`, up to `MAX_PAGES`
@@ -644,15 +705,24 @@ impl<'t> Client<'t> {
         Ok(out)
     }
 
+    fn get_at<T: for<'de> Deserialize<'de>>(&mut self, url: &str) -> Result<T, Error> {
+        let body = self.request_at("GET", url, None)?;
+        serde_json::from_slice(&body).map_err(|e| Error::Parse(e.to_string()))
+    }
+
     /// The repository's runners whose names start with `sbr-`.
     pub(crate) fn runners(&mut self) -> Result<Vec<GhRunner>, Error> {
+        self.runners_at(&format!("{API}/repos/{}/actions/runners", self.repo))
+    }
+
+    fn runners_at(&mut self, url: &str) -> Result<Vec<GhRunner>, Error> {
         #[derive(Deserialize)]
         struct Page {
             runners: Vec<GhRunner>,
         }
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
-            let p: Page = self.get(&format!("/actions/runners?per_page={PER_PAGE}&page={page}"))?;
+            let p: Page = self.get_at(&format!("{url}?per_page={PER_PAGE}&page={page}"))?;
             let last = p.runners.len() < PER_PAGE;
             out.extend(p.runners.into_iter().filter(|r| r.name.starts_with(PREFIX)));
             if last {
@@ -664,27 +734,161 @@ impl<'t> Client<'t> {
         )))
     }
 
-    /// Registers an ephemeral runner (one job) in the default group 1.
+    /// Read group membership even when the repository also lists these runners.
+    /// The listing that owns a registration determines which endpoint can delete it.
+    pub(crate) fn policy_runners(&mut self, cfg: &Config) -> Result<Vec<GhRunner>, Error> {
+        let mut runners = self.runners()?;
+        let groups: std::collections::BTreeSet<_> = cfg
+            .pools
+            .iter()
+            .filter_map(|p| p.organization_runner_group)
+            .collect();
+        for group in groups {
+            let base = self.organization_url(&format!("/actions/runner-groups/{group}"));
+            self.check_group_access(group, &base)?;
+            for mut runner in self.runners_at(&format!("{base}/runners"))? {
+                if !parse_runner_name(&runner.name).is_some_and(|n| {
+                    cfg.pools
+                        .iter()
+                        .any(|p| p.name == n.pool && p.organization_runner_group == Some(group))
+                }) {
+                    continue;
+                }
+                if runners
+                    .iter()
+                    .any(|r| r.name == runner.name && r.id != runner.id)
+                {
+                    return Err(Error::RunnerGroup(format!(
+                        "two registrations named {} have different IDs",
+                        runner.name
+                    )));
+                }
+                runners.retain(|r| r.name != runner.name);
+                runner.organization_group = Some(group);
+                runners.push(runner);
+            }
+        }
+        if let Some(runner) = runners.iter().find(|r| {
+            r.organization_group.is_none()
+                && parse_runner_name(&r.name).is_some_and(|n| {
+                    cfg.pools
+                        .iter()
+                        .any(|p| p.name == n.pool && p.organization_runner_group.is_some())
+                })
+        }) {
+            return Err(Error::Parse(format!(
+                "runner {} is listed on the repository but missing from its configured organization group",
+                runner.name
+            )));
+        }
+        Ok(runners)
+    }
+
+    fn check_group_access(&mut self, group: NonZeroU64, base: &str) -> Result<(), Error> {
+        #[derive(Deserialize)]
+        struct Group {
+            id: NonZeroU64,
+            visibility: String,
+            inherited: bool,
+            default: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct Repository {
+            full_name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Selection {
+            total_count: u64,
+            repositories: Vec<Repository>,
+        }
+
+        let info: Group = self.get_at(base)?;
+        let selection: Selection = self.get_at(&format!("{base}/repositories?per_page=2"))?;
+        if info.id != group
+            || info.default
+            || info.inherited
+            || info.visibility != "selected"
+            || selection.total_count != 1
+            || !matches!(selection.repositories.as_slice(), [repo] if repo.full_name.eq_ignore_ascii_case(&self.repo))
+        {
+            return Err(Error::RunnerGroup(format!(
+                "organization group {group} must be dedicated to {} alone and owned by the organization",
+                self.repo
+            )));
+        }
+        Ok(())
+    }
+
+    /// Registers an ephemeral runner (one job) on the configured group or repository.
     pub(crate) fn generate_jitconfig(
         &mut self,
         name: &str,
         labels: &[String],
+        organization_group: Option<NonZeroU64>,
     ) -> Result<JitConfig, Error> {
+        #[derive(Deserialize)]
+        struct Runner {
+            id: Option<u64>,
+        }
+
         #[derive(Deserialize)]
         struct Out {
             encoded_jit_config: String,
+            runner: Option<Runner>,
         }
-        let body = json!({ "name": name, "runner_group_id": 1, "labels": labels });
-        let bytes = self.request("POST", JITCONFIG, Some(&body))?;
+        let group = organization_group.map_or(1, NonZeroU64::get);
+        let body = json!({ "name": name, "runner_group_id": group, "labels": labels });
+        let bytes = match organization_group {
+            Some(_) => {
+                let url = self.organization_url(JITCONFIG);
+                self.request_at("POST", &url, Some(&body))?
+            }
+            None => self.request("POST", JITCONFIG, Some(&body))?,
+        };
         // serde errors can quote the input; this input holds a credential.
         let out: Out = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Parse("generate-jitconfig response".into()))?;
-        Ok(JitConfig(out.encoded_jit_config))
+        let runner = out
+            .runner
+            .and_then(|runner| runner.id)
+            .filter(|id| *id > 0)
+            .map(|id| RunnerRef {
+                id,
+                organization_group,
+            });
+        if organization_group.is_some() && runner.is_none() {
+            return Err(Error::Parse(
+                "organization generate-jitconfig response lacks a runner ID".into(),
+            ));
+        }
+        Ok(JitConfig {
+            encoded: out.encoded_jit_config,
+            runner,
+        })
     }
 
-    pub(crate) fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
-        self.request("DELETE", &format!("/actions/runners/{id}"), None)
-            .map(drop)
+    pub(crate) fn delete_runner(&mut self, runner: RunnerRef) -> Result<(), Error> {
+        let path = format!("/actions/runners/{}", runner.id);
+        if let Some(group) = runner.organization_group {
+            let members = self.organization_url(&format!("/actions/runner-groups/{group}/runners"));
+            if !self
+                .runners_at(&members)?
+                .iter()
+                .any(|member| member.id == runner.id)
+            {
+                return Err(Error::RunnerGroup(format!(
+                    "runner {} is no longer listed in group {group}",
+                    runner.id
+                )));
+            }
+            let url = self.organization_url(&path);
+            self.request_at("DELETE", &url, None)
+        } else {
+            self.request("DELETE", &path, None)
+        }
+        .map(drop)
     }
 
     /// The queued jobs of one run, every page of them, so a matrix of more than 100 jobs
@@ -957,7 +1161,11 @@ mod tests {
 
         // ...and a tick that sends requests but not this one drops it.
         gh.begin_tick(5);
-        gh.delete_runner(1).unwrap();
+        gh.delete_runner(RunnerRef {
+            id: 1,
+            organization_group: None,
+        })
+        .unwrap();
         gh.begin_tick(6);
         gh.runners().unwrap();
         assert_eq!(fake.sent()[4].header("if-none-match"), None);
@@ -1015,8 +1223,14 @@ mod tests {
             })
         );
         gh.begin_tick(77);
-        assert_eq!(gh.delete_runner(5), Err(Error::NotFound));
-        let err = gh.generate_jitconfig("n", &[]).err().unwrap();
+        assert_eq!(
+            gh.delete_runner(RunnerRef {
+                id: 5,
+                organization_group: None
+            }),
+            Err(Error::NotFound)
+        );
+        let err = gh.generate_jitconfig("n", &[], None).err().unwrap();
         assert!(err.is_fatal());
     }
 
@@ -1287,9 +1501,10 @@ mod tests {
         });
         let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
         let jit = gh
-            .generate_jitconfig("sbr-ci-bx_22222222-0-1", &["self-hosted".into()])
+            .generate_jitconfig("sbr-ci-bx_22222222-0-1", &["self-hosted".into()], None)
             .unwrap();
         assert_eq!(jit.expose(), "SECRET");
+        assert_eq!(jit.runner.map(|r| r.id), Some(9));
         let sent = fake.sent();
         assert_eq!(
             sent[0].url,
@@ -1300,6 +1515,187 @@ mod tests {
             body,
             json!({"name": "sbr-ci-bx_22222222-0-1", "runner_group_id": 1, "labels": ["self-hosted"]})
         );
+    }
+
+    fn group_policy() -> Config {
+        crate::policy::parse(
+            r#"
+repo = "o/r"
+
+[[pool]]
+name = "dedicated"
+labels = ["self-hosted", "studio"]
+snapshot = "s"
+organization_runner_group = 15
+
+[[pool]]
+name = "ci"
+labels = ["self-hosted", "legacy"]
+snapshot = "s"
+"#,
+        )
+        .unwrap()
+    }
+
+    const GROUP: &str = "https://api.github.com/orgs/o/actions/runner-groups/15";
+    const GROUP_JIT: &str = "https://api.github.com/orgs/o/actions/runners/generate-jitconfig";
+
+    #[test]
+    fn organization_group_registration_and_cleanup_keep_their_scope() {
+        const LEGACY: &str = "sbr-ci-bx_22222222-0-1";
+        const DEDICATED: &str = "sbr-dedicated-bx_33333333-0-1";
+        let fake = Fake::new(|s| match (s.method.as_str(), s.url.as_str()) {
+            ("GET", RUNNERS) => respond(
+                200,
+                &[],
+                &json!({"runners": [
+                    {"id": 1, "name": LEGACY, "status": "offline", "busy": false},
+                    {"id": 2, "name": DEDICATED, "status": "offline", "busy": false}
+                ]})
+                .to_string(),
+            ),
+            ("GET", GROUP) => respond(
+                200,
+                &[],
+                r#"{"id":15,"visibility":"selected","inherited":false,"default":false}"#,
+            ),
+            (
+                "GET",
+                "https://api.github.com/orgs/o/actions/runner-groups/15/repositories?per_page=2",
+            ) => respond(
+                200,
+                &[],
+                r#"{"total_count":1,"repositories":[{"full_name":"O/R"}]}"#,
+            ),
+            (
+                "GET",
+                "https://api.github.com/orgs/o/actions/runner-groups/15/runners?per_page=100&page=1",
+            ) => respond(
+                200,
+                &[],
+                &json!({"runners": [
+                    {"id": 2, "name": DEDICATED, "status": "online", "busy": true},
+                    {"id": 3, "name": LEGACY, "status": "offline", "busy": false}
+                ]})
+                .to_string(),
+            ),
+            ("POST", GROUP_JIT) => respond(
+                201,
+                &[],
+                r#"{"runner":{"id":4},"encoded_jit_config":"TEST"}"#,
+            ),
+            ("DELETE", "https://api.github.com/orgs/o/actions/runners/2")
+            | ("DELETE", "https://api.github.com/repos/o/r/actions/runners/1") => {
+                respond(204, &[], "")
+            }
+            _ => panic!("unexpected {} {}", s.method, s.url),
+        });
+        let cfg = group_policy();
+        let mut gh = Client::for_policy(&fake, Auth::Token("t".into()), &cfg);
+        let listed = gh.policy_runners(&cfg).unwrap();
+        assert_eq!(listed.len(), 2);
+        let legacy = listed.iter().find(|r| r.name == LEGACY).unwrap();
+        let dedicated = listed.iter().find(|r| r.name == DEDICATED).unwrap();
+        assert!(dedicated.busy);
+        let pool = &cfg.pools[0];
+        let jit = gh
+            .generate_jitconfig(DEDICATED, &pool.labels, pool.organization_runner_group)
+            .unwrap();
+        assert_eq!(jit.expose(), "TEST");
+        gh.delete_runner(legacy.reference()).unwrap();
+        gh.delete_runner(dedicated.reference()).unwrap();
+
+        let sent = fake.sent();
+        let req = sent.iter().find(|s| s.url == GROUP_JIT).unwrap();
+        let body: Value = serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"name": DEDICATED, "runner_group_id": 15, "labels": pool.labels})
+        );
+    }
+
+    #[test]
+    fn organization_runner_group_must_be_dedicated_to_the_policy_repository() {
+        let fake = Fake::new(|s| match s.url.as_str() {
+            RUNNERS => respond(200, &[], r#"{"runners":[]}"#),
+            GROUP => respond(
+                200,
+                &[],
+                r#"{"id":15,"visibility":"selected","inherited":false,"default":false}"#,
+            ),
+            "https://api.github.com/orgs/o/actions/runner-groups/15/repositories?per_page=2" => {
+                respond(
+                    200,
+                    &[],
+                    r#"{"total_count":2,"repositories":[{"full_name":"o/r"},{"full_name":"o/other"}]}"#,
+                )
+            }
+            _ => panic!("unexpected {} {}", s.method, s.url),
+        });
+        let cfg = group_policy();
+        let mut gh = Client::for_policy(&fake, Auth::Token("t".into()), &cfg);
+        assert!(
+            matches!(gh.policy_runners(&cfg), Err(Error::RunnerGroup(message)) if message.contains("dedicated to o/r alone"))
+        );
+    }
+
+    #[test]
+    fn a_restricted_default_group_is_not_a_dedicated_group() {
+        let fake = Fake::new(|s| match s.url.as_str() {
+            RUNNERS => respond(200, &[], r#"{"runners":[]}"#),
+            GROUP => respond(
+                200,
+                &[],
+                r#"{"id":15,"visibility":"selected","inherited":false,"default":true}"#,
+            ),
+            "https://api.github.com/orgs/o/actions/runner-groups/15/repositories?per_page=2" => {
+                respond(
+                    200,
+                    &[],
+                    r#"{"total_count":1,"repositories":[{"full_name":"o/r"}]}"#,
+                )
+            }
+            _ => panic!("unexpected {} {}", s.method, s.url),
+        });
+        let cfg = group_policy();
+        let mut gh = Client::for_policy(&fake, Auth::Token("t".into()), &cfg);
+        assert!(matches!(
+            gh.policy_runners(&cfg),
+            Err(Error::RunnerGroup(_))
+        ));
+    }
+
+    #[test]
+    fn org_cleanup_does_not_delete_a_runner_that_left_its_group() {
+        let fake = Fake::new(|s| match (s.method.as_str(), s.url.as_str()) {
+            (
+                "GET",
+                "https://api.github.com/orgs/o/actions/runner-groups/15/runners?per_page=100&page=1",
+            ) => respond(200, &[], r#"{"runners":[]}"#),
+            _ => panic!("unexpected {} {}", s.method, s.url),
+        });
+        let cfg = group_policy();
+        let mut gh = Client::for_policy(&fake, Auth::Token("t".into()), &cfg);
+        let result = gh.delete_runner(RunnerRef {
+            id: 2,
+            organization_group: cfg.pools[0].organization_runner_group,
+        });
+        assert!(matches!(result, Err(Error::RunnerGroup(_))));
+    }
+
+    #[test]
+    fn jitconfig_without_a_numeric_identity_cannot_supply_one() {
+        for body in [
+            r#"{"encoded_jit_config":"SECRET"}"#,
+            r#"{"runner":{"id":0},"encoded_jit_config":"SECRET"}"#,
+        ] {
+            let fake = Fake::new(move |_| respond(201, &[], body));
+            let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+            let jit = gh
+                .generate_jitconfig("sbr-ci-bx_22222222-0-1", &[], None)
+                .unwrap();
+            assert!(jit.runner.is_none());
+        }
     }
 
     /// An installation token GitHub answers with 401 is minted again and the request sent
@@ -1876,7 +2272,7 @@ mod tests {
             gh.begin_tick(T0);
             (
                 gh.runners().unwrap_err(),
-                gh.generate_jitconfig("n", &[]).err().unwrap(),
+                gh.generate_jitconfig("n", &[], None).err().unwrap(),
             )
         };
 

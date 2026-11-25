@@ -1327,6 +1327,7 @@ mod tests {
                         register_timeout_s: times.2,
                         fork_ttl_s: times.3,
                         paid_start_cents_per_day: cap,
+                        organization_runner_group: None,
                         idle_warm: warm.filter(|_| has_slot).map(|interval_s| IdleWarm {
                             argv: vec!["w".into()],
                             cwd: "/".into(),

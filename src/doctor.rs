@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use crate::boat;
 use crate::github::{self, API, Auth, GhRunner};
-use crate::github_app::{self, App};
+use crate::github_app::{self, App, RunnerPermissions};
 use crate::model::{Config, Pool, UnixSecs};
 use crate::transport::{Transport, Ureq};
 use crate::{policy, run, snapshot};
@@ -590,12 +590,12 @@ fn github_checks(
         }
     };
     if let Auth::App(app) = &auth {
-        app_checks(r, app, &cfg.repo, t, now)?;
+        app_checks(r, app, &cfg.repo, github::policy_permissions(cfg), t, now)?;
     }
     let pat = matches!(auth, Auth::Token(_));
-    let mut gh = github::Client::new(t, auth, cfg.repo.clone());
+    let mut gh = github::Client::for_policy(t, auth, cfg);
     gh.begin_tick(now);
-    let runners = match gh.runners() {
+    let runners = match gh.policy_runners(cfg) {
         Ok(runners) => runners,
         Err(e) => {
             let fix = match &e {
@@ -610,7 +610,16 @@ fn github_checks(
                 ),
                 _ => String::new(),
             };
-            r.fail("github", format!("listing runners: {e}{fix}"));
+            let group_hint = if cfg
+                .pools
+                .iter()
+                .any(|p| p.organization_runner_group.is_some())
+            {
+                "; organization runner groups also require the organization's Self-hosted runners write permission"
+            } else {
+                ""
+            };
+            r.fail("github", format!("listing runners: {e}{fix}{group_hint}"));
             return None;
         }
     };
@@ -647,6 +656,7 @@ fn app_checks(
     r: &mut Report,
     app: &App,
     repo: &str,
+    required: RunnerPermissions,
     t: &dyn Transport,
     now: UnixSecs,
 ) -> Option<()> {
@@ -676,14 +686,16 @@ fn app_checks(
     };
     match app.installation_permissions(t, installation, now) {
         Ok(perms) => {
-            let missing = missing_permissions(&perms);
+            let missing = missing_permissions(&perms, required);
             if missing.is_empty() {
+                let granted = required
+                    .required()
+                    .map(|(name, level)| format!("{name}: {level}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ");
                 r.ok(
                     "github",
-                    format!(
-                        "App installation {installation} has administration: write and \
-                         actions: read"
-                    ),
+                    format!("App installation {installation} has {granted}"),
                 );
                 Some(())
             } else {
@@ -709,7 +721,10 @@ fn app_checks(
 }
 
 /// What the daemon needs and the grant lacks, as `administration: write (has read)`.
-pub(crate) fn missing_permissions(granted: &BTreeMap<String, String>) -> Vec<String> {
+fn missing_permissions(
+    granted: &BTreeMap<String, String>,
+    required: RunnerPermissions,
+) -> Vec<String> {
     fn rank(level: &str) -> u8 {
         match level {
             "read" => 1,
@@ -718,8 +733,8 @@ pub(crate) fn missing_permissions(granted: &BTreeMap<String, String>) -> Vec<Str
             _ => 0,
         }
     }
-    [("administration", "write"), ("actions", "read")]
-        .into_iter()
+    required
+        .required()
         .filter_map(|(name, need)| {
             let has = granted.get(name).map(String::as_str);
             if has.is_some_and(|h| rank(h) >= rank(need)) {
@@ -896,11 +911,14 @@ mod tests {
             ("actions", "read"),
             ("metadata", "read"),
         ]);
-        assert!(missing_permissions(&ok).is_empty());
+        assert!(missing_permissions(&ok, RunnerPermissions::REPOSITORY).is_empty());
         let more = grant(&[("administration", "admin"), ("actions", "write")]);
-        assert!(missing_permissions(&more).is_empty());
+        assert!(missing_permissions(&more, RunnerPermissions::REPOSITORY).is_empty());
         assert_eq!(
-            missing_permissions(&grant(&[("administration", "read")])),
+            missing_permissions(
+                &grant(&[("administration", "read")]),
+                RunnerPermissions::REPOSITORY
+            ),
             ["administration: write (has read)", "actions: read"]
         );
     }
@@ -985,6 +1003,7 @@ mod tests {
             name: github::runner_name(pool, "bx_44444444", id as u32, 100),
             status: status.into(),
             busy,
+            organization_group: None,
         };
         let runners = [
             runner(1, "ci", "online", true),

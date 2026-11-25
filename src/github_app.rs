@@ -39,10 +39,42 @@ pub struct App {
     key: RsaKeyPair,
     rng: SystemRandom,
     token: Option<Installation>,
+    runner_permissions: RunnerPermissions,
     /// GitHub's clock minus this one, in seconds, from the last `Date` GitHub sent. The
     /// JWT's `iat` and `exp` and the token's expiry go by GitHub's time, so a clock that
     /// runs ahead or behind is not refused. A `Cell`, so `doctor`'s `&App` calls learn it.
     skew: Cell<i64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RunnerPermissions {
+    pub repository_write: bool,
+    pub organization_write: bool,
+}
+
+impl RunnerPermissions {
+    pub(crate) const REPOSITORY: Self = Self {
+        repository_write: true,
+        organization_write: false,
+    };
+
+    pub(crate) fn required(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            Some((
+                "administration",
+                if self.repository_write {
+                    "write"
+                } else {
+                    "read"
+                },
+            )),
+            Some(("actions", "read")),
+            self.organization_write
+                .then_some(("organization_self_hosted_runners", "write")),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 struct Installation {
@@ -78,6 +110,7 @@ impl App {
             key,
             rng: SystemRandom::new(),
             token: None,
+            runner_permissions: RunnerPermissions::REPOSITORY,
             skew: Cell::new(0),
         })
     }
@@ -240,6 +273,10 @@ impl App {
             .map_err(|_| Error::Parse("installation response".into()))
     }
 
+    pub(crate) fn set_runner_permissions(&mut self, permissions: RunnerPermissions) {
+        self.runner_permissions = permissions;
+    }
+
     /// The installation token held now, if any.
     pub(crate) fn held_token(&self) -> Option<&str> {
         self.token.as_ref().map(|held| held.token.as_str())
@@ -287,9 +324,10 @@ impl App {
         }
         let url = format!("{API}/app/installations/{installation}/access_tokens");
         let name = repo.split_once('/').map_or(repo, |(_, name)| name);
+        let permissions: BTreeMap<_, _> = self.runner_permissions.required().collect();
         let body = json!({
             "repositories": [name],
-            "permissions": { "administration": "write", "actions": "read" },
+            "permissions": permissions,
         });
         let what = format!("get a token for installation {installation}");
         let bytes = self.call(t, "POST", &url, jwt, Some(&body), &what, now)?;
@@ -509,6 +547,31 @@ pub(crate) mod tests {
             ),
             _ => respond(404, &[], r#"{"message":"Not Found"}"#),
         })
+    }
+
+    #[test]
+    fn requests_organization_runner_permission_for_opted_in_policy() {
+        let fake = app_github();
+        let mut app = test_app(Some(77));
+        app.set_runner_permissions(RunnerPermissions {
+            repository_write: false,
+            organization_write: true,
+        });
+        app.token(&fake, "o/r", 999_996_400).unwrap();
+        let sent = fake.sent();
+        assert_eq!(sent[0].url, TOKENS);
+        let body: Value = serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "repositories": ["r"],
+                "permissions": {
+                    "administration": "read",
+                    "actions": "read",
+                    "organization_self_hosted_runners": "write",
+                }
+            })
+        );
     }
 
     #[test]

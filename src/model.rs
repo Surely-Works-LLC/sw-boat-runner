@@ -2,6 +2,7 @@
 //! Names follow docs/design.md and spec/BoatRunner.tla.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,9 @@ pub struct Pool {
     pub name: String,
     /// Runner labels; a job goes to this pool when its `runs-on` labels are a subset.
     pub labels: Vec<String>,
+    /// A dedicated organization runner group. Without it, register on the repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_runner_group: Option<NonZeroU64>,
     /// boat machine type: small, default, large or xlarge.
     pub machine_type: String,
     /// Saved snapshot that `Fork` starts from.

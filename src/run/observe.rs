@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::idle_file::{self, Clock};
 use super::{Error, HTTP_TIMEOUT, Loop, script};
 use crate::boat::{self, Sandbox};
-use crate::github::{self, GhRunner};
+use crate::github::{self, GhRunner, RunnerRef};
 use crate::model::{
     Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs, Warming,
 };
@@ -14,7 +14,7 @@ use crate::model::{
 /// A snapshot, and the GitHub id of each of its runners, which deleting one needs.
 pub(super) struct Observed {
     pub snapshot: Snapshot,
-    pub runner_ids: HashMap<String, u64>,
+    pub runner_ids: HashMap<String, RunnerRef>,
     /// Runners whose start failed, still listed and never online; left out of `snapshot`.
     pub abandoned: Vec<Abandoned>,
 }
@@ -22,7 +22,7 @@ pub(super) struct Observed {
 /// A runner GitHub issued a jit config for whose file write or start command then failed.
 pub(super) struct Abandoned {
     pub name: String,
-    pub id: u64,
+    pub runner: RunnerRef,
     pub machine: String,
 }
 
@@ -43,8 +43,8 @@ pub(super) struct Memory {
     inflight: Vec<Inflight>,
     /// Whether an observe has succeeded since this process started.
     warm: bool,
-    /// Runners whose start failed, by name: their machine and when they were noted.
-    abandoned: HashMap<String, (String, UnixSecs)>,
+    /// Failed starts by runner name, with their original GitHub registration.
+    abandoned: HashMap<String, (String, UnixSecs, RunnerRef)>,
     /// Job forks already warned about for a `Busy` runner near their TTL.
     ttl_warned: HashSet<String>,
     /// Machines whose stop boat refuses, already warned about while it does.
@@ -176,8 +176,15 @@ impl Memory {
     /// lists it and it has never been online, it is left out of the snapshot, so its slot
     /// is free and it covers no job, and `act` deletes it. One that comes online after all
     /// (a start command that ran without an answer) is a runner like any other.
-    pub(super) fn abandon(&mut self, name: String, machine: &str, now: UnixSecs) {
-        self.abandoned.insert(name, (machine.to_string(), now));
+    pub(super) fn abandon(
+        &mut self,
+        name: String,
+        machine: &str,
+        now: UnixSecs,
+        runner: RunnerRef,
+    ) {
+        self.abandoned
+            .insert(name, (machine.to_string(), now, runner));
     }
 
     /// `act` deleted the runner, or GitHub has no such runner.
@@ -219,7 +226,7 @@ impl Memory {
         now: UnixSecs,
         lag_s: u64,
         listed: Vec<GhRunner>,
-    ) -> (Vec<Runner>, HashMap<String, u64>, Vec<Abandoned>) {
+    ) -> (Vec<Runner>, HashMap<String, RunnerRef>, Vec<Abandoned>) {
         let mut ids = HashMap::new();
         let mut runners = Vec::new();
         let mut abandoned = Vec::new();
@@ -244,19 +251,22 @@ impl Memory {
             } else if state == RunnerState::Offline && self.busy.contains(&r.name) {
                 state = RunnerState::Busy;
             }
-            if let Some((machine, _)) = self.abandoned.get(&r.name) {
-                if state == RunnerState::Registered {
+            if let Some((machine, _, failed)) = self.abandoned.get(&r.name) {
+                let same_registration = *failed == r.reference();
+                if same_registration && state == RunnerState::Registered {
                     abandoned.push(Abandoned {
+                        runner: r.reference(),
                         name: r.name,
-                        id: r.id,
                         machine: machine.clone(),
                     });
                     continue;
                 }
-                eprintln!("warn: {} came online after its start failed; kept", r.name);
+                if same_registration {
+                    eprintln!("warn: {} came online after its start failed; kept", r.name);
+                }
                 self.abandoned.remove(&r.name);
             }
-            ids.insert(r.name.clone(), r.id);
+            ids.insert(r.name.clone(), r.reference());
             runners.push(Runner {
                 name: r.name,
                 pool: n.pool,
@@ -269,7 +279,7 @@ impl Memory {
         self.online.retain(|name| ids.contains_key(name));
         self.busy = busy;
         // One GitHub has not listed within a request timeout and a tick is gone.
-        self.abandoned.retain(|name, (_, noted)| {
+        self.abandoned.retain(|name, (_, noted, _)| {
             listed_names.contains(name) || now.saturating_sub(*noted) <= lag_s
         });
         (runners, ids, abandoned)
@@ -481,7 +491,7 @@ impl Loop<'_> {
             let sandboxes = self.boat.list(&pool.name)?;
             listed.extend(sandboxes.into_iter().map(|sb| (pool.name.clone(), sb)));
         }
-        let gh_runners = self.gh.runners()?;
+        let gh_runners = self.gh.policy_runners(self.cfg)?;
         let queued = if self.read_jobs {
             let pools = &self.cfg.pools;
             self.gh
@@ -619,6 +629,25 @@ mod tests {
 
     /// The register log's wait counts from when a job was first seen queued, restarts when
     /// it leaves the queue and comes back, and goes only to the first pool that serves it.
+    #[test]
+    fn a_failed_start_does_not_abandon_a_new_registration_with_the_same_name() {
+        let cfg = config();
+        let mut memory = Memory::new(NOW);
+        let mut runner = GhRunner {
+            id: 20,
+            name: "sbr-ci-bx_22222222-1-1000".into(),
+            status: "offline".into(),
+            busy: false,
+            organization_group: None,
+        };
+        memory.abandon(runner.name.clone(), "bx_22222222", NOW, runner.reference());
+        runner.id = 21;
+        let (runners, ids, abandoned) = memory.runners(&cfg, NOW + 15, 90, vec![runner]);
+        assert!(abandoned.is_empty());
+        assert_eq!(runners.len(), 1);
+        assert_eq!(ids[&runners[0].name].id, 21);
+    }
+
     #[test]
     fn queue_wait_counts_from_first_sight_for_the_first_pool() {
         let mut cfg = config();

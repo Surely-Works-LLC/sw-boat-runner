@@ -1516,6 +1516,7 @@ mod tests {
             register_timeout_s: 0,
             fork_ttl_s: 60,
             paid_start_cents_per_day: 0,
+            organization_runner_group: None,
             idle_warm: None,
         };
         let saved = |name: &str, size: Option<u64>| SavedSnapshot {

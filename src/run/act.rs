@@ -270,7 +270,7 @@ struct Tick<'s> {
     began: Duration,
     snapshot: &'s Snapshot,
     /// GitHub ids of the snapshot's runners that are still there.
-    runner_ids: HashMap<String, u64>,
+    runner_ids: HashMap<String, github::RunnerRef>,
     starts: Starts,
     /// Machines this tick leaves alone: a runner whose start failed is still registered
     /// on them.
@@ -462,7 +462,7 @@ impl Loop<'_> {
         // Runners whose start failed last tick hold a slot and count as supply until they
         // are gone, so they go first.
         for a in &observed.abandoned {
-            match self.delete_runner(a.id) {
+            match self.delete_runner(a.runner) {
                 Ok(()) => {
                     self.memory.forget_abandoned(&a.name);
                     self.log(format_args!("unregister {}: start_failed", a.name));
@@ -715,8 +715,8 @@ impl Loop<'_> {
         }
     }
 
-    fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
-        match self.gh.delete_runner(id) {
+    fn delete_runner(&mut self, runner: github::RunnerRef) -> Result<(), Error> {
+        match self.gh.delete_runner(runner) {
             Err(github::Error::NotFound) => Ok(()),
             r => r.map_err(Error::from),
         }
@@ -727,14 +727,14 @@ impl Loop<'_> {
     /// runner takes no job, and GitHub refuses to delete one that runs a job; that error
     /// skips the machine this tick.
     fn remove_runners(&mut self, t: &mut Tick, machine: &str) -> Result<(), Error> {
-        let mut on_machine: Vec<(&str, u64)> = t
+        let mut on_machine: Vec<_> = t
             .snapshot
             .runners
             .iter()
             .filter(|r| r.machine == machine)
             .filter_map(|r| Some((r.name.as_str(), *t.runner_ids.get(&r.name)?)))
             .collect();
-        on_machine.sort_unstable_by_key(|&(_, id)| id);
+        on_machine.sort_unstable_by_key(|&(_, runner)| runner.id);
         for (name, id) in on_machine {
             self.delete_runner(id)?;
             t.runner_ids.remove(name);
@@ -809,7 +809,24 @@ impl Loop<'_> {
         let p = self.pool(pool)?;
         let now = self.at(t);
         let name = github::runner_name(pool, machine, slot, now);
-        let jit = self.gh.generate_jitconfig(&name, &p.labels)?;
+        let jit = self
+            .gh
+            .generate_jitconfig(&name, &p.labels, p.organization_runner_group)?;
+        if let Some(runner) = jit.runner {
+            let mut registration = serde_json::json!({
+                "repo": self.cfg.repo,
+                "pool": pool,
+                "labels": p.labels,
+                "runner_id": runner.id,
+                "runner_name": name,
+                "machine": machine,
+            });
+            if let Some(group) = p.organization_runner_group {
+                registration["runner_group_id"] = serde_json::json!(group);
+                registration["slot"] = serde_json::json!(slot);
+            }
+            self.log(format_args!("runner-registration {registration}"));
+        }
         self.memory.mark_used(machine, now);
         let started = self
             .boat
@@ -819,9 +836,13 @@ impl Loop<'_> {
                     .exec_detached(machine, &script::start_command(slot))
             });
         if let Err(e) = started {
-            eprintln!("{name}: {e}; its registration is deleted next tick");
-            let at = self.at(t);
-            self.memory.abandon(name, machine, at);
+            if let Some(runner) = jit.runner {
+                eprintln!("{name}: {e}; its registration is deleted next tick");
+                let at = self.at(t);
+                self.memory.abandon(name, machine, at, runner);
+            } else {
+                eprintln!("{name}: {e}; GitHub did not return a runner ID");
+            }
             return Err(e.into());
         }
         // The name, machine and queue only: the jit config is a secret.
@@ -1760,7 +1781,7 @@ mod tests {
                 let body = format!(
                     r#"{{"total_count":2,"runners":[
                     {{"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"online","busy":false}},
-                    {{"id":21,"name":"{jit_name}","status":"offline","busy":false}}]}}"#
+                    {{"id":20,"name":"{jit_name}","status":"offline","busy":false}}]}}"#
                 );
                 return respond(200, &[], &body);
             }
@@ -1782,7 +1803,7 @@ mod tests {
         let reqs = requests(&fake);
         let deleted = reqs
             .iter()
-            .position(|r| *r == format!("DELETE {GH}/runners/21"));
+            .position(|r| *r == format!("DELETE {GH}/runners/20"));
         let second = reqs
             .iter()
             .rposition(|r| r.ends_with("/generate-jitconfig"));
@@ -1964,12 +1985,24 @@ mod tests {
             ]
         );
         tick_loop.tick(NOW + 15, decide).unwrap();
+        let lines = log.take();
+        assert_eq!(lines.len(), 2);
+        let registration = lines[0].strip_prefix("runner-registration ").unwrap();
         assert_eq!(
-            log.take(),
-            [
-                "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
-              oldest 15s"
-            ]
+            serde_json::from_str::<serde_json::Value>(registration).unwrap(),
+            serde_json::json!({
+                "repo": cfg.repo,
+                "pool": "ci",
+                "labels": cfg.pools[0].labels,
+                "runner_id": 20,
+                "runner_name": "sbr-ci-bx_55555555-0-1015",
+                "machine": "bx_55555555",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
+             oldest 15s"
         );
         // The runner ran its job and is gone, so the fork is finished.
         tick_loop.tick(NOW + 30, decide).unwrap();
