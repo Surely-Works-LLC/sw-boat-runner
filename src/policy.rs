@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -182,6 +183,7 @@ struct RawConfig {
 struct RawPool {
     name: Option<String>,
     labels: Vec<String>,
+    organization_runner_group: Option<NonZeroU64>,
     snapshot: String,
     machine_type: Option<String>,
     max_boxes: Option<u32>,
@@ -230,6 +232,7 @@ impl RawPool {
         Pool {
             name: self.name.unwrap_or_else(|| name_from(&self.labels)),
             labels: self.labels,
+            organization_runner_group: self.organization_runner_group,
             machine_type: self.machine_type.unwrap_or_else(|| "default".into()),
             snapshot: self.snapshot,
             placement: self.placement.unwrap_or_else(|| placement.to_vec()),
@@ -434,6 +437,7 @@ max_boxes = 4
                 register_timeout_s: 900,
                 fork_ttl_s: 3600,
                 paid_start_cents_per_day: 0,
+                organization_runner_group: None,
                 idle_warm: None,
             }]
         );
@@ -460,6 +464,7 @@ max_boxes = 4
                 register_timeout_s: 900,
                 fork_ttl_s: 3600,
                 paid_start_cents_per_day: 0,
+                organization_runner_group: None,
                 idle_warm: None,
             }
         );

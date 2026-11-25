@@ -270,7 +270,7 @@ struct Tick<'s> {
     began: Duration,
     snapshot: &'s Snapshot,
     /// GitHub ids of the snapshot's runners that are still there.
-    runner_ids: HashMap<String, u64>,
+    runner_ids: HashMap<String, github::RunnerRef>,
     starts: Starts,
     /// Machines this tick leaves alone: a runner whose start failed is still registered
     /// on them.
@@ -462,7 +462,7 @@ impl Loop<'_> {
         // Runners whose start failed last tick hold a slot and count as supply until they
         // are gone, so they go first.
         for a in &observed.abandoned {
-            match self.delete_runner(a.id) {
+            match self.delete_runner(a.runner) {
                 Ok(()) => {
                     self.memory.forget_abandoned(&a.name);
                     self.log(format_args!("unregister {}: start_failed", a.name));
@@ -715,8 +715,8 @@ impl Loop<'_> {
         }
     }
 
-    fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
-        match self.gh.delete_runner(id) {
+    fn delete_runner(&mut self, runner: github::RunnerRef) -> Result<(), Error> {
+        match self.gh.delete_runner(runner) {
             Err(github::Error::NotFound) => Ok(()),
             r => r.map_err(Error::from),
         }
@@ -727,14 +727,14 @@ impl Loop<'_> {
     /// runner takes no job, and GitHub refuses to delete one that runs a job; that error
     /// skips the machine this tick.
     fn remove_runners(&mut self, t: &mut Tick, machine: &str) -> Result<(), Error> {
-        let mut on_machine: Vec<(&str, u64)> = t
+        let mut on_machine: Vec<_> = t
             .snapshot
             .runners
             .iter()
             .filter(|r| r.machine == machine)
             .filter_map(|r| Some((r.name.as_str(), *t.runner_ids.get(&r.name)?)))
             .collect();
-        on_machine.sort_unstable_by_key(|&(_, id)| id);
+        on_machine.sort_unstable_by_key(|&(_, runner)| runner.id);
         for (name, id) in on_machine {
             self.delete_runner(id)?;
             t.runner_ids.remove(name);
@@ -809,7 +809,9 @@ impl Loop<'_> {
         let p = self.pool(pool)?;
         let now = self.at(t);
         let name = github::runner_name(pool, machine, slot, now);
-        let jit = self.gh.generate_jitconfig(&name, &p.labels)?;
+        let jit = self
+            .gh
+            .generate_jitconfig(&name, &p.labels, p.organization_runner_group)?;
         self.memory.mark_used(machine, now);
         let started = self
             .boat

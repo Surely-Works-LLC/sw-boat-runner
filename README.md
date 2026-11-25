@@ -161,6 +161,7 @@ its keys at the top level too, as above. Each `[[pool]]` takes:
 | `register_timeout_s` | 900 | Time a runner may take to come online. Keep it above 600, the runner's wait for the snapshot copy. |
 | `fork_ttl_s` | 3600 (at most 2592000) | Longest life of a machine forked for one job. Keep it above `register_timeout_s` plus 300; `check` warns. |
 | `paid_start_cents_per_day` | 0 | Daily cap on paid starts. 0 means only included starts. |
+| `organization_runner_group` | unset | Dedicated organization runner group ID. Without it, register on the repository. |
 | `idle_warm` | unset | A command run on kept machines no job needs, to keep caches warm; see [Idle warm](#idle-warm). |
 
 | Preset | Placement | Idle machines |
@@ -175,6 +176,21 @@ most `fork_ttl_s` (default 3600 s), so raise it for jobs that run longer. Kept m
 machine time while up. boat snapshots do not save `/tmp` or `~/.cache`, so keep caches
 under a home subdirectory such as `/home/user/ci-cache`. [docs/design.md](docs/design.md)
 has the full design and the [GitHub request budget](docs/design.md#github-requests).
+
+### Organization runner groups
+
+Set `organization_runner_group = 15` in a pool to register its runners in that
+organization runner group. Leave the setting out for repository JIT registration.
+Create the group in the repository's organization and select only this repository
+under Repository access. Give the GitHub App **Self-hosted runners** organization
+permission **Read and write**, then approve the new permission on its installation.
+The daemon requests this additional permission only for policies with a group.
+
+Use a distinct pool name and label for the group. Point a job at both the group
+name and its label with `runs-on.group` and `runs-on.labels`. Run `doctor` with the
+proposed policy before restarting the daemon. The daemon checks the group belongs
+to the organization and is accessible to this repository alone before it uses it.
+Wait for the pool's existing runners to finish before changing or removing its group.
 
 ### Idle warm
 

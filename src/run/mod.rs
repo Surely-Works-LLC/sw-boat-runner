@@ -532,7 +532,7 @@ impl<'a> Loop<'a> {
         Loop {
             cfg,
             boat: boat::Client::new(t, boat_key).for_repo(&cfg.repo, daemon_id(now), grace),
-            gh: github::Client::new(t, github, cfg.repo.clone()),
+            gh: github::Client::for_policy(t, github, cfg),
             memory,
             ledger: act::Ledger::new(cfg, now),
             read_jobs: true,

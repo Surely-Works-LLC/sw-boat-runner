@@ -593,9 +593,9 @@ fn github_checks(
         app_checks(r, app, &cfg.repo, t, now)?;
     }
     let pat = matches!(auth, Auth::Token(_));
-    let mut gh = github::Client::new(t, auth, cfg.repo.clone());
+    let mut gh = github::Client::for_policy(t, auth, cfg);
     gh.begin_tick(now);
-    let runners = match gh.runners() {
+    let runners = match gh.policy_runners(cfg) {
         Ok(runners) => runners,
         Err(e) => {
             let fix = match &e {
@@ -610,7 +610,16 @@ fn github_checks(
                 ),
                 _ => String::new(),
             };
-            r.fail("github", format!("listing runners: {e}{fix}"));
+            let group_hint = if cfg
+                .pools
+                .iter()
+                .any(|p| p.organization_runner_group.is_some())
+            {
+                "; organization runner groups also require the organization's Self-hosted runners write permission"
+            } else {
+                ""
+            };
+            r.fail("github", format!("listing runners: {e}{fix}{group_hint}"));
             return None;
         }
     };
@@ -985,6 +994,7 @@ mod tests {
             name: github::runner_name(pool, "bx_44444444", id as u32, 100),
             status: status.into(),
             busy,
+            organization: false,
         };
         let runners = [
             runner(1, "ci", "online", true),

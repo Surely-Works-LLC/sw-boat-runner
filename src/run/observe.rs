@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::idle_file::{self, Clock};
 use super::{Error, HTTP_TIMEOUT, Loop, script};
 use crate::boat::{self, Sandbox};
-use crate::github::{self, GhRunner};
+use crate::github::{self, GhRunner, RunnerRef};
 use crate::model::{
     Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs, Warming,
 };
@@ -14,7 +14,7 @@ use crate::model::{
 /// A snapshot, and the GitHub id of each of its runners, which deleting one needs.
 pub(super) struct Observed {
     pub snapshot: Snapshot,
-    pub runner_ids: HashMap<String, u64>,
+    pub runner_ids: HashMap<String, RunnerRef>,
     /// Runners whose start failed, still listed and never online; left out of `snapshot`.
     pub abandoned: Vec<Abandoned>,
 }
@@ -22,7 +22,7 @@ pub(super) struct Observed {
 /// A runner GitHub issued a jit config for whose file write or start command then failed.
 pub(super) struct Abandoned {
     pub name: String,
-    pub id: u64,
+    pub runner: RunnerRef,
     pub machine: String,
 }
 
@@ -219,7 +219,7 @@ impl Memory {
         now: UnixSecs,
         lag_s: u64,
         listed: Vec<GhRunner>,
-    ) -> (Vec<Runner>, HashMap<String, u64>, Vec<Abandoned>) {
+    ) -> (Vec<Runner>, HashMap<String, RunnerRef>, Vec<Abandoned>) {
         let mut ids = HashMap::new();
         let mut runners = Vec::new();
         let mut abandoned = Vec::new();
@@ -247,8 +247,8 @@ impl Memory {
             if let Some((machine, _)) = self.abandoned.get(&r.name) {
                 if state == RunnerState::Registered {
                     abandoned.push(Abandoned {
+                        runner: r.reference(),
                         name: r.name,
-                        id: r.id,
                         machine: machine.clone(),
                     });
                     continue;
@@ -256,7 +256,7 @@ impl Memory {
                 eprintln!("warn: {} came online after its start failed; kept", r.name);
                 self.abandoned.remove(&r.name);
             }
-            ids.insert(r.name.clone(), r.id);
+            ids.insert(r.name.clone(), r.reference());
             runners.push(Runner {
                 name: r.name,
                 pool: n.pool,
@@ -481,7 +481,7 @@ impl Loop<'_> {
             let sandboxes = self.boat.list(&pool.name)?;
             listed.extend(sandboxes.into_iter().map(|sb| (pool.name.clone(), sb)));
         }
-        let gh_runners = self.gh.runners()?;
+        let gh_runners = self.gh.policy_runners(self.cfg)?;
         let queued = if self.read_jobs {
             let pools = &self.cfg.pools;
             self.gh
