@@ -552,7 +552,8 @@ impl<'a> Loop<'a> {
     }
 
     /// Sends the loop's action lines (one per fork, resume, stop, delete, register and
-    /// unregister that succeeds, and the hourly summary) to `w` instead of stderr.
+    /// unregister that succeeds), runner registration records and hourly summaries to
+    /// `w` instead of stderr.
     pub fn set_log(&mut self, w: Box<dyn Write>) {
         self.log = w;
     }

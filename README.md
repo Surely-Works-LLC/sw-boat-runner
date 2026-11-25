@@ -226,6 +226,13 @@ refuses to start with `idle_warm` and no state directory. The log has a `warm st
 
 Run these on the host (`boat ssh <id>` for a boat machine).
 
+The service journal records `runner-registration` JSON when GitHub returns a
+numeric runner ID. To verify a job's registration after its runner disappears
+from GitHub, read the matching record from the authorized registrar's journal
+and compare the job's `runner_id`, repository and requested labels with the
+record. GitHub's job record separately establishes the workflow, head and
+outcome. The registration line contains no JIT configuration or credentials.
+
 Change the policy: edit `/etc/sw-boat-runner/policy.toml` and run
 `sudo systemctl restart sw-boat-runner`.
 

@@ -810,6 +810,17 @@ impl Loop<'_> {
         let now = self.at(t);
         let name = github::runner_name(pool, machine, slot, now);
         let jit = self.gh.generate_jitconfig(&name, &p.labels)?;
+        if let Some(runner_id) = jit.runner_id {
+            let registration = serde_json::json!({
+                "repo": self.cfg.repo,
+                "pool": pool,
+                "labels": p.labels,
+                "runner_id": runner_id,
+                "runner_name": name,
+                "machine": machine,
+            });
+            self.log(format_args!("runner-registration {registration}"));
+        }
         self.memory.mark_used(machine, now);
         let started = self
             .boat
@@ -1964,12 +1975,24 @@ mod tests {
             ]
         );
         tick_loop.tick(NOW + 15, decide).unwrap();
+        let lines = log.take();
+        assert_eq!(lines.len(), 2);
+        let registration = lines[0].strip_prefix("runner-registration ").unwrap();
         assert_eq!(
-            log.take(),
-            [
-                "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
-              oldest 15s"
-            ]
+            serde_json::from_str::<serde_json::Value>(registration).unwrap(),
+            serde_json::json!({
+                "repo": cfg.repo,
+                "pool": "ci",
+                "labels": cfg.pools[0].labels,
+                "runner_id": 20,
+                "runner_name": "sbr-ci-bx_55555555-0-1015",
+                "machine": "bx_55555555",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
+             oldest 15s"
         );
         // The runner ran its job and is gone, so the fork is finished.
         tick_loop.tick(NOW + 30, decide).unwrap();

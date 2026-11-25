@@ -174,11 +174,14 @@ pub(crate) struct GhRunner {
 
 /// A just-in-time runner config. It is a credential: no `Debug`, no `Display`, and the
 /// only way out is `expose`.
-pub(crate) struct JitConfig(String);
+pub(crate) struct JitConfig {
+    encoded: String,
+    pub(crate) runner_id: Option<u64>,
+}
 
 impl JitConfig {
     pub(crate) fn expose(&self) -> &str {
-        &self.0
+        &self.encoded
     }
 }
 
@@ -671,15 +674,24 @@ impl<'t> Client<'t> {
         labels: &[String],
     ) -> Result<JitConfig, Error> {
         #[derive(Deserialize)]
+        struct Runner {
+            id: Option<u64>,
+        }
+
+        #[derive(Deserialize)]
         struct Out {
             encoded_jit_config: String,
+            runner: Option<Runner>,
         }
         let body = json!({ "name": name, "runner_group_id": 1, "labels": labels });
         let bytes = self.request("POST", JITCONFIG, Some(&body))?;
         // serde errors can quote the input; this input holds a credential.
         let out: Out = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Parse("generate-jitconfig response".into()))?;
-        Ok(JitConfig(out.encoded_jit_config))
+        Ok(JitConfig {
+            encoded: out.encoded_jit_config,
+            runner_id: out.runner.and_then(|runner| runner.id).filter(|id| *id > 0),
+        })
     }
 
     pub(crate) fn delete_runner(&mut self, id: u64) -> Result<(), Error> {
@@ -1290,6 +1302,7 @@ mod tests {
             .generate_jitconfig("sbr-ci-bx_22222222-0-1", &["self-hosted".into()])
             .unwrap();
         assert_eq!(jit.expose(), "SECRET");
+        assert_eq!(jit.runner_id, Some(9));
         let sent = fake.sent();
         assert_eq!(
             sent[0].url,
@@ -1300,6 +1313,21 @@ mod tests {
             body,
             json!({"name": "sbr-ci-bx_22222222-0-1", "runner_group_id": 1, "labels": ["self-hosted"]})
         );
+    }
+
+    #[test]
+    fn jitconfig_without_a_numeric_identity_cannot_supply_one() {
+        for body in [
+            r#"{"encoded_jit_config":"SECRET"}"#,
+            r#"{"runner":{"id":0},"encoded_jit_config":"SECRET"}"#,
+        ] {
+            let fake = Fake::new(move |_| respond(201, &[], body));
+            let mut gh = Client::new(&fake, Auth::Token("t".into()), "o/r".into());
+            let jit = gh
+                .generate_jitconfig("sbr-ci-bx_22222222-0-1", &[])
+                .unwrap();
+            assert_eq!(jit.runner_id, None);
+        }
     }
 
     /// An installation token GitHub answers with 401 is minted again and the request sent
