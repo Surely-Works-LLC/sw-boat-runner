@@ -239,6 +239,28 @@ fn fork_labels(
     labels
 }
 
+/// boat's longest sandbox name.
+const MAX_NAME: usize = 120;
+
+/// The name a fork carries. Without one boat names it after its snapshot, so every
+/// machine of a pool read `mjth-ci-20261123b` and said nothing about whose it was or
+/// what for. Labels say the same, but `boat list` and the dashboard show only the name.
+fn fork_name(pool: &str, owner: Option<&Owner>, job: Option<JobKey>) -> String {
+    let what = match job {
+        Some(job) => format!("job {}-{}", job.id, job.attempt),
+        None => "kept".to_string(),
+    };
+    let mut name = match owner {
+        Some(owner) => format!("sbr {} {pool} {what}", owner.repo),
+        None => format!("sbr {pool} {what}"),
+    };
+    // Repository and pool names are ASCII, but cut on a char boundary all the same.
+    while name.len() > MAX_NAME {
+        name.pop();
+    }
+    name
+}
+
 /// How much a `stray_report` line matters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Severity {
@@ -650,6 +672,7 @@ impl<'t> Client<'t> {
             "from": snapshot,
             "type": machine_type,
             "labels": fork_labels(pool, self.owner.as_ref(), job),
+            "name": fork_name(pool, self.owner.as_ref(), job),
             "ttlSeconds": ttl_s,
             "noEnv": true,
         });
@@ -1429,8 +1452,32 @@ mod tests {
         assert_eq!(
             body,
             json!({"from":"runner-base","type":"large","ttlSeconds":3600,"noEnv":true,
-                   "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"7-2"}})
+                   "labels":{"sw-boat-runner":"ci","sw-boat-runner-job":"7-2"},
+                   "name":"sbr ci job 7-2"})
         );
+    }
+
+    #[test]
+    fn fork_names_say_whose_machine_it_is_and_what_for() {
+        let job = Some(JobKey { id: 7, attempt: 2 });
+        let fake = Fake::new(|_| respond(200, &[], "{}"));
+        let boat = Client::new(&fake, "k".into()).for_repo(
+            "Surely-Works-LLC/mjth-monorepo",
+            "d1".into(),
+            Duration::ZERO,
+        );
+        let owner = boat.owner.as_ref();
+        assert_eq!(
+            fork_name("mjth", owner, job),
+            "sbr surely-works-llc/mjth-monorepo mjth job 7-2"
+        );
+        assert_eq!(
+            fork_name("mjth", owner, None),
+            "sbr surely-works-llc/mjth-monorepo mjth kept"
+        );
+        assert_eq!(fork_name("ci", None, None), "sbr ci kept");
+        let long = "p".repeat(200);
+        assert_eq!(fork_name(&long, owner, job).len(), MAX_NAME);
     }
 
     #[test]
