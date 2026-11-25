@@ -812,6 +812,21 @@ impl Loop<'_> {
         let jit = self
             .gh
             .generate_jitconfig(&name, &p.labels, p.organization_runner_group)?;
+        if let Some(runner) = jit.runner {
+            let mut registration = serde_json::json!({
+                "repo": self.cfg.repo,
+                "pool": pool,
+                "labels": p.labels,
+                "runner_id": runner.id,
+                "runner_name": name,
+                "machine": machine,
+            });
+            if let Some(group) = p.organization_runner_group {
+                registration["runner_group_id"] = serde_json::json!(group);
+                registration["slot"] = serde_json::json!(slot);
+            }
+            self.log(format_args!("runner-registration {registration}"));
+        }
         self.memory.mark_used(machine, now);
         let started = self
             .boat
@@ -821,9 +836,13 @@ impl Loop<'_> {
                     .exec_detached(machine, &script::start_command(slot))
             });
         if let Err(e) = started {
-            eprintln!("{name}: {e}; its registration is deleted next tick");
-            let at = self.at(t);
-            self.memory.abandon(name, machine, at);
+            if let Some(runner) = jit.runner {
+                eprintln!("{name}: {e}; its registration is deleted next tick");
+                let at = self.at(t);
+                self.memory.abandon(name, machine, at, runner);
+            } else {
+                eprintln!("{name}: {e}; GitHub did not return a runner ID");
+            }
             return Err(e.into());
         }
         // The name, machine and queue only: the jit config is a secret.
@@ -1762,7 +1781,7 @@ mod tests {
                 let body = format!(
                     r#"{{"total_count":2,"runners":[
                     {{"id":11,"name":"sbr-ci-bx_22222222-0-900","status":"online","busy":false}},
-                    {{"id":21,"name":"{jit_name}","status":"offline","busy":false}}]}}"#
+                    {{"id":20,"name":"{jit_name}","status":"offline","busy":false}}]}}"#
                 );
                 return respond(200, &[], &body);
             }
@@ -1784,7 +1803,7 @@ mod tests {
         let reqs = requests(&fake);
         let deleted = reqs
             .iter()
-            .position(|r| *r == format!("DELETE {GH}/runners/21"));
+            .position(|r| *r == format!("DELETE {GH}/runners/20"));
         let second = reqs
             .iter()
             .rposition(|r| r.ends_with("/generate-jitconfig"));
@@ -1966,12 +1985,24 @@ mod tests {
             ]
         );
         tick_loop.tick(NOW + 15, decide).unwrap();
+        let lines = log.take();
+        assert_eq!(lines.len(), 2);
+        let registration = lines[0].strip_prefix("runner-registration ").unwrap();
         assert_eq!(
-            log.take(),
-            [
-                "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
-              oldest 15s"
-            ]
+            serde_json::from_str::<serde_json::Value>(registration).unwrap(),
+            serde_json::json!({
+                "repo": cfg.repo,
+                "pool": "ci",
+                "labels": cfg.pools[0].labels,
+                "runner_id": 20,
+                "runner_name": "sbr-ci-bx_55555555-0-1015",
+                "machine": "bx_55555555",
+            }),
+        );
+        assert_eq!(
+            lines[1],
+            "register sbr-ci-bx_55555555-0-1015 on bx_55555555 (pool ci, slot 0): 1 queued, \
+             oldest 15s"
         );
         // The runner ran its job and is gone, so the fork is finished.
         tick_loop.tick(NOW + 30, decide).unwrap();

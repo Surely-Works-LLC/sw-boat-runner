@@ -191,6 +191,8 @@ name and its label with `runs-on.group` and `runs-on.labels`. Run `doctor` with 
 proposed policy before restarting the daemon. The daemon checks the group belongs
 to the organization and is accessible to this repository alone before it uses it.
 Wait for the pool's existing runners to finish before changing or removing its group.
+Leave the group's membership alone while the daemon is retiring its runners. GitHub's
+organization deletion endpoint cannot make membership checking and deletion atomic.
 
 ### Idle warm
 
@@ -241,6 +243,13 @@ refuses to start with `idle_warm` and no state directory. The log has a `warm st
 ## Operating
 
 Run these on the host (`boat ssh <id>` for a boat machine).
+
+The service journal records `runner-registration` JSON when GitHub returns a
+numeric runner ID. To verify a job's registration after its runner disappears
+from GitHub, read the matching record from the authorized registrar's journal
+and compare the job's `runner_id`, repository and requested labels with the
+record. GitHub's job record separately establishes the workflow, head and
+outcome. The registration line contains no JIT configuration or credentials.
 
 Change the policy: edit `/etc/sw-boat-runner/policy.toml` and run
 `sudo systemctl restart sw-boat-runner`.

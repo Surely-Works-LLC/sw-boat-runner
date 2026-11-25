@@ -39,11 +39,42 @@ pub struct App {
     key: RsaKeyPair,
     rng: SystemRandom,
     token: Option<Installation>,
-    organization_runners: bool,
+    runner_permissions: RunnerPermissions,
     /// GitHub's clock minus this one, in seconds, from the last `Date` GitHub sent. The
     /// JWT's `iat` and `exp` and the token's expiry go by GitHub's time, so a clock that
     /// runs ahead or behind is not refused. A `Cell`, so `doctor`'s `&App` calls learn it.
     skew: Cell<i64>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RunnerPermissions {
+    pub repository_write: bool,
+    pub organization_write: bool,
+}
+
+impl RunnerPermissions {
+    pub(crate) const REPOSITORY: Self = Self {
+        repository_write: true,
+        organization_write: false,
+    };
+
+    pub(crate) fn required(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            Some((
+                "administration",
+                if self.repository_write {
+                    "write"
+                } else {
+                    "read"
+                },
+            )),
+            Some(("actions", "read")),
+            self.organization_write
+                .then_some(("organization_self_hosted_runners", "write")),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 struct Installation {
@@ -79,7 +110,7 @@ impl App {
             key,
             rng: SystemRandom::new(),
             token: None,
-            organization_runners: false,
+            runner_permissions: RunnerPermissions::REPOSITORY,
             skew: Cell::new(0),
         })
     }
@@ -242,9 +273,8 @@ impl App {
             .map_err(|_| Error::Parse("installation response".into()))
     }
 
-    /// Request the extra write permission only for a policy using organization groups.
-    pub(crate) fn set_organization_runners(&mut self, enabled: bool) {
-        self.organization_runners = enabled;
+    pub(crate) fn set_runner_permissions(&mut self, permissions: RunnerPermissions) {
+        self.runner_permissions = permissions;
     }
 
     /// The installation token held now, if any.
@@ -294,13 +324,11 @@ impl App {
         }
         let url = format!("{API}/app/installations/{installation}/access_tokens");
         let name = repo.split_once('/').map_or(repo, |(_, name)| name);
-        let mut body = json!({
+        let permissions: BTreeMap<_, _> = self.runner_permissions.required().collect();
+        let body = json!({
             "repositories": [name],
-            "permissions": { "administration": "write", "actions": "read" },
+            "permissions": permissions,
         });
-        if self.organization_runners {
-            body["permissions"]["organization_self_hosted_runners"] = json!("write");
-        }
         let what = format!("get a token for installation {installation}");
         let bytes = self.call(t, "POST", &url, jwt, Some(&body), &what, now)?;
         // serde errors can quote the input; this input holds the token.
@@ -525,7 +553,10 @@ pub(crate) mod tests {
     fn requests_organization_runner_permission_for_opted_in_policy() {
         let fake = app_github();
         let mut app = test_app(Some(77));
-        app.set_organization_runners(true);
+        app.set_runner_permissions(RunnerPermissions {
+            repository_write: false,
+            organization_write: true,
+        });
         app.token(&fake, "o/r", 999_996_400).unwrap();
         let sent = fake.sent();
         assert_eq!(sent[0].url, TOKENS);
@@ -535,7 +566,7 @@ pub(crate) mod tests {
             json!({
                 "repositories": ["r"],
                 "permissions": {
-                    "administration": "write",
+                    "administration": "read",
                     "actions": "read",
                     "organization_self_hosted_runners": "write",
                 }
