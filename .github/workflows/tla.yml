@@ -1,12 +1,14 @@
 name: tla
 # TLC runs on main only when the spec or this workflow changes, and on demand.
-# The spec does not read src/, so a Rust change cannot change TLC's result;
-# spec/README.md has the command to run TLC locally.
+# The spec does not read src/, so a Rust change cannot change TLC's result.
+# TLC reads only the .tla and .cfg files, so a change to spec/README.md alone
+# does not start it either; that README has the command to run TLC locally.
 on:
   push:
     branches: [main]
     paths:
       - spec/**
+      - '!spec/**/*.md'
       - .github/workflows/tla.yml
   workflow_dispatch:
 concurrency:
