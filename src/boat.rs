@@ -695,6 +695,14 @@ impl<'t> Client<'t> {
             .map_err(|e| e.redact(content))
     }
 
+    /// Both direct routes used to start a runner can still refuse while the detail
+    /// endpoint reports hydration complete. Use a disposable marker with no JIT data.
+    pub(crate) fn probe_runner_direct(&self, id: &str) -> Result<(), Error> {
+        const PATH: &str = "/tmp/.sbr-restore-probe";
+        self.write_file(id, PATH, "runner readiness probe")?;
+        self.exec_detached(id, &format!("rm -f -- {PATH}"))
+    }
+
     /// Starts `command` in the background. boat keeps every command in its history, so the
     /// command must never contain a secret.
     pub(crate) fn exec_detached(&self, id: &str, command: &str) -> Result<(), Error> {
