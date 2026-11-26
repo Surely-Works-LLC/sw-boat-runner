@@ -82,6 +82,12 @@ impl Error {
         matches!(self, Error::Unauthorized { status: 403, .. })
     }
 
+    /// The direct endpoint refused the operation before reaching the guest.
+    pub(crate) fn is_restoring(&self) -> bool {
+        matches!(self, Error::Other { status: 502, code, message }
+            if code == "sandbox_direct_failed" && message == "sandbox_restoring")
+    }
+
     /// Failures without a definite answer, so boat may have done what was asked: a
     /// transport error or timeout, a 5xx that is not a refusal, or a 2xx whose body did
     /// not parse. A 4xx is a refusal.

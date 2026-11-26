@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::idle_file::{self, Clock};
 use super::{Error, HTTP_TIMEOUT, Loop, script};
 use crate::boat::{self, Sandbox};
+use crate::decide::STUCK_START_S;
 use crate::github::{self, GhRunner, RunnerRef};
 use crate::model::{
     Config, JobKey, Limits, Machine, MachineState, Runner, RunnerState, Snapshot, UnixSecs, Warming,
@@ -81,7 +82,19 @@ struct Seen {
     /// A kept machine found holding its creator's logins in its current state. No runner
     /// goes on it until it starts again.
     holds_logins: bool,
+    restore_retry: Option<RestoreRetry>,
 }
+
+/// A direct restore refusal can outlast boat's optimistic listing. Preserve the first
+/// refusal's clock until a launch succeeds or the machine leaves this boot.
+struct RestoreRetry {
+    since: UnixSecs,
+    next_check: UnixSecs,
+    delay: u64,
+}
+
+const RESTORE_RETRY_MIN_S: u64 = 15;
+const RESTORE_RETRY_MAX_S: u64 = 120;
 
 /// A start boat accepted but may not list for a while (`FixListLag`). Until it is listed,
 /// or the HTTP request timeout plus a tick has passed, `decide` sees the machine as
@@ -140,6 +153,38 @@ impl Memory {
     pub(super) fn mark_used(&mut self, machine: &str, now: UnixSecs) {
         if let Some(seen) = self.machines.get_mut(machine) {
             seen.last_busy = now;
+            seen.restore_retry = None;
+        }
+    }
+
+    pub(super) fn waiting_for_restore(&self, machine: &str) -> bool {
+        self.machines
+            .get(machine)
+            .is_some_and(|seen| seen.restore_retry.is_some())
+    }
+
+    pub(super) fn restore_check_due(&self, machine: &str, now: UnixSecs) -> bool {
+        let Some(retry) = self
+            .machines
+            .get(machine)
+            .and_then(|m| m.restore_retry.as_ref())
+        else {
+            return true;
+        };
+        now >= retry.next_check
+            && now.saturating_sub(retry.since) < STUCK_START_S
+            && !self.abandoned.values().any(|(id, _, _)| id == machine)
+    }
+
+    pub(super) fn defer_restore(&mut self, machine: &str, now: UnixSecs) {
+        if let Some(seen) = self.machines.get_mut(machine) {
+            let retry = seen.restore_retry.get_or_insert(RestoreRetry {
+                since: if seen.kept { now } else { seen.since },
+                next_check: now,
+                delay: 0,
+            });
+            retry.delay = (retry.delay * 2).clamp(RESTORE_RETRY_MIN_S, RESTORE_RETRY_MAX_S);
+            retry.next_check = now.saturating_add(retry.delay);
         }
     }
 
@@ -364,6 +409,7 @@ impl Memory {
                         None => now.saturating_sub(1),
                     },
                     holds_logins: false,
+                    restore_retry: None,
                 });
                 if seen.state != state {
                     seen.state = state;
@@ -373,8 +419,28 @@ impl Memory {
                 if live.contains(sb.id.as_str()) {
                     seen.last_busy = now;
                 }
+                if !matches!(state, MachineState::Up | MachineState::Starting) {
+                    seen.restore_retry = None;
+                }
+                let mut since = seen.since;
+                let mut state = state;
+                if let Some(retry) = &seen.restore_retry {
+                    if !seen.kept {
+                        // A listing that alternates between Up and Starting must not keep
+                        // extending the fork's existing registration timeout or TTL.
+                        since = since.min(retry.since);
+                    } else if now.saturating_sub(retry.since) >= STUCK_START_S
+                        && !runners
+                            .iter()
+                            .any(|r| r.machine == sb.id && r.state != RunnerState::Offline)
+                    {
+                        // Reuse the kept-machine stuck-start cleanup once its slots are empty.
+                        state = MachineState::Starting;
+                        since = retry.since;
+                    }
+                }
                 Machine {
-                    since: seen.since,
+                    since,
                     last_busy: seen.last_busy,
                     id: sb.id,
                     pool,

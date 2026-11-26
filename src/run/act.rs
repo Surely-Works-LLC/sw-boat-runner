@@ -608,12 +608,28 @@ impl Loop<'_> {
                 // `decide` cancels a warm first; a failed cancel skips the machine.
                 if self.warm_file.warms().contains_key(machine) {
                     eprintln!("error: {machine}: its warm may still run; no runner registered");
-                    Ok(())
-                } else if self.free_of_logins(t, pool, machine)? {
-                    self.register(t, pool, machine, *slot)
-                } else {
-                    Ok(())
+                    return Ok(());
                 }
+                if !self.memory.restore_check_due(machine, self.at(t)) {
+                    t.skip.insert(machine.clone());
+                    return Ok(());
+                }
+                if self.memory.holds_logins(machine) {
+                    return Ok(());
+                }
+                let sb = self.boat.get(machine)?;
+                let state = sb.machine_state();
+                let awaiting_restore = self.memory.waiting_for_restore(machine);
+                if sb.hydrated == Some(false)
+                    || (awaiting_restore
+                        && (state != MachineState::Up || sb.hydrated != Some(true)))
+                {
+                    self.memory.defer_restore(machine, self.at(t));
+                    t.skip.insert(machine.clone());
+                } else if state == MachineState::Up && self.free_of_logins(t, pool, machine, &sb)? {
+                    self.register(t, pool, machine, *slot)?;
+                }
+                Ok(())
             }
             Action::Resume { machine } => self.resume(t, machine),
             Action::Fork { pool, job } => self.fork(t, pool, *job),
@@ -639,7 +655,11 @@ impl Loop<'_> {
             return Ok(());
         };
         // Like a job, a warm may run code a job left behind, so it gets the same check.
-        if !self.free_of_logins(t, &p.name, machine)? {
+        if self.memory.holds_logins(machine) {
+            return Ok(());
+        }
+        let sb = self.boat.get(machine)?;
+        if !self.free_of_logins(t, &p.name, machine, &sb)? {
             return Ok(());
         }
         let what = machine_in(t.snapshot, machine);
@@ -757,12 +777,14 @@ impl Loop<'_> {
     /// kept machine in a pool with `resume` is stopped, as its `noEnv` resume scrubs them.
     /// Either way the pool's forks back off, since a fork of the same snapshot holds them
     /// too. A machine boat does not say about counts as holding them.
-    fn free_of_logins(&mut self, t: &mut Tick, pool: &str, machine: &str) -> Result<bool, Error> {
-        if self.memory.holds_logins(machine) {
-            return Ok(false);
-        }
+    fn free_of_logins(
+        &mut self,
+        t: &mut Tick,
+        pool: &str,
+        machine: &str,
+        sb: &boat::Sandbox,
+    ) -> Result<bool, Error> {
         let p = self.pool(pool)?;
-        let sb = self.boat.get(machine)?;
         let why = match sb.holds_creator_logins {
             Some(false) => {
                 self.ledger.pool_free_of_logins(pool);
@@ -805,7 +827,13 @@ impl Loop<'_> {
     /// runner would stay `Registered`, hold its slot and count as supply until
     /// `register_timeout_s`. It is noted instead, and the next tick deletes it and leaves
     /// it out of the snapshot (`Memory::abandon`).
-    fn register(&mut self, t: &Tick, pool: &str, machine: &str, slot: u32) -> Result<(), Error> {
+    fn register(
+        &mut self,
+        t: &mut Tick,
+        pool: &str,
+        machine: &str,
+        slot: u32,
+    ) -> Result<(), Error> {
         let p = self.pool(pool)?;
         let now = self.at(t);
         let name = github::runner_name(pool, machine, slot, now);
@@ -827,7 +855,6 @@ impl Loop<'_> {
             }
             self.log(format_args!("runner-registration {registration}"));
         }
-        self.memory.mark_used(machine, now);
         let started = self
             .boat
             .write_file(machine, &script::jit_path(slot), jit.expose())
@@ -835,6 +862,13 @@ impl Loop<'_> {
                 self.boat
                     .exec_detached(machine, &script::start_command(slot))
             });
+        if started.as_ref().is_err_and(|error| error.is_restoring()) {
+            self.memory.defer_restore(machine, self.at(t));
+            t.skip.insert(machine.to_string());
+        } else {
+            // For any other outcome the runner may already have reached GitHub.
+            self.memory.mark_used(machine, now);
+        }
         if let Err(e) = started {
             if let Some(runner) = jit.runner {
                 eprintln!("{name}: {e}; its registration is deleted next tick");
@@ -1758,6 +1792,133 @@ mod tests {
         assert_eq!(xlarge(&fake), 2);
         let key = ("big".to_string(), StartKind::Fork);
         assert_eq!(tick_loop.ledger.failing[&key].backoff_s, 2 * REFUSED_MIN_S);
+    }
+
+    #[test]
+    fn restoring_fork_waits_for_detail_and_reuses_the_guest() {
+        let mut cfg = config();
+        cfg.pools[0].paid_start_cents_per_day = 0;
+        let tick = std::cell::Cell::new(0);
+        let jit_count = std::cell::Cell::new(0);
+        let deleted_runner = std::cell::Cell::new(false);
+        let fake = Fake::new(move |s| {
+            if s.method == "GET" && s.url.starts_with(&format!("{BOAT}/sandboxes?")) {
+                let n = tick.get() + 1;
+                tick.set(n);
+                let state = if n == 1 { "provisioning" } else { "idle" };
+                let listing = format!(
+                    r#"{{"id":"bx_66666666","state":"{state}",
+                        "labels":{{"sw-boat-runner":"ci","sw-boat-runner-job":"70-1"}}}}"#
+                );
+                return lagging_reply(s, &listing, JOB_70);
+            }
+            if s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?")) {
+                if jit_count.get() == 1 && !deleted_runner.get() {
+                    return respond(
+                        200,
+                        &[],
+                        r#"{"total_count":1,"runners":[
+                        {"id":20,"name":"sbr-ci-bx_66666666-0-1000","status":"offline","busy":false}]}"#,
+                    );
+                }
+                return respond(200, &[], r#"{"total_count":0,"runners":[]}"#);
+            }
+            if s.method == "DELETE" && s.url == format!("{GH}/runners/20") {
+                deleted_runner.set(true);
+            }
+            if s.method == "GET" && s.url == format!("{BOAT}/sandboxes/bx_66666666") {
+                let detail = if tick.get() == 3 {
+                    r#"{"sandbox":{"id":"bx_66666666","state":"idle","hydrated":false}}"#
+                } else {
+                    r#"{"sandbox":{"id":"bx_66666666","state":"idle",
+                        "holdsCreatorLogins":false,"hydrated":true}}"#
+                };
+                return respond(200, &[], detail);
+            }
+            if s.method == "POST" && s.url.ends_with("/generate-jitconfig") {
+                jit_count.set(jit_count.get() + 1);
+            }
+            if s.method == "POST" && s.url.ends_with("/commands") && jit_count.get() == 1 {
+                return respond(
+                    502,
+                    &[],
+                    r#"{"code":"sandbox_direct_failed","message":"sandbox_restoring"}"#,
+                );
+            }
+            lagging_reply(s, "", JOB_70)
+        });
+        let mut tick_loop = started(&cfg, &fake);
+        for now in [NOW - 15, NOW, NOW + 15, NOW + 30] {
+            tick_loop.tick(now, decide).unwrap();
+        }
+
+        assert_eq!(registers(&fake), 1);
+        assert!(requests(&fake).contains(&format!("DELETE {GH}/runners/20")));
+        tick_loop.tick(NOW + 45, decide).unwrap();
+        assert_eq!(registers(&fake), 2);
+        assert!(forks(&fake).is_empty());
+        assert!(!requests(&fake).contains(&format!("DELETE {BOAT}/sandboxes/bx_66666666")));
+        assert_eq!(
+            requests(&fake)
+                .iter()
+                .filter(|r| { r.as_str() == format!("POST {BOAT}/sandboxes/bx_66666666/commands") })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn restoring_kept_machine_waits_for_its_other_runner_after_the_stuck_start_bound() {
+        let mut cfg = config();
+        let pool = &mut cfg.pools[0];
+        pool.placement = vec![Placement::Slot, Placement::Resume];
+        pool.min_up = 1;
+        pool.max_boxes = 1;
+        pool.paid_start_cents_per_day = 0;
+        let busy = std::rc::Rc::new(std::cell::Cell::new(false));
+        let busy_slot = busy.clone();
+        let fake = Fake::new(move |s| {
+            if busy_slot.get() && s.method == "GET" && s.url.starts_with(&format!("{GH}/runners?"))
+            {
+                return respond(
+                    200,
+                    &[],
+                    r#"{"total_count":1,"runners":[
+                        {"id":11,"name":"sbr-ci-bx_66666666-1-1000","status":"online","busy":true}]}"#,
+                );
+            }
+            if s.method == "PUT" && s.url.ends_with("/files") {
+                return respond(
+                    502,
+                    &[],
+                    r#"{"code":"sandbox_direct_failed","message":"sandbox_restoring"}"#,
+                );
+            }
+            lagging_reply(
+                s,
+                r#"{"id":"bx_66666666","state":"idle","labels":{"sw-boat-runner":"ci"}}"#,
+                JOB_70,
+            )
+        });
+
+        let mut tick_loop = started(&cfg, &fake);
+        let deadline = NOW + crate::decide::STUCK_START_S;
+        for now in [NOW, NOW + 15, NOW + 120, deadline - 1] {
+            tick_loop.tick(now, decide).unwrap();
+        }
+        let stop = format!("POST {BOAT}/sandboxes/bx_66666666/stop");
+        assert_eq!(registers(&fake), 1);
+        assert!(!requests(&fake).contains(&stop));
+        busy.set(true);
+        tick_loop.tick(deadline, decide).unwrap();
+        assert!(!requests(&fake).contains(&stop));
+        assert!(!requests(&fake).contains(&format!("DELETE {GH}/runners/11")));
+
+        busy.set(false);
+        tick_loop.tick(deadline + cfg.tick_s, decide).unwrap();
+        assert!(requests(&fake).contains(&stop));
+        assert_eq!(registers(&fake), 1);
+        assert!(forks(&fake).is_empty());
     }
 
     /// GitHub issued the jit config, then the file write failed. The next tick deletes the
