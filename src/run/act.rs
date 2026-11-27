@@ -627,6 +627,13 @@ impl Loop<'_> {
                     self.memory.defer_restore(machine, self.at(t));
                     t.skip.insert(machine.clone());
                 } else if state == MachineState::Up && self.free_of_logins(t, pool, machine, &sb)? {
+                    if awaiting_restore {
+                        if let Err(error) = self.boat.probe_runner_direct(machine) {
+                            self.memory.defer_restore(machine, self.at(t));
+                            t.skip.insert(machine.clone());
+                            return Err(error.into());
+                        }
+                    }
                     self.register(t, pool, machine, *slot)?;
                 }
                 Ok(())
@@ -1795,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_fork_waits_for_detail_and_reuses_the_guest() {
+    fn restoring_fork_waits_for_both_direct_routes_before_another_jit() {
         let mut cfg = config();
         cfg.pools[0].paid_start_cents_per_day = 0;
         let tick = std::cell::Cell::new(0);
@@ -1838,7 +1845,13 @@ mod tests {
             if s.method == "POST" && s.url.ends_with("/generate-jitconfig") {
                 jit_count.set(jit_count.get() + 1);
             }
-            if s.method == "POST" && s.url.ends_with("/commands") && jit_count.get() == 1 {
+            let probe = s.body_text().contains("/tmp/.sbr-restore-probe");
+            let files_still_restoring =
+                s.method == "PUT" && s.url.ends_with("/files") && tick.get() == 5;
+            let commands_still_restoring = s.method == "POST"
+                && s.url.ends_with("/commands")
+                && ((probe && tick.get() == 6) || (!probe && tick.get() <= 6));
+            if files_still_restoring || commands_still_restoring {
                 return respond(
                     502,
                     &[],
@@ -1854,14 +1867,24 @@ mod tests {
 
         assert_eq!(registers(&fake), 1);
         assert!(requests(&fake).contains(&format!("DELETE {GH}/runners/20")));
-        tick_loop.tick(NOW + 45, decide).unwrap();
+        // Detail says hydrated on all three checks. First files and then commands
+        // still refuse. The same fork takes a second JIT only after both accept.
+        for now in [NOW + 45, NOW + 105] {
+            tick_loop.tick(now, decide).unwrap();
+            assert_eq!(registers(&fake), 1);
+        }
+        tick_loop.tick(NOW + 225, decide).unwrap();
         assert_eq!(registers(&fake), 2);
         assert!(forks(&fake).is_empty());
         assert!(!requests(&fake).contains(&format!("DELETE {BOAT}/sandboxes/bx_66666666")));
         assert_eq!(
-            requests(&fake)
+            fake.sent()
                 .iter()
-                .filter(|r| { r.as_str() == format!("POST {BOAT}/sandboxes/bx_66666666/commands") })
+                .filter(|s| {
+                    s.method == "POST"
+                        && s.url.ends_with("/commands")
+                        && s.body_text().contains("/tmp/.sbr-restore-probe")
+                })
                 .count(),
             2
         );
